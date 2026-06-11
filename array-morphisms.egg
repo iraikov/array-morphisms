@@ -1,0 +1,33 @@
+;;;; -*- Hen -*-
+
+(
+ ; Your egg's license:
+ (license "LGPL-3")
+
+ ; Egg category
+ (category data)
+
+ ; A list of eggs array-morphisms depends on.
+ (dependencies srfi-1 srfi-4 srfi-69
+               datatype matchable random-mtzig)
+
+ (author "Ivan Raikov")
+
+ (synopsis "Structure-preserving transformations between arrays.")
+
+ (components (extension array-morphisms-core (source "core.scm") (csc-options "-O3" "-d1"))
+             (extension array-morphisms-index-fn (source "index-functions.scm") (csc-options "-O3" "-d1"))
+             (extension array-morphisms-basic-ops (source "basic-ops.scm") (csc-options "-O3" "-d1"))
+             (extension array-morphisms-blas-compat (source "blas-compat.scm")   (csc-options "-O0" "-d2"))
+             (extension array-morphisms-blas-exec   (source "blas-exec.scm")     (csc-options "-O0" "-d2"))
+             (extension array-morphisms-structural-ops (source "structural-ops.scm") (csc-options "-O0" "-d2"))
+             (extension array-morphisms-realization (source "realization.scm") (csc-options "-O0" "-d2"))
+             (extension array-morphisms-context     (source "context.scm")     (csc-options "-O0" "-d2"))
+             (extension array-morphisms-batch-ops   (source "batch-ops.scm")   (csc-options "-O0" "-d2"))
+             (extension array-morphisms-grad        (source "grad.scm")        (csc-options "-O0" "-d2"))
+             (extension array-morphisms-grad-check  (source "grad-check.scm")  (csc-options "-O0" "-d2"))
+             )
+
+ (test-dependencies test)
+
+)
