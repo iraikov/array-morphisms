@@ -41,6 +41,10 @@
    zero-grad!
    accumulate-grad!
 
+   ;; Read-only accessors for integration modules
+   var-parents
+   var-grad-fn
+
    ;; Record mutators (needed for testing/injection of custom grad-fns)
    morph-variable-grad-fn-set!
    morph-variable-parents-set!
@@ -616,6 +620,17 @@
             (accumulate-grad! vB
               (morph-matmul (morph-transpose A '(1 0)) g))))))
     out))
+
+
+;;;; ============================================================
+;;;; Read-only accessors for integration modules
+;;;;
+;;;; These expose morph-variable fields needed by the nanograd
+;;;; integration module without requiring raw define-record access.
+;;;; ============================================================
+
+(define (var-parents v) (morph-variable-parents v))
+(define (var-grad-fn v)  (morph-variable-grad-fn v))
 
 
 ;;;; ============================================================
