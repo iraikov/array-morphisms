@@ -48,6 +48,7 @@
    ;; Record mutators (needed for testing/injection of custom grad-fns)
    morph-variable-grad-fn-set!
    morph-variable-parents-set!
+   morph-variable-value-set!
 
    ;; Utilities (no realization)
    morph-ones-like
@@ -73,7 +74,8 @@
    var-matmul
 
    ;; Backward pass
-   backward!)
+   backward!
+   topo-sort)
 
   (import scheme (chicken base))
   (import (only srfi-1 iota any filter every map fold))
@@ -339,13 +341,14 @@
         (filter var-requires-grad? (list v1 v2)))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          ;; x1 and x2 are morphisms captured in the closure (still lazy)
-          (when (var-requires-grad? v1)
-            (accumulate-grad! v1
-              (reduce-sum-to (morph* g x2) (morph-shape x1))))
-          (when (var-requires-grad? v2)
-            (accumulate-grad! v2
-              (reduce-sum-to (morph* g x1) (morph-shape x2)))))))
+          (let ((x1 (var-value v1))
+                (x2 (var-value v2)))
+            (when (var-requires-grad? v1)
+              (accumulate-grad! v1
+                (reduce-sum-to (morph* g x2) (morph-shape x1))))
+            (when (var-requires-grad? v2)
+              (accumulate-grad! v2
+                (reduce-sum-to (morph* g x1) (morph-shape x2))))))))
     out))
 
 (define (var/ v1 v2)
@@ -361,15 +364,17 @@
         (filter var-requires-grad? (list v1 v2)))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          (when (var-requires-grad? v1)
-            (accumulate-grad! v1
-              (reduce-sum-to (morph/ g x2) (morph-shape x1))))
-          (when (var-requires-grad? v2)
-            (accumulate-grad! v2
-              (reduce-sum-to
-               (morph* (morph-negate g)
-                       (morph/ x1 (morph* x2 x2)))
-               (morph-shape x2)))))))
+          (let ((x1 (var-value v1))
+                (x2 (var-value v2)))
+            (when (var-requires-grad? v1)
+              (accumulate-grad! v1
+                (reduce-sum-to (morph/ g x2) (morph-shape x1))))
+            (when (var-requires-grad? v2)
+              (accumulate-grad! v2
+                (reduce-sum-to
+                 (morph* (morph-negate g)
+                         (morph/ x1 (morph* x2 x2)))
+                 (morph-shape x2))))))))
     out))
 
 (define (var-pow v1 v2)
@@ -385,13 +390,15 @@
         (filter var-requires-grad? (list v1 v2)))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          (when (var-requires-grad? v1)
-            (let* ((one (morph-from-list '(1.0) '(1) 'f64))
-                   (dx1 (morph* g (morph* x2 (morph-pow x1 (morph- x2 one))))))
-              (accumulate-grad! v1 (reduce-sum-to dx1 (morph-shape x1)))))
-          (when (var-requires-grad? v2)
-            (let ((dx2 (morph* g (morph* (morph-pow x1 x2) (morph-log x1)))))
-              (accumulate-grad! v2 (reduce-sum-to dx2 (morph-shape x2))))))))
+          (let ((x1 (var-value v1))
+                (x2 (var-value v2)))
+            (when (var-requires-grad? v1)
+              (let* ((one (morph-from-list '(1.0) '(1) 'f64))
+                     (dx1 (morph* g (morph* x2 (morph-pow x1 (morph- x2 one))))))
+                (accumulate-grad! v1 (reduce-sum-to dx1 (morph-shape x1)))))
+            (when (var-requires-grad? v2)
+              (let ((dx2 (morph* g (morph* (morph-pow x1 x2) (morph-log x1)))))
+                (accumulate-grad! v2 (reduce-sum-to dx2 (morph-shape x2)))))))))
     out))
 
 
@@ -416,8 +423,10 @@
       (morph-variable-parents-set! out (list v))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          (let* ((two (morph-from-list '(2.0) '(1) 'f64))
-                 (dx  (morph/ g (morph* two out-morph))))  ; lazy
+          (let* ((x-now   (var-value v))
+                 (out-now (morph-sqrt x-now))
+                 (two     (morph-from-list '(2.0) '(1) 'f64))
+                 (dx      (morph/ g (morph* two out-now))))
             (accumulate-grad! v dx)))))
     out))
 
@@ -432,7 +441,9 @@
       (morph-variable-parents-set! out (list v))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          (accumulate-grad! v (morph* g out-morph)))))  ; lazy
+          (let* ((x-now   (var-value v))
+                 (out-now (morph-exp x-now)))
+            (accumulate-grad! v (morph* g out-now))))))
     out))
 
 (define (var-log v)
@@ -445,7 +456,8 @@
       (morph-variable-parents-set! out (list v))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          (accumulate-grad! v (morph/ g x)))))
+          (let ((x (var-value v)))
+            (accumulate-grad! v (morph/ g x))))))
     out))
 
 (define (var-sin v)
@@ -458,7 +470,8 @@
       (morph-variable-parents-set! out (list v))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          (accumulate-grad! v (morph* g (morph-cos x))))))
+          (let ((x (var-value v)))
+            (accumulate-grad! v (morph* g (morph-cos x)))))))
     out))
 
 (define (var-cos v)
@@ -471,7 +484,8 @@
       (morph-variable-parents-set! out (list v))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          (accumulate-grad! v (morph-negate (morph* g (morph-sin x)))))))
+          (let ((x (var-value v)))
+            (accumulate-grad! v (morph-negate (morph* g (morph-sin x))))))))
     out))
 
 
@@ -500,8 +514,10 @@
       (morph-variable-parents-set! out (list v))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          (accumulate-grad! v (morph* g (morph-sign x))))))
+          (let ((x (var-value v)))
+            (accumulate-grad! v (morph* g (morph-sign x)))))))
     out))
+
 
 
 ;;;; ============================================================
@@ -610,15 +626,14 @@
         (filter var-requires-grad? (list vA vB)))
       (morph-variable-grad-fn-set! out
         (lambda (g)
-          ;; morph-transpose creates a lazy zero-copy strided view.
-          ;; morph-matmul wraps both in a lazy morphism-expr.
-          ;; The realization engine handles strided operands via gemm-strided.
-          (when (var-requires-grad? vA)
-            (accumulate-grad! vA
-              (morph-matmul g (morph-transpose B '(1 0)))))
-          (when (var-requires-grad? vB)
-            (accumulate-grad! vB
-              (morph-matmul (morph-transpose A '(1 0)) g))))))
+          (let ((A (var-value vA))
+                (B (var-value vB)))
+            (when (var-requires-grad? vA)
+              (accumulate-grad! vA
+                (morph-matmul g (morph-transpose B '(1 0)))))
+            (when (var-requires-grad? vB)
+              (accumulate-grad! vB
+                (morph-matmul (morph-transpose A '(1 0)) g)))))))
     out))
 
 
