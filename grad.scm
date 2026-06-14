@@ -33,6 +33,7 @@
    make-var
 
    ;; Accessors
+   var-name
    var-value
    var-grad
    var-requires-grad?
@@ -107,6 +108,7 @@
 ;;;; ============================================================
 
 (define-record morph-variable
+  name 
   value         ; morphism (abstract or concrete): the forward value
   grad          ; accumulated gradient, itself a morphism (#f before backward!)
   requires-grad ; boolean: leaf inputs that need derivatives set this #t
@@ -123,7 +125,11 @@
    rg: if #t, gradients will be accumulated into this variable."
   (unless (array-morphism? m)
     (error "make-var: value must be an array morphism" m))
-  (make-morph-variable m #f rg #f '()))
+  (make-morph-variable (gensym 'morph-var) m #f rg #f '()))
+
+(define (var-name v)
+  "Extract the name of a morph-variable."
+  (morph-variable-name v))
 
 (define (var-value v)
   "Extract the morphism value from a variable."
@@ -662,15 +668,14 @@
   "Return morph-variable nodes in root-first topological order.
    Uses DFS post-order with prepend: root first, leaves last.
    Each node appears exactly once (visited table prevents duplicates)."
-  (let ((visited (make-hash-table))
-        (order   '()))
-    (define (visit v)
-      (unless (hash-table-ref/default visited v #f)
-        (hash-table-set! visited v #t)
-        (for-each visit (morph-variable-parents v))
-        (set! order (cons v order))))
-    (visit root)
-    order))
+  (let ((visited (make-hash-table)))
+    (define (visit v order)
+      (if (hash-table-ref/default visited (var-name v) #f)
+          order
+          (begin
+            (hash-table-set! visited (var-name v) #t)
+            (cons v (fold visit order (morph-variable-parents v))))))
+    (visit root '())))
 
 (define (backward! var #!optional seed)
   "Run reverse-mode automatic differentiation from var.
