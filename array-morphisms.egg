@@ -26,6 +26,10 @@
              (extension array-morphisms-batch-ops   (source "batch-ops.scm")   (csc-options "-O0" "-d2"))
              (extension array-morphisms-grad        (source "grad.scm")        (csc-options "-O0" "-d2"))
              (extension array-morphisms-grad-check  (source "grad-check.scm")  (csc-options "-O0" "-d2"))
+             (extension array-morphisms-ssa         (source "ssa.scm")         (csc-options "-O0" "-d2")
+                        (component-dependencies array-morphisms-grad
+                                                array-morphisms-realization
+                                                array-morphisms-context))
              )
 
  (test-dependencies test)
