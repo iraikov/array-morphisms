@@ -49,6 +49,11 @@
    *attention-fusion-threshold*
    should-fuse-attention?
    execute-fused-attention
+
+   ;; Flat-loop fast-path kernels (zero allocation per element; called by SSA replay plan)
+   execute-flat-unary-compute
+   execute-flat-binary-compute
+   execute-flat-bias-broadcast-compute
    )
 
   (import scheme chicken.base chicken.module)
@@ -717,17 +722,77 @@
 
   (define (execute-index-fn index-fn output-buffer shape operands dtype)
     "Execute index function to fill output buffer
-  
+
      Dispatches to specialized kernels based on index function type"
-  
+
+    ;; True when m is a zero-offset, row-major concrete array with shape = expected-shape.
+    ;; Used to select zero-allocation flat-loop kernels for common element-wise ops.
+    (define (flat-operand? m expected-shape)
+      (cases array-morphism m
+        (concrete-array (_ s st o _ _ _)
+          (and (= o 0) (equal? s expected-shape) (equal? st (compute-strides s))))
+        (else #f)))
+
     (cond
      ;; Pure affine (reshape, transpose, slice)
      ((affine-index-fn? index-fn)
       (execute-affine-morphism index-fn output-buffer shape operands dtype))
-    
+
      ;; Computational (arithmetic, transcendental)
+     ;; Fast paths avoid per-element linear-to-multi-index allocation when all
+     ;; operands are row-major and the output shape matches.
      ((compute-index-fn? index-fn)
-      (execute-compute-morphism index-fn output-buffer shape operands dtype))
+      (let* ((combiner (compute-index-fn-combiner index-fn))
+             (size     (shape-size shape))
+             (nops     (length operands)))
+        (cond
+          ;; Fast path 1: unary, row-major same shape
+          ((and (= nops 1)
+                (flat-operand? (car operands) shape))
+           (cases array-morphism (car operands)
+             (concrete-array (data _ _ _ _ _ _)
+               (execute-flat-unary-compute combiner data output-buffer size dtype))
+             (else
+              (execute-compute-morphism index-fn output-buffer shape operands dtype))))
+          ;; Fast path 2: binary, both row-major, same shape
+          ((and (= nops 2)
+                (flat-operand? (car operands)  shape)
+                (flat-operand? (cadr operands) shape))
+           (cases array-morphism (car operands)
+             (concrete-array (data1 _ _ _ _ _ _)
+               (cases array-morphism (cadr operands)
+                 (concrete-array (data2 _ _ _ _ _ _)
+                   (execute-flat-binary-compute combiner data1 data2 output-buffer size dtype))
+                 (else
+                  (execute-compute-morphism index-fn output-buffer shape operands dtype))))
+             (else
+              (execute-compute-morphism index-fn output-buffer shape operands dtype))))
+          ;; Fast path 3: bias broadcast A[...,N] + B[N]
+          ((and (= nops 2)
+                (> (vector-length shape) 0)
+                (flat-operand? (car operands) shape)
+                (let ((N (vector-ref shape (- (vector-length shape) 1))))
+                  (cases array-morphism (cadr operands)
+                    (concrete-array (_ bs bst bo _ _ _)
+                      (and (= bo 0)
+                           (= (vector-length bs) 1)
+                           (= (vector-ref bs 0) N)
+                           (equal? bst (compute-strides bs))))
+                    (else #f))))
+           (let ((N (vector-ref shape (- (vector-length shape) 1))))
+             (cases array-morphism (car operands)
+               (concrete-array (data1 _ _ _ _ _ _)
+                 (cases array-morphism (cadr operands)
+                   (concrete-array (data2 _ _ _ _ _ _)
+                     (execute-flat-bias-broadcast-compute
+                      combiner data1 data2 output-buffer size N dtype))
+                   (else
+                    (execute-compute-morphism index-fn output-buffer shape operands dtype))))
+               (else
+                (execute-compute-morphism index-fn output-buffer shape operands dtype)))))
+          ;; Generic fallback
+          (else
+           (execute-compute-morphism index-fn output-buffer shape operands dtype)))))
     
      ;; Window (im2col, padding)
      ((window-index-fn? index-fn)
@@ -864,7 +929,51 @@
         
         (else
          (error "Unsupported dtype for compute morphism" dtype)))))
-  
+
+  (define (execute-flat-unary-compute combiner data output-buffer size dtype)
+    (case dtype
+      ((f64) (do ((i 0 (+ i 1))) ((= i size))
+               (f64vector-set! output-buffer i (exact->inexact (combiner (f64vector-ref data i))))))
+      ((f32) (do ((i 0 (+ i 1))) ((= i size))
+               (f32vector-set! output-buffer i (exact->inexact (combiner (f32vector-ref data i))))))
+      ((s32) (do ((i 0 (+ i 1))) ((= i size))
+               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (s32vector-ref data i)))))))
+      ((s64) (do ((i 0 (+ i 1))) ((= i size))
+               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (s64vector-ref data i)))))))
+      (else (error "execute-flat-unary-compute: unsupported dtype" dtype))))
+
+  (define (execute-flat-binary-compute combiner data1 data2 output-buffer size dtype)
+    (case dtype
+      ((f64) (do ((i 0 (+ i 1))) ((= i size))
+               (f64vector-set! output-buffer i (exact->inexact (combiner (f64vector-ref data1 i)
+                                                                          (f64vector-ref data2 i))))))
+      ((f32) (do ((i 0 (+ i 1))) ((= i size))
+               (f32vector-set! output-buffer i (exact->inexact (combiner (f32vector-ref data1 i)
+                                                                          (f32vector-ref data2 i))))))
+      ((s32) (do ((i 0 (+ i 1))) ((= i size))
+               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (s32vector-ref data1 i)
+                                                                                    (s32vector-ref data2 i)))))))
+      ((s64) (do ((i 0 (+ i 1))) ((= i size))
+               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (s64vector-ref data1 i)
+                                                                                    (s64vector-ref data2 i)))))))
+      (else (error "execute-flat-binary-compute: unsupported dtype" dtype))))
+
+  (define (execute-flat-bias-broadcast-compute combiner data1 data2 output-buffer size N dtype)
+    (case dtype
+      ((f64) (do ((i 0 (+ i 1))) ((= i size))
+               (f64vector-set! output-buffer i (exact->inexact (combiner (f64vector-ref data1 i)
+                                                                          (f64vector-ref data2 (modulo i N)))))))
+      ((f32) (do ((i 0 (+ i 1))) ((= i size))
+               (f32vector-set! output-buffer i (exact->inexact (combiner (f32vector-ref data1 i)
+                                                                          (f32vector-ref data2 (modulo i N)))))))
+      ((s32) (do ((i 0 (+ i 1))) ((= i size))
+               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (s32vector-ref data1 i)
+                                                                                    (s32vector-ref data2 (modulo i N))))))))
+      ((s64) (do ((i 0 (+ i 1))) ((= i size))
+               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (s64vector-ref data1 i)
+                                                                                    (s64vector-ref data2 (modulo i N))))))))
+      (else (error "execute-flat-bias-broadcast-compute: unsupported dtype" dtype))))
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Window Morphism Execution (im2col, Padding)
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

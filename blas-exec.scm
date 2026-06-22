@@ -207,10 +207,11 @@
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
   (define (use-blas-for-shape? shape)
-    "True when all dimensions of shape meet the size threshold.
-    Small matrices are not worth the BLAS call overhead."
-    (every (lambda (d) (>= d *blas-size-threshold*))
-           (vector->list shape)))
+    "True when the total number of output elements meets the size threshold.
+    Checks product of all dimensions rather than per-dimension size, so that
+    non-square matrices like (10 x 8) with 80 total elements correctly
+    trigger BLAS rather than being rejected because 10 < threshold."
+    (>= (apply * (vector->list shape)) *blas-size-threshold*))
 
   (define (%select-kernel backend dtype f64-accessor f32-accessor)
     "Extract the dtype-specialised kernel from backend.
@@ -649,7 +650,9 @@
     (if (and *blas-enabled*
              *active-backend*
              (blas-compatible-matmul? A B)
-             (use-blas-for-shape? (get-morphism-shape A)))
+             (>= (* (vector-ref (get-morphism-shape A) 0)
+                    (vector-ref (get-morphism-shape B) 1))
+                 *blas-size-threshold*))
         (%blas-gemm/into! A B result-data)
         (%scheme-gemm/into! A B result-data)))
 
@@ -703,7 +706,9 @@
       result-data: typed-vector of length M*N (pre-allocated, row-major)"
     (if (and *blas-enabled*
              *active-backend*
-             (use-blas-for-shape? (get-morphism-shape A)))
+             (>= (* (vector-ref (get-morphism-shape A) 0)
+                    (vector-ref (get-morphism-shape B) 1))
+                 *blas-size-threshold*))
         (%blas-gemm-strided/into! A B result-data)
         (%scheme-gemm/into! A B result-data)))
 
@@ -824,7 +829,9 @@ this is a bug (compat predicates should have rejected it)" m)))
     (if (and *blas-enabled*
              *active-backend*
              (blas-compatible-matmul? A B)
-             (use-blas-for-shape? (get-morphism-shape A)))
+             (>= (* (vector-ref (get-morphism-shape A) 0)
+                    (vector-ref (get-morphism-shape B) 1))
+                 *blas-size-threshold*))
         (%blas-gemm A B)
         (execute-scheme-gemm A B)))
 

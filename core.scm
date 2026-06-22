@@ -105,6 +105,7 @@
    concat-index-fn-offsets
 
    ;; Classification predicates
+   index-fn?
    single-source-index-fn?
    routing-index-fn?
    

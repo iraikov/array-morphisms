@@ -359,4 +359,88 @@
       (let ((result (realize/ctx ctx b)))
         (eq? (get-morphism-dtype result) 'f32)))))
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 9: Context pinning API
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(test-group "context pinning API"
+
+  (test-assert "context-counter starts at 0"
+    (let ((ctx (make-morphism-context)))
+      (= (context-counter ctx) 0)))
+
+  (test-assert "context-counter increments after non-zero-copy realize/ctx"
+    (let* ((ctx (make-morphism-context))
+           (a   (morph-from-list '(1.0 2.0) #(2) 'f64))
+           (b   (morph+ a a)))
+      (realize/ctx ctx b)
+      (= (context-counter ctx) 1)))
+
+  (test-assert "context-counter increments once per op in a chain"
+    (let* ((ctx (make-morphism-context))
+           (a   (morph-from-list '(1.0 2.0) #(2) 'f64))
+           (two (morph-from-list '(2.0 2.0) #(2) 'f64))
+           (b   (morph+ a a))
+           (c   (morph* b two)))
+      (realize/ctx ctx c)
+      (= (context-counter ctx) 2)))
+
+  (test-assert "context-counter unchanged for concrete input (zero-copy)"
+    (let* ((ctx (make-morphism-context))
+           (a   (morph-from-list '(1.0 2.0) #(2) 'f64)))
+      (realize/ctx ctx a)
+      (= (context-counter ctx) 0)))
+
+  (test-assert "context-pin-output! succeeds in trace mode"
+    (let* ((ctx (make-morphism-context))
+           (a   (morph-from-list '(1.0 2.0) #(2) 'f64))
+           (b   (morph+ a a)))
+      (realize/ctx ctx b)
+      (context-pin-output! ctx 0)
+      #t))
+
+  (test-assert "context-pin-output! signals error for unknown alloc-id"
+    (let* ((ctx (make-morphism-context))
+           (a   (morph-from-list '(1.0 2.0) #(2) 'f64))
+           (b   (morph+ a a)))
+      (realize/ctx ctx b)
+      (condition-case
+          (begin (context-pin-output! ctx 99) #f)
+        (e (exn) #t))))
+
+  (test-assert "context-pin-output! signals error in replay mode"
+    (let* ((ctx (make-morphism-context))
+           (a   (morph-from-list '(1.0 2.0) #(2) 'f64))
+           (b   (morph+ a a)))
+      (realize/ctx ctx b)
+      (finalize-context! ctx)
+      (condition-case
+          (begin (context-pin-output! ctx 0) #f)
+        (e (exn) #t))))
+
+  (test-assert "pinned alloc gets its own buffer slot (not reused by independent later alloc)"
+    ;; Two independent allocs of same dtype/size:
+    ;;   alloc 0 (b = a+a): inputs = (external, external) -> last-use = 0 without pinning
+    ;;   alloc 1 (c = x+x): inputs = (external, external) -> last-use = 1 without pinning
+    ;; Without pinning: alloc 0 dies at step 0, alloc 1 born at step 1 -> slot reused -> 1 buffer.
+    ;; With pinning: alloc 0's last-use extended to n-1=1 -> overlaps alloc 1 -> 2 buffers.
+    ;; Use concrete arrays as inputs so realize/ctx produces exactly one alloc per call.
+    (let* ((ctx (make-morphism-context))
+           (a   (morph-from-list '(1.0 2.0) #(2) 'f64))
+           (x   (morph-from-list '(3.0 4.0) #(2) 'f64)))
+      (realize/ctx ctx (morph+ a a))    ; alloc 0, independent (external inputs only)
+      (realize/ctx ctx (morph+ x x))    ; alloc 1, independent (external inputs only)
+      (context-pin-output! ctx 0)
+      (finalize-context! ctx)
+      (= (stats-ref (context-stats ctx) 'buffers) 2)))
+
+  (test-assert "print-context-plan runs without error after pinning"
+    (let* ((ctx (make-morphism-context))
+           (a   (morph-from-list '(1.0 2.0) #(2) 'f64)))
+      (realize/ctx ctx (morph+ a a))
+      (context-pin-output! ctx 0)
+      (finalize-context! ctx)
+      (print-context-plan ctx)
+      #t)))
+
 (test-exit)

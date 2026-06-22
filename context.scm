@@ -23,9 +23,19 @@
    ;; Inspection
    context-mode
    context-stats
-   print-context-plan)
+   context-counter
+   print-context-plan
 
-  (import scheme chicken.base chicken.format)
+   ;; Output pinning
+   context-pin-output!
+
+   ;; Pool accessors (for replay-plan compilation)
+   morphism-context-pool
+   buffer-pool-assignment
+   buffer-pool-buffers
+   context-alloc->pool-idx)
+
+  (import scheme chicken.base chicken.format chicken.port)
   (import (only srfi-1 iota fold every filter find))
   (import srfi-4 srfi-69)
   (import array-morphisms-core)
@@ -37,7 +47,8 @@
 
   ;; One entry per non-zero-copy allocation recorded during the trace phase.
   ;; last-use is initialised to id (birth) and updated during lifetime analysis.
-  (define-record allocation-rec id dtype size shape last-use inputs)
+  ;; kind is 'normal or 'output-pinned; pinned allocs have last-use extended to n-1.
+  (define-record allocation-rec id dtype size shape last-use inputs kind)
 
   ;; Immutable buffer pool created by finalize-context!.
   ;;   buffers    - #(typed-vector ...)  one physical buffer per logical slot
@@ -93,7 +104,8 @@
      (lambda (alloc-id dtype size shape input-ids)
        (let ((rec (make-allocation-rec alloc-id dtype size shape
                                        alloc-id   ; last-use = birth initially
-                                       input-ids)))
+                                       input-ids
+                                       'normal)))  ; kind
          (morphism-context-allocs-set!
           ctx (cons rec (morphism-context-allocs ctx)))))
 
@@ -123,7 +135,15 @@
     (let* ((allocs-list (reverse (morphism-context-allocs ctx)))
            (n           (length allocs-list))
            (allocs-vec  (list->vector allocs-list)))
+      ;; Step 1: dependency-driven lifetime extension
       (compute-last-uses! allocs-vec)
+      ;; Step 2: extend output-pinned allocations to end-of-program
+      (do ((i 0 (+ i 1)))
+          ((= i n))
+        (let ((rec (vector-ref allocs-vec i)))
+          (when (eq? (allocation-rec-kind rec) 'output-pinned)
+            (allocation-rec-last-use-set! rec (- n 1)))))
+      ;; Step 3: greedy interval scheduling
       (let ((pool (allocate-buffers allocs-vec n)))
         (morphism-context-allocs-set! ctx allocs-vec)
         (morphism-context-pool-set!   ctx pool)
@@ -158,6 +178,36 @@
              (buffers . ,n-bufs))))
         (else `((mode . ,mode))))))
 
+  (define (context-counter ctx)
+    "Return the current allocation counter.
+    Incremented once per non-zero-copy realize/ctx call; unchanged for zero-copy views."
+    (morphism-context-counter ctx))
+
+  (define (context-pin-output! ctx alloc-id)
+    "Mark alloc-id as output-pinned.  During finalize-context! its last-use
+    will be extended to n-1 so the greedy allocator never reuses its buffer slot
+    within a single program run.  Must be called in trace mode."
+    (unless (eq? (morphism-context-mode ctx) 'trace)
+      (error "context-pin-output!: context must be in trace mode" alloc-id))
+    (let ((rec (find (lambda (r) (= (allocation-rec-id r) alloc-id))
+                     (morphism-context-allocs ctx))))
+      (unless rec
+        (error "context-pin-output!: alloc-id not found" alloc-id))
+      (allocation-rec-kind-set! rec 'output-pinned)))
+
+  (define (context-alloc->pool-idx ctx alloc-id)
+    "Return the physical buffer slot (pool-idx) for alloc-id.
+    The context must be in replay mode (finalize-context! already called)."
+    (let ((pool (morphism-context-pool ctx)))
+      (unless pool
+        (error "context-alloc->pool-idx: context not finalized" alloc-id))
+      (let ((assignment (buffer-pool-assignment pool)))
+        (when (>= alloc-id (vector-length assignment))
+          (error "context-alloc->pool-idx: alloc-id out of range"
+                 `((alloc-id ,alloc-id)
+                   (pool-size ,(vector-length assignment)))))
+        (vector-ref assignment alloc-id))))
+
   (define (print-context-plan ctx)
     "Print a human-readable allocation plan for debugging."
     (let ((allocs (morphism-context-allocs ctx))
@@ -176,20 +226,23 @@
                                         (buffer-pool-buffers pool)))))
               (newline)
               (newline)
-              (display "alloc  dtype   size  born  dies  buf") (newline)
-              (display "-----  -----  -----  ----  ----  ---") (newline)
+              (display "alloc  dtype  size  born  dies  buf  kind           inputs") (newline)
+              (display "-----  -----  ----  ----  ----  ---  ----           ------") (newline)
               (do ((i 0 (+ i 1)))
                   ((= i (vector-length allocs)))
                 (let* ((rec    (vector-ref allocs i))
                        (buf-id (vector-ref (buffer-pool-assignment pool) i)))
                   (display
-                   (format #f "~5d  ~5a  ~5d  ~4d  ~4d  ~3d"
-                           (allocation-rec-id rec)
-                           (allocation-rec-dtype rec)
-                           (allocation-rec-size rec)
-                           (allocation-rec-id rec)
-                           (allocation-rec-last-use rec)
-                           buf-id))
+                   (string-append
+                    (number->string (allocation-rec-id rec)) "  "
+                    (symbol->string (allocation-rec-dtype rec)) "  "
+                    (number->string (allocation-rec-size rec)) "  "
+                    (number->string (allocation-rec-id rec)) "  "
+                    (number->string (allocation-rec-last-use rec)) "  "
+                    (number->string buf-id) "  "
+                    (symbol->string (allocation-rec-kind rec)) "  "
+                    (with-output-to-string (lambda ()
+                                            (write (allocation-rec-inputs rec))))))
                   (newline))))))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

@@ -1,6 +1,6 @@
 ;;; array-morphisms-ssa.scm
 ;;;
-;;; SSA IR for fused forward+backward computation (Approach B).
+;;; SSA IR for fused forward+backward computation.
 ;;;
 ;;; Compiles a morph-variable loss node into a flat SSA program once,
 ;;; then replays the joint forward+backward computation every training step.
@@ -9,10 +9,10 @@
 ;;; build separate lazy trees.
 ;;;
 ;;; Phases:
-;;;   B-1  morphism-to-ssa  -- DFS over morphism-expr tree → SSA program
-;;;   B-2  ssa-vjp          -- symbolic VJP over SSA bindings → extended program
-;;;   B-3  ssa-realize      -- sequential executor (no context pooling)
-;;;   B-4  ssa-realize/ctx  -- context-pooled executor
+;;;   1.  morphism-to-ssa  -- DFS over morphism-expr tree -> SSA program
+;;;   2.  ssa-vjp          -- symbolic VJP over SSA bindings -> extended program
+;;;   3.  ssa-realize      -- sequential executor (no context pooling)
+;;;   4.  ssa-realize/ctx  -- context-pooled executor
 ;;;
 ;;; Key invariants:
 ;;;   - Constants (concrete-array leaves) are stored in a hash-table keyed by
@@ -49,7 +49,18 @@
 
    ;; Execution
    ssa-realize
-   ssa-realize/ctx)
+   ssa-realize/ctx
+
+   ;; Replay plan ADTs
+   replay-ref?
+   rr-val rr-const
+   replay-instruction?
+   ri-gemm ri-gemm-strided ri-index ri-reduce ri-view
+   ri-flat-unary ri-flat-binary ri-flat-bias-broadcast
+
+   ;; Replay plan compilation and execution
+   compile-replay-plan
+   execute-replay-plan)
 
   (import scheme (chicken base))
   (import (only srfi-1 iota fold filter map for-each append-map filter-map))
@@ -69,6 +80,7 @@
   (import array-morphisms-basic-ops)
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-exec)
+  (import array-morphisms-blas-compat)
   (import array-morphisms-realization)
   (import array-morphisms-context)
   (import (prefix array-morphisms-grad am:))
@@ -108,20 +120,122 @@
 ;;   inputs : list of ssa-value
 ;;   shape  : vector (result shape)
 ;;   dtype  : symbol
-;;   meta   : alist of extra info (index-fn, axes, perm, fn, …)
+;;   meta   : alist of extra info (index-fn, axes, perm, fn, ...)
 (define-record ssa-binding name op inputs shape dtype meta)
 
 ;; The compiled SSA program.
-;;   constants   : hash-table cid-symbol → concrete-array
-;;   morph-to-val: hash-table morphism-object (eq?) → ssa-value  (for ssa-constant-id)
+;;   constants   : hash-table cid-symbol -> concrete-array
+;;   morph-to-val: hash-table morphism-object (eq?) -> ssa-value  (for ssa-constant-id)
 ;;   bindings    : list of ssa-binding in topological order
 ;;   outputs     : list of ssa-value  (loss first, then param grads)
 ;;   n-params    : count of trainable parameter constants
-(define-record ssa-program constants morph-to-val bindings outputs n-params)
+;;   replay-plan   : #f until compiled; vector of replay-instruction (one per binding)
+;;   trace-info    : #f until trace; hash-table bid-sym -> (concrete-array . is-pool?)
+;;   output-specs  : #f until compiled; list of (integer | concrete-array) per output
+;;                   integer = index into vals vector; concrete-array = const-ref value
+(define-record ssa-program constants morph-to-val bindings outputs n-params
+               replay-plan trace-info output-specs)
 
 
 ;;; ============================================================
-;;; Phase B-1: morphism-to-ssa
+;;; Replay Plan ADTs
+;;;
+;;; Pre-compiled dispatch structures produced by compile-replay-plan.
+;;; Used by execute-replay-plan to avoid per-step morphism rebuilding,
+;;; BLAS eligibility re-evaluation, and context-vector allocation.
+;;; ============================================================
+
+;; Input reference: previous binding result (by 0-based position in vals vector)
+;; or a constant (by cid-symbol from constants hash-table).
+(define-datatype replay-ref replay-ref?
+  (rr-val   (val-idx integer?))
+  (rr-const (cid symbol?)))
+
+;; One pre-compiled instruction per SSA binding.
+(define-datatype replay-instruction replay-instruction?
+
+  ;; Row-major matmul: strides pre-computed at compile time.
+  (ri-gemm
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (in-A         replay-ref?)
+    (in-B         replay-ref?))
+
+  ;; Strided matmul (at least one input is a transposed zero-copy view).
+  (ri-gemm-strided
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (in-A         replay-ref?)
+    (in-B         replay-ref?))
+
+  ;; Element-wise / general index-fn op: strides pre-computed at compile time.
+  (ri-index
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (index-fn     index-fn?)
+    (in-refs      list?))
+
+  ;; Reduction (sum, mean, max, ...): strides pre-computed at compile time.
+  (ri-reduce
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (src-dtype    symbol?)
+    (rop          symbol?)
+    (reduce-axes  list?)
+    (reducer      procedure?)
+    (keepdims?    boolean?)
+    (in-ref       replay-ref?))
+
+  ;; Zero-copy view (transpose, reshape, slice): shares pool buffer with source.
+  (ri-view
+    (view-fn  procedure?)
+    (in-ref   replay-ref?))
+
+  ;; Element-wise unary: output[i] = combiner(A[i])
+  ;; Emitted when: 1 operand, operand and output both row-major with same shape.
+  (ri-flat-unary
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (combiner     procedure?)
+    (in-A         replay-ref?))
+
+  ;; Element-wise binary same-shape: output[i] = combiner(A[i], B[i])
+  ;; Emitted when: 2 operands, all row-major with identical shape.
+  (ri-flat-binary
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (combiner     procedure?)
+    (in-A         replay-ref?)
+    (in-B         replay-ref?))
+
+  ;; Bias broadcast: output[i] = combiner(A[i], B[i mod N])
+  ;; Emitted when: A row-major = output shape; B row-major shape [N] = last dim of output.
+  ;; N baked in at compile time.
+  (ri-flat-bias-broadcast
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (combiner     procedure?)
+    (bias-N       integer?)
+    (in-A         replay-ref?)
+    (in-B         replay-ref?)))
+
+
+;;; ============================================================
+;;; Phase 1: morphism-to-ssa
 ;;;
 ;;; Post-order DFS over the morphism-expr tree rooted at loss-mv.
 ;;; concrete-array leaves become constants; morphism-expr / reduction-morphism
@@ -131,8 +245,8 @@
 (define (morphism-to-ssa loss-mv)
   "Compile the morph-variable graph rooted at loss-mv into an SSA program.
    Returns an ssa-program with outputs = (list loss-binding-val) and n-params = 0."
-  (let* ((constants   (make-hash-table))          ; cid-symbol → concrete-array
-         (visited     (make-hash-table eq? eq?-hash)) ; morphism → ssa-value
+  (let* ((constants   (make-hash-table))          ; cid-symbol -> concrete-array
+         (visited     (make-hash-table eq? eq?-hash)) ; morphism -> ssa-value
          (bindings    '()))                         ; accumulated in topo order
 
     (define (emit-binding! op inputs shape dtype meta)
@@ -181,7 +295,7 @@
 
     (let* ((loss-m   (am:var-value loss-mv))
            (loss-val (visit loss-m)))
-      (make-ssa-program constants visited bindings (list loss-val) 0))))
+      (make-ssa-program constants visited bindings (list loss-val) 0 #f #f #f))))
 
 
 ;;; ============================================================
@@ -199,7 +313,7 @@
 
 
 ;;; ============================================================
-;;; Phase B-2: ssa-vjp
+;;; Phase 2: ssa-vjp
 ;;;
 ;;; Symbolic reverse-mode AD over SSA bindings.
 ;;; Appends backward bindings to fwd-prog's bindings and returns an
@@ -215,13 +329,13 @@
 
   (let* (;; Build shape/dtype lookup from forward bindings
          (fwd-bindings  (ssa-program-bindings fwd-prog))
-         (binding-shape (make-hash-table))   ; bid-symbol → vector
-         (binding-dtype (make-hash-table))   ; bid-symbol → symbol
+         (binding-shape (make-hash-table))   ; bid-symbol -> vector
+         (binding-dtype (make-hash-table))   ; bid-symbol -> symbol
          ;; Accumulate backward bindings here
          (bwd-bindings  '())
-         ;; Adjoint table: bid-symbol → ssa-value (the accumulated dL/d(bid))
+         ;; Adjoint table: bid-symbol -> ssa-value (the accumulated dL/d(bid))
          (adjoint-val   (make-hash-table))
-         ;; Param gradient table: cid-symbol → ssa-value
+         ;; Param gradient table: cid-symbol -> ssa-value
          (param-grad-val (make-hash-table))
          ;; Set of trainable param cid-symbols for fast membership test
          (param-cid-set  (make-hash-table))
@@ -362,7 +476,7 @@
              (_ (hash-table-set! binding-shape ones-cid src-shape))
              (_ (hash-table-set! binding-dtype ones-cid dtype))
              (ones-val (const-ref ones-cid)))
-        ;; morph* broadcasts: g-kd * ones → src-shape
+        ;; morph* broadcasts: g-kd * ones -> src-shape
         (emit! 'mul (list g-kd ones-val) src-shape dtype '())))
 
     ;; emit-scalar-const! -- emit a scalar constant of given value
@@ -376,7 +490,7 @@
         (hash-table-set! binding-dtype cid dtype)
         (const-ref cid)))
 
-    ;; --- Seed: dL/dL = ones-like(loss) stored as a constant ---
+    ;; Seed: dL/dL = ones-like(loss) stored as a constant
     (let* ((loss-bid    (find-fwd-binding fwd-bindings loss-bid-sym))
            (loss-shape  (ssa-binding-shape loss-bid))
            (loss-dtype  (ssa-binding-dtype loss-bid))
@@ -393,7 +507,7 @@
            (seed-val    (const-ref seed-cid)))
       (hash-table-set! adjoint-val loss-bid-sym seed-val))
 
-    ;; --- Backward sweep: iterate bindings in reverse order ---
+    ;; Backward sweep: iterate bindings in reverse order
     (for-each
      (lambda (b)
        (let* ((bid-sym  (ssa-binding-name b))
@@ -552,7 +666,7 @@
                        (b-val    (list-ref inputs 1))
                        (a-shape  (val-shape a-val))
                        (b-shape  (val-shape b-val))
-                       ;; Determine 2D shapes; shape = [M K] [K N] → [M N]
+                       ;; Determine 2D shapes; shape = [M K] [K N] -> [M N]
                        (rank     (vector-length a-shape))
                        (perm-t   (transpose-perm rank))
                        (b-t-shape (permute-shape b-shape perm-t))
@@ -618,20 +732,49 @@
                 (void)))))))
      (reverse fwd-bindings))
 
-    ;; Collect param grad outputs in order of param-const-vals
-    (let* ((grad-vals (filter-map
-                       (lambda (pcv)
-                         (let ((cid-sym (ssa-value-id pcv)))
-                           (hash-table-ref/default param-grad-val cid-sym #f)))
-                       param-const-vals))
-           (all-outputs (cons loss-binding-val grad-vals))
+    ;; Emit add(loss, zero-const) as the final backward binding.
+    ;;
+    ;; The context's compute-last-uses! extends a buffer's lifetime only when
+    ;; it appears as an INPUT to a later allocation-rec.  The loss forward binding
+    ;; has no backward binding that references it directly (the seed is stored as
+    ;; a pre-computed constant), so loss.alloc-id's last-use stays at its birth
+    ;; step and backward bindings can reuse its buffer slot in replay mode.
+    ;;
+    ;; add(loss, zero) is a two-operand op — can-zero-copy? returns #f so a real
+    ;; allocation is recorded.  input-ids includes loss.alloc-id, which forces
+    ;; compute-last-uses! to extend loss's lifetime to this final step, preventing
+    ;; any backward binding from aliasing its buffer.
+    (let* ((loss-bid-b  (find-fwd-binding fwd-bindings loss-bid-sym))
+           (loss-shape  (ssa-binding-shape loss-bid-b))
+           (loss-dtype  (ssa-binding-dtype loss-bid-b))
+           ;; Zero constant with same shape as loss (alloc-id=-1, not context-tracked)
+           (zero-data   (allocate-typed-vector loss-dtype (shape-size loss-shape)))
+           (_ (let loop ((i 0) (n (shape-size loss-shape)))
+                (when (< i n)
+                  (typed-vector-set! zero-data loss-dtype i 0.0)
+                  (loop (+ i 1) n))))
+           (zero-const  (make-morphism zero-data (vector->list loss-shape) loss-dtype))
+           (zero-cid    (gensym 'cid-))
+           (_ (hash-table-set! (ssa-program-constants fwd-prog) zero-cid zero-const))
+           (_ (hash-table-set! binding-shape zero-cid loss-shape))
+           (_ (hash-table-set! binding-dtype zero-cid loss-dtype))
+           (zero-val    (const-ref zero-cid))
+           (loss-out-val (emit! 'add (list loss-binding-val zero-val) loss-shape loss-dtype '()))
+           ;; Collect param grad outputs in order of param-const-vals
+           (grad-vals   (filter-map
+                         (lambda (pcv)
+                           (let ((cid-sym (ssa-value-id pcv)))
+                             (hash-table-ref/default param-grad-val cid-sym #f)))
+                         param-const-vals))
+           (all-outputs  (cons loss-out-val grad-vals))
            (all-bindings (append fwd-bindings bwd-bindings)))
       (make-ssa-program
        (ssa-program-constants fwd-prog)
        (ssa-program-morph-to-val fwd-prog)
        all-bindings
        all-outputs
-       (length param-const-vals)))))
+       (length param-const-vals)
+       #f #f #f))))
 
 
 ;;; Helper: find a forward binding by its bid-symbol
@@ -658,7 +801,7 @@
 
 
 ;;; ============================================================
-;;; Phase B-3: rebuild-morphism
+;;; Phase 3: rebuild-morphism
 ;;;
 ;;; Given an ssa-binding and a list of already-realized concrete-array
 ;;; inputs, construct a lazy morphism to pass to realize.
@@ -709,7 +852,7 @@
 
 
 ;;; ============================================================
-;;; Phase B-3: ssa-realize
+;;; Phase 3: ssa-realize
 ;;;
 ;;; Sequential executor.  Runs every binding once, returns outputs
 ;;; as a list of concrete-arrays.
@@ -738,27 +881,479 @@
 
 
 ;;; ============================================================
-;;; Phase B-4: ssa-realize/ctx
+;;; Phase 4: ssa-realize/ctx
 ;;;
 ;;; Like ssa-realize but routes each allocation through a
 ;;; morphism context for buffer pooling.
 ;;; ============================================================
 
+;; True iff m is a concrete-array with row-major strides and zero offset.
+;; Transposed zero-copy views have permuted strides and fail this check.
+;; Used to distinguish pool-allocated row-major results (which can be pinned
+;; and returned directly) from zero-copy transposed views (which must be copied).
+(define (concrete-row-major? m)
+  (cases array-morphism m
+    (concrete-array (data shape strides offset dtype alloc-id batch-axis)
+      (and (= offset 0) (equal? strides (compute-strides shape))))
+    (else #f)))
+
+(define (concrete-alloc-id m)
+  (cases array-morphism m
+    (concrete-array (data shape strides offset dtype alloc-id batch-axis) alloc-id)
+    (else -1)))
+
+;; De-transpose a concrete-array to a fresh row-major non-pooled buffer (alloc-id=-1).
+;; Used for output bindings that are zero-copy transposed views (no pool slot of their own).
+(define (copy-concrete-array m)
+  (cases array-morphism m
+    (concrete-array (data shape strides offset dtype alloc-id batch-axis)
+      (let* ((size     (shape-size shape))
+             (new-data (allocate-typed-vector dtype size))
+             (new-strs (compute-strides shape)))
+        (do ((i 0 (+ i 1)))
+            ((= i size))
+          (let* ((multi (linear-to-multi-index i shape))
+                 (phys  (multi-to-linear-index multi strides offset))
+                 (val   (typed-vector-ref data dtype phys)))
+            (typed-vector-set! new-data dtype i val)))
+        (concrete-array new-data shape new-strs 0 dtype -1 batch-axis)))
+    (else (error "copy-concrete-array: not a concrete-array" m))))
+
+;;; ============================================================
+;;; Replay Plan: compile-time classification helpers
+;;;
+;;; These predicates inspect trace-time concrete arrays.  They run once
+;;; inside compile-one-instruction and never during replay.
+;;; ============================================================
+
+(define (trace-arr-row-major? m)
+  (cases array-morphism m
+    (concrete-array (_ shape strides offset _ _ _)
+      (and (= offset 0) (equal? strides (compute-strides shape))))
+    (else #f)))
+
+(define (trace-arr-shape m)
+  (cases array-morphism m
+    (concrete-array (_ shape _ _ _ _ _) shape)
+    (else (error "trace-arr-shape: not concrete" m))))
+
+(define (flat-unary-eligible? out-shape in-traces)
+  (and (= (length in-traces) 1)
+       (trace-arr-row-major? (car in-traces))
+       (equal? (trace-arr-shape (car in-traces)) out-shape)))
+
+(define (flat-binary-eligible? out-shape in-traces)
+  (and (= (length in-traces) 2)
+       (trace-arr-row-major? (car  in-traces))
+       (trace-arr-row-major? (cadr in-traces))
+       (equal? (trace-arr-shape (car  in-traces)) out-shape)
+       (equal? (trace-arr-shape (cadr in-traces)) out-shape)))
+
+(define (flat-bias-broadcast-eligible? out-shape in-traces)
+  (and (= (length in-traces) 2)
+       (> (vector-length out-shape) 0)  ; bias-broadcast requires rank >= 1
+       (trace-arr-row-major? (car  in-traces))
+       (trace-arr-row-major? (cadr in-traces))
+       (equal? (trace-arr-shape (car in-traces)) out-shape)
+       (let* ((bias-shape (trace-arr-shape (cadr in-traces)))
+              (rank       (vector-length out-shape))
+              (N          (vector-ref out-shape (- rank 1))))
+         (and (= (vector-length bias-shape) 1)
+              (= (vector-ref bias-shape 0) N)))))
+
+
+;;; ============================================================
+;;; Replay Plan: compile-replay-ref
+;;; ============================================================
+
+(define (compile-replay-ref v name->pos)
+  "Compile an ssa-value to a replay-ref.
+   v: ssa-value (binding-ref or const-ref)
+   name->pos: hash-table bid-sym -> integer (0-based binding position)"
+  (cases ssa-value v
+    (const-ref   (cid) (rr-const cid))
+    (binding-ref (bid) (rr-val (hash-table-ref name->pos bid)))))
+
+
+;;; ============================================================
+;;; Replay Plan: compile-one-instruction
+;;; ============================================================
+
+(define (compile-one-instruction b in-refs pool-idx trace-info-table constants)
+  "Compile one SSA binding into a replay-instruction.
+   b:                ssa-binding
+   in-refs:          list of replay-ref? (already compiled from inputs)
+   pool-idx:         integer (physical buffer slot) or -1 (zero-copy)
+   trace-info-table: hash-table bid-sym -> (concrete-array . is-pool?)
+   constants:        hash-table cid-sym -> concrete-array"
+  (let* ((op        (ssa-binding-op b))
+         (meta      (ssa-binding-meta b))
+         (shape     (ssa-binding-shape b))
+         (dtype     (ssa-binding-dtype b))
+         (strides   (if (vector? shape) (compute-strides shape) '#()))
+         (info      (hash-table-ref trace-info-table (ssa-binding-name b)))
+         (trace-arr (car info))
+         (is-pool?  (cdr info)))
+
+    ;; Look up trace-time concrete-array for any ssa-value input:
+    ;; binding-ref -> trace-info-table; const-ref -> constants.
+    (define (trace-arr-of v)
+      (cases ssa-value v
+        (const-ref   (cid) (hash-table-ref constants cid))
+        (binding-ref (bid) (car (hash-table-ref trace-info-table bid)))))
+
+    ;; Extract index-fn from meta when present (morphism-to-ssa bindings),
+    ;; or rebuild the morphism with trace-time inputs to obtain it
+    ;; (VJP-emitted bindings whose meta never carries 'index-fn).
+    ;; rebuild-morphism can return morphism-expr (most ops) or reduction-morphism.
+    (define (get-index-fn)
+      (let ((p (assq 'index-fn meta)))
+        (if p
+            (cdr p)
+            (let ((trace-inputs (map trace-arr-of (ssa-binding-inputs b))))
+              (cases array-morphism (rebuild-morphism b trace-inputs)
+                (morphism-expr (_ _ ifn _ _ _ _) ifn)
+                (reduction-morphism (_ _ _ ifn _ _ _) ifn)
+                (else (error "compile-one-instruction: rebuild-morphism returned unexpected type"
+                             op meta)))))))
+
+    (cond
+      ;; Zero-copy view: any op where the trace did not allocate (counter not incremented).
+      ;; Only transpose and reshape produce zero-copy views in practice.
+      ((not is-pool?)
+       (let* ((index-fn   (get-index-fn))
+              (batch-axis (cases array-morphism trace-arr
+                            (concrete-array (_ _ _ _ _ _ ba) ba)
+                            (else -1)))
+              (view-fn    (lambda (src) (create-view src index-fn shape batch-axis))))
+         (ri-view view-fn (car in-refs))))
+
+      ;; matmul: use trace-time input arrays to determine BLAS variant once.
+      ;; morph-matmul uses (identity-fn) as a placeholder, so matmul can never
+      ;; use the ri-index path — it always needs the BLAS/Scheme kernel dispatch.
+      ;; execute-blas-gemm/into! handles the row-major case; execute-blas-gemm-strided/into!
+      ;; handles transposed/non-contiguous inputs via a stride-aware Scheme triple loop.
+      ((eq? op 'matmul)
+       (let* ((A-tr      (trace-arr-of (car  (ssa-binding-inputs b))))
+              (B-tr      (trace-arr-of (cadr (ssa-binding-inputs b))))
+              (blas-info (blas-compatible-operation? (morph-matmul A-tr B-tr))))
+         (if blas-info
+             (case (car blas-info)
+               ((gemm)         (ri-gemm pool-idx shape strides dtype
+                                        (car in-refs) (cadr in-refs)))
+               ((gemm-strided) (ri-gemm-strided pool-idx shape strides dtype
+                                                (car in-refs) (cadr in-refs)))
+               (else           (ri-gemm pool-idx shape strides dtype
+                                        (car in-refs) (cadr in-refs))))
+             ;; Not compatible (shapes mismatch etc.) — shouldn't reach here in practice.
+             (error "compile-one-instruction: matmul not BLAS-compatible" (ssa-binding-name b)))))
+
+      ;; Reductions: op is (list 'reduce rop).
+      ;; VJP-emitted reduce has 'axes and 'keepdims? in meta but no 'index-fn;
+      ;; get-index-fn handles both via rebuild-morphism.
+      ((and (pair? op) (eq? (car op) 'reduce))
+       (let* ((rop       (cadr op))
+              (axes      (cdr (assq 'axes meta)))
+              (keepdims? (cdr (assq 'keepdims? meta)))
+              (rfn       (get-index-fn))
+              (reducer   (reduction-index-fn-reducer rfn))
+              (src-arr   (trace-arr-of (car (ssa-binding-inputs b))))
+              (src-dtype (cases array-morphism src-arr
+                           (concrete-array (_ _ _ _ d _ _) d)
+                           (else dtype))))
+         (ri-reduce pool-idx shape strides dtype src-dtype rop axes reducer keepdims?
+                    (car in-refs))))
+
+      ;; Element-wise and all other pool-backed ops.
+      ;; VJP-emitted bindings have empty meta; get-index-fn rebuilds via trace inputs.
+      ;; classify once at compile time into flat fast-paths or generic ri-index fallback.
+      (else
+       (let* ((index-fn  (get-index-fn))
+              (in-traces (map trace-arr-of (ssa-binding-inputs b))))
+         (cond
+           ;; Non-compute index-fns (affine, window, etc.): generic path
+           ((not (compute-index-fn? index-fn))
+            (ri-index pool-idx shape strides dtype index-fn in-refs))
+
+           ;; Fast path 1: unary, row-major, same shape
+           ((flat-unary-eligible? shape in-traces)
+            (ri-flat-unary pool-idx shape strides dtype
+                           (compute-index-fn-combiner index-fn)
+                           (car in-refs)))
+
+           ;; Fast path 2: binary, both row-major, same shape
+           ((flat-binary-eligible? shape in-traces)
+            (ri-flat-binary pool-idx shape strides dtype
+                            (compute-index-fn-combiner index-fn)
+                            (car in-refs) (cadr in-refs)))
+
+           ;; Fast path 3: bias broadcast [B*N] + [N]
+           ((flat-bias-broadcast-eligible? shape in-traces)
+            (let* ((rank (vector-length shape))
+                   (N    (vector-ref shape (- rank 1))))
+              (ri-flat-bias-broadcast pool-idx shape strides dtype
+                                      (compute-index-fn-combiner index-fn)
+                                      N
+                                      (car in-refs) (cadr in-refs))))
+
+           ;; Generic fallback: compute-index-fn with non-trivial layout
+           (else
+            (ri-index pool-idx shape strides dtype index-fn in-refs))))))))
+
+
+;;; ============================================================
+;;; Replay Plan: compile-replay-plan
+;;; ============================================================
+
+(define (compile-replay-plan prog ctx)
+  "Compile the SSA program's bindings into a vector of replay-instructions.
+   ctx must be in replay mode (finalize-context! already called).
+   Reads ssa-program-trace-info to determine pool-idx and BLAS variant.
+   Returns a vector of replay-instruction (one per binding, in binding order)."
+  (let* ((bindings    (ssa-program-bindings prog))
+         (n           (length bindings))
+         (constants   (ssa-program-constants prog))
+         (trace-info  (ssa-program-trace-info prog))
+         (plan-vec    (make-vector n #f))
+         ;; Map binding name -> 0-based position in bindings list
+         (name->pos   (let ((ht (make-hash-table)))
+                        (let loop ((bs bindings) (i 0))
+                          (unless (null? bs)
+                            (hash-table-set! ht (ssa-binding-name (car bs)) i)
+                            (loop (cdr bs) (+ i 1))))
+                        ht)))
+    (let loop ((bs bindings) (i 0))
+      (unless (null? bs)
+        (let* ((b        (car bs))
+               (in-refs  (map (lambda (v) (compile-replay-ref v name->pos))
+                              (ssa-binding-inputs b)))
+               (info     (hash-table-ref trace-info (ssa-binding-name b)))
+               (is-pool? (cdr info))
+               (pool-idx (if is-pool?
+                             (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
+                             -1))
+               (instr    (compile-one-instruction b in-refs pool-idx trace-info constants)))
+          (vector-set! plan-vec i instr)
+          (loop (cdr bs) (+ i 1)))))
+
+    ;; Pre-compute output specs to eliminate name->idx hash-table rebuild per replay step.
+    ;; Each spec is either an integer (0-based position in vals for binding-refs)
+    ;; or a concrete-array (the constant value itself for const-refs).
+    (let ((output-specs
+           (map (lambda (ov)
+                  (cases ssa-value ov
+                    (binding-ref (bid) (hash-table-ref name->pos bid))
+                    (const-ref   (cid) (hash-table-ref constants cid))))
+                (ssa-program-outputs prog))))
+      (ssa-program-output-specs-set! prog output-specs))
+
+    plan-vec))
+
+
+;;; ============================================================
+;;; Replay Plan: execute-replay-plan
+;;; ============================================================
+
+(define (execute-replay-plan plan pool constants)
+  "Execute a pre-compiled replay-plan.
+   plan:      vector of replay-instruction (from compile-replay-plan)
+   pool:      buffer-pool record (from morphism-context-pool ctx)
+   constants: hash-table cid-sym -> concrete-array (from ssa-program-constants)
+   Returns:   vector of concrete-array, one per binding position."
+  (let* ((n         (vector-length plan))
+         (pool-bufs (buffer-pool-buffers pool))
+         (vals      (make-vector n #f))
+         ;; alloc-ctr mirrors the trace-time context counter so that pool-backed
+         ;; bindings get the same alloc-id here as they did during the trace run.
+         ;; Zero-copy (ri-view) bindings don't increment this, matching the trace.
+         (alloc-ctr 0))
+
+    (define (deref ref)
+      (cases replay-ref ref
+        (rr-val   (i)   (vector-ref vals i))
+        (rr-const (cid) (hash-table-ref constants cid))))
+
+    ;; Build a concrete-array for a pool-backed instruction using the next
+    ;; trace-aligned alloc-id (not pool-idx) so callers that inspect alloc-id
+    ;; see the same value as they did in the trace run.
+    ;; Strides are pre-computed at compile time; no compute-strides call per step.
+    (define (make-pool-arr pool-idx shape strides dtype)
+      (let ((aid alloc-ctr))
+        (set! alloc-ctr (+ alloc-ctr 1))
+        (concrete-array (vector-ref pool-bufs pool-idx)
+                        shape strides 0 dtype aid -1)))
+
+    (do ((i 0 (+ i 1)))
+        ((= i n))
+      (let* ((instr (vector-ref plan i))
+             (result
+              (cases replay-instruction instr
+
+                (ri-gemm (pool-idx shape strides dtype A-ref B-ref)
+                  (let ((buf (vector-ref pool-bufs pool-idx)))
+                    (execute-blas-gemm/into! (deref A-ref) (deref B-ref) buf)
+                    (make-pool-arr pool-idx shape strides dtype)))
+
+                (ri-gemm-strided (pool-idx shape strides dtype A-ref B-ref)
+                  (let ((buf (vector-ref pool-bufs pool-idx)))
+                    (execute-blas-gemm-strided/into! (deref A-ref) (deref B-ref) buf)
+                    (make-pool-arr pool-idx shape strides dtype)))
+
+                (ri-index (pool-idx shape strides dtype index-fn in-refs)
+                  (let ((buf (vector-ref pool-bufs pool-idx)))
+                    (execute-index-fn index-fn buf shape (map deref in-refs) dtype)
+                    (make-pool-arr pool-idx shape strides dtype)))
+
+                (ri-reduce (pool-idx shape strides dtype src-dtype rop axes reducer keepdims? in-ref)
+                  (let* ((src (deref in-ref))
+                         (buf (vector-ref pool-bufs pool-idx)))
+                    (cases array-morphism src
+                      (concrete-array (src-data src-shape src-strides src-offset _ _ _)
+                        (execute-reduction-morphism
+                         rop buf shape
+                         src-data src-shape src-strides src-offset
+                         axes reducer keepdims? dtype src-dtype)
+                        (make-pool-arr pool-idx shape strides dtype))
+                      (else
+                       (error "execute-replay-plan ri-reduce: source not concrete" src)))))
+
+                (ri-view (view-fn in-ref)
+                  (view-fn (deref in-ref)))
+
+                (ri-flat-unary (pool-idx shape strides dtype combiner in-A)
+                  (let* ((src  (deref in-A))
+                         (buf  (vector-ref pool-bufs pool-idx))
+                         (size (shape-size shape)))
+                    (cases array-morphism src
+                      (concrete-array (data _ _ _ _ _ _)
+                        (execute-flat-unary-compute combiner data buf size dtype)
+                        (make-pool-arr pool-idx shape strides dtype))
+                      (else (error "ri-flat-unary: source not concrete" src)))))
+
+                (ri-flat-binary (pool-idx shape strides dtype combiner in-A in-B)
+                  (let* ((A    (deref in-A))
+                         (B    (deref in-B))
+                         (buf  (vector-ref pool-bufs pool-idx))
+                         (size (shape-size shape)))
+                    (cases array-morphism A
+                      (concrete-array (data1 _ _ _ _ _ _)
+                        (cases array-morphism B
+                          (concrete-array (data2 _ _ _ _ _ _)
+                            (execute-flat-binary-compute combiner data1 data2 buf size dtype)
+                            (make-pool-arr pool-idx shape strides dtype))
+                          (else (error "ri-flat-binary: B not concrete" B))))
+                      (else (error "ri-flat-binary: A not concrete" A)))))
+
+                (ri-flat-bias-broadcast (pool-idx shape strides dtype combiner N in-A in-B)
+                  (let* ((A    (deref in-A))
+                         (B    (deref in-B))
+                         (buf  (vector-ref pool-bufs pool-idx))
+                         (size (shape-size shape)))
+                    (cases array-morphism A
+                      (concrete-array (data1 _ _ _ _ _ _)
+                        (cases array-morphism B
+                          (concrete-array (data2 _ _ _ _ _ _)
+                            (execute-flat-bias-broadcast-compute combiner data1 data2 buf size N dtype)
+                            (make-pool-arr pool-idx shape strides dtype))
+                          (else (error "ri-flat-bias-broadcast: B not concrete" B))))
+                      (else (error "ri-flat-bias-broadcast: A not concrete" A))))))))
+        (vector-set! vals i result)))
+
+    vals))
+
+
+;;; ============================================================
+;;; Phase 4: ssa-realize/ctx (with lazy replay-plan compilation)
+;;; ============================================================
+
 (define (ssa-realize/ctx ctx prog)
-  "Like ssa-realize but uses realize/ctx for buffer pooling."
-  (let ((values (make-hash-table)))
-    (hash-table-walk (ssa-program-constants prog)
-      (lambda (k v) (hash-table-set! values k v)))
-    (for-each
-     (lambda (b)
-       (let* ((inputs (map (lambda (v)
-                             (hash-table-ref values (ssa-value-id v)))
-                           (ssa-binding-inputs b)))
-              (result (realize/ctx ctx (rebuild-morphism b inputs))))
-         (hash-table-set! values (ssa-binding-name b) result)))
-     (ssa-program-bindings prog))
-    (map (lambda (ov)
-           (hash-table-ref values (ssa-value-id ov)))
-         (ssa-program-outputs prog))))
+  "Execute the SSA program through a morphism context.
+
+   Trace run (first call, context in trace mode):
+     Executes each binding via realize/ctx, recording per-binding trace-info
+     (concrete-array + is-pool? flag). Output bindings with pool allocations
+     are pinned via context-pin-output! so the greedy allocator never reuses
+     their slot within a replay run.
+
+   First replay call (context in replay mode, no plan yet):
+     Lazily compiles the replay-plan from trace-info + finalized pool, then
+     executes it via execute-replay-plan.
+
+   Subsequent replay calls:
+     Executes the pre-compiled replay-plan directly.  No morphism rebuilding,
+     no BLAS-compat re-evaluation, no context-vector allocation per binding."
+  (let* ((mode        (context-mode ctx))
+         (trace-mode? (eq? mode 'trace))
+         (constants   (ssa-program-constants prog))
+         (bindings    (ssa-program-bindings prog)))
+
+    (cond
+      ;; ---- BINDING-LOOP PATH ----
+      ;; Used for the trace run AND for any replay call where trace-info is
+      ;; missing (e.g., when the caller's joint-program state table missed a
+      ;; lookup due to GC-invalidated eq?-hash keys and created a fresh
+      ;; program).  In both cases we run every binding via realize/ctx, collect
+      ;; trace-info, and return the outputs.  Output pinning via
+      ;; context-pin-output! is only performed in true trace mode.
+      ((or trace-mode? (not (ssa-program-trace-info prog)))
+       (let* ((values      (make-hash-table))
+              (trace-info  (make-hash-table))
+              (output-bids (make-hash-table eq? eq?-hash)))
+         ;; Index output binding names for O(1) lookup
+         (for-each (lambda (ov)
+                     (when (ssa-binding-ref? ov)
+                       (hash-table-set! output-bids (ssa-value-id ov) #t)))
+                   (ssa-program-outputs prog))
+         ;; Pre-populate constants
+         (hash-table-walk constants
+           (lambda (k v) (hash-table-set! values k v)))
+         ;; Execute each binding; record trace-info
+         (for-each
+          (lambda (b)
+            (let* ((inputs     (map (lambda (v) (hash-table-ref values (ssa-value-id v)))
+                                    (ssa-binding-inputs b)))
+                   (is-output? (hash-table-ref/default output-bids (ssa-binding-name b) #f))
+                   (ctr-before (context-counter ctx))
+                   (result     (realize/ctx ctx (rebuild-morphism b inputs)))
+                   (is-pool?   (> (context-counter ctx) ctr-before))
+                   (stored
+                    (if is-output?
+                        (if (concrete-row-major? result)
+                            (begin
+                              ;; context-pin-output! only valid in trace mode
+                              (when (and trace-mode? is-pool?)
+                                (context-pin-output! ctx (concrete-alloc-id result)))
+                              result)
+                            (copy-concrete-array result))
+                        result)))
+              (hash-table-set! values (ssa-binding-name b) stored)
+              ;; Record per-binding (concrete-array . is-pool?) for replay-plan compilation
+              (hash-table-set! trace-info (ssa-binding-name b) (cons result is-pool?))))
+          bindings)
+         ;; Save trace-info for lazy replay-plan compilation
+         (ssa-program-trace-info-set! prog trace-info)
+         ;; Return outputs
+         (map (lambda (ov) (hash-table-ref values (ssa-value-id ov)))
+              (ssa-program-outputs prog))))
+
+      ;; ---- REPLAY RUN ----
+      (else
+       ;; Lazily compile replay-plan on first replay call (pool is now available)
+       (unless (ssa-program-replay-plan prog)
+         (ssa-program-replay-plan-set! prog
+           (compile-replay-plan prog ctx)))
+       ;; Execute the pre-compiled plan directly
+       (let* ((plan  (ssa-program-replay-plan prog))
+              (pool  (morphism-context-pool ctx))
+              (vals  (execute-replay-plan plan pool constants))
+              ;; output-specs pre-computed by compile-replay-plan: list of
+              ;; (integer | concrete-array) — no hash-table rebuild per step.
+              (specs (ssa-program-output-specs prog)))
+         (map (lambda (spec)
+                (if (integer? spec)
+                    (let ((v (vector-ref vals spec)))
+                      (if (concrete-row-major? v) v (copy-concrete-array v)))
+                    spec))   ; const-ref: direct concrete-array from constants
+              specs))))))
 
 ) ; end module array-morphisms-ssa
