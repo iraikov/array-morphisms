@@ -46,6 +46,9 @@
          ;; Information
          index-fn-invertible?
          index-fn-rank
+
+         ;; MoA psi-composition for element-wise combiners
+         compose-flat-combiners
          )
 
         (import scheme (chicken base)
@@ -280,6 +283,32 @@
     ;; General composition (no optimization)
     (else
      (make-composed-index-fn f g))))
+
+
+;;;; ============================================================
+;;;; MoA psi-composition for element-wise combiners
+;;;;
+;;;; Implements Psi(f, Psi(g, A)) = Psi(f o g, A) at the combiner level.
+;;;; Used by the SSA element-wise fusion pass.
+;;;; ============================================================
+
+(define (compose-flat-combiners p-combiner p-nargs c-combiner c-extra-nargs)
+  "Compose two element-wise combiners: c-combiner(p-combiner(p-args...), c-rest...).
+   p-nargs:       number of inputs the producer combiner takes.
+   c-extra-nargs: number of consumer inputs beyond the producer's output.
+   Uses fixed-arity lambdas to avoid rest-list allocation on every element call."
+  (cond
+    ((and (= p-nargs 1) (= c-extra-nargs 0))
+     (lambda (x) (c-combiner (p-combiner x))))
+    ((and (= p-nargs 2) (= c-extra-nargs 0))
+     (lambda (x y) (c-combiner (p-combiner x y))))
+    ((and (= p-nargs 1) (= c-extra-nargs 1))
+     (lambda (x y) (c-combiner (p-combiner x) y)))
+    ((and (= p-nargs 2) (= c-extra-nargs 1))
+     (lambda (x y z) (c-combiner (p-combiner x y) z)))
+    (else (error "compose-flat-combiners: unsupported arity"
+                 `(p-nargs ,p-nargs) `(c-extra-nargs ,c-extra-nargs)))))
+
 
 (define (apply-index-fn fn indices)
   "Apply index function to indices.

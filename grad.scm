@@ -68,6 +68,9 @@
    var-cos
    var-negate
    var-abs
+   var-relu
+   var-sigmoid
+   var-tanh
    var-sum
    var-mean
    var-reshape
@@ -524,6 +527,49 @@
             (accumulate-grad! v (morph* g (morph-sign x)))))))
     out))
 
+
+
+(define (var-relu v)
+  "Gradient-tracking ReLU.  d/dx = g * heaviside(x)  [lazy]"
+  (let* ((x   (var-value v))
+         (rg  (var-requires-grad? v))
+         (out (make-var (morph-relu x) rg)))
+    (when rg
+      (morph-variable-parents-set! out (list v))
+      (morph-variable-grad-fn-set! out
+        (lambda (g)
+          (let ((x (var-value v)))
+            (accumulate-grad! v
+              (morph* g (morph-map (lambda (xv) (if (> xv 0.0) 1.0 0.0)) x)))))))
+    out))
+
+(define (var-sigmoid v)
+  "Gradient-tracking sigmoid.  d/dx = g * s * (1-s) where s=sigmoid(x)  [lazy]"
+  (let* ((x   (var-value v))
+         (rg  (var-requires-grad? v))
+         (out (make-var (morph-sigmoid x) rg)))
+    (when rg
+      (morph-variable-parents-set! out (list v))
+      (morph-variable-grad-fn-set! out
+        (lambda (g)
+          (let ((s (var-value out)))
+            (accumulate-grad! v
+              (morph* g (morph-map (lambda (sv) (* sv (- 1.0 sv))) s)))))))
+    out))
+
+(define (var-tanh v)
+  "Gradient-tracking tanh.  d/dx = g * (1 - t^2) where t=tanh(x)  [lazy]"
+  (let* ((x   (var-value v))
+         (rg  (var-requires-grad? v))
+         (out (make-var (morph-tanh-am x) rg)))
+    (when rg
+      (morph-variable-parents-set! out (list v))
+      (morph-variable-grad-fn-set! out
+        (lambda (g)
+          (let ((t (var-value out)))
+            (accumulate-grad! v
+              (morph* g (morph-map (lambda (tv) (- 1.0 (* tv tv))) t)))))))
+    out))
 
 
 ;;;; ============================================================

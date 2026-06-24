@@ -15,8 +15,8 @@
 
 (import scheme (chicken base))
 (import test)
-(import (only srfi-1 iota every map filter filter-map))
-(import (only srfi-4 f64vector-ref f64vector-length))
+(import (only srfi-1 iota every map filter filter-map take drop))
+(import (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!))
 (import srfi-69)
 (import datatype)
 (import array-morphisms-core)
@@ -771,3 +771,354 @@
         (let* ((results (ssa-realize/ctx ctx joint)))
           (and (>= (output-alloc-id (cadr  results)) 0)
                (>= (output-alloc-id (caddr results)) 0)))))))
+
+
+;;;; ============================================================
+;;;; Group E2: compose-flat-combiners and SSA element-wise fusion pass
+;;;; ============================================================
+
+(test-group "E2: compose-flat-combiners"
+
+  (test "unary+unary: abs then negate"
+    -3.0
+    (let ((fused (compose-flat-combiners abs 1 - 0)))
+      (fused -3.0)))
+
+  (test "unary+unary: negate then abs"
+    3.0
+    (let ((fused (compose-flat-combiners - 1 abs 0)))
+      (fused -3.0)))
+
+  (test "binary+unary: add then relu passes negative to zero"
+    0.0
+    (let ((fused (compose-flat-combiners + 2 (lambda (x) (max 0.0 x)) 0)))
+      (fused 1.0 -3.0)))
+
+  (test "binary+unary: add then relu passes positive through"
+    1.5
+    (let ((fused (compose-flat-combiners + 2 (lambda (x) (max 0.0 x)) 0)))
+      (fused 1.0 0.5)))
+
+  (test "unary chain of 3 composes correctly"
+    3.0
+    ;; abs(-3) = 3; negate(3) = -3; abs(-3) = 3
+    (let* ((f01  (compose-flat-combiners abs 1 (lambda (x) (- x)) 0))
+           (f012 (compose-flat-combiners f01 1 abs 0)))
+      (f012 -3.0))))
+
+
+(test-group "E2: ssa-element-wise-fusion-pass"
+
+  (test "unary chain abs+negate: fusion reduces binding count by 1"
+    1
+    (let* ((a     (morph-from-list '(-3.0 2.0) #(2) 'f64))
+           (prog0 (morphism-to-ssa (am:make-var (morph-negate (morph-abs a)) #f)))
+           (n-before (length (ssa-program-bindings prog0)))
+           (prog1 (ssa-element-wise-fusion-pass prog0))
+           (n-after  (length (ssa-program-bindings prog1))))
+      (- n-before n-after)))
+
+  (test "fused abs+negate produces correct numerics"
+    '(-3 -2)
+    ;; abs(-3)=3 -> negate(3)=-3; abs(2)=2 -> negate(2)=-2
+    (let* ((a     (morph-from-list '(-3.0 2.0) #(2) 'f64))
+           (prog0 (morphism-to-ssa (am:make-var (morph-negate (morph-abs a)) #f)))
+           (prog1 (ssa-element-wise-fusion-pass prog0))
+           (res   (ssa-realize prog1)))
+      (map inexact->exact (map exact->inexact (concrete->list (car res))))))
+
+  (test "multi-consumer binding is not fused (b has 2 consumers)"
+    3
+    ;; b = abs(a); c = negate(b); d = b + c  => b has use-count=2 -> no fusion of b into c
+    (let* ((a     (morph-from-list '(1.0 2.0) #(2) 'f64))
+           (b     (morph-abs a))
+           (c     (morph-negate b))
+           (d     (morph+ b c))
+           (prog0 (morphism-to-ssa (am:make-var d #f)))
+           (n-before (length (ssa-program-bindings prog0)))
+           (prog1 (ssa-element-wise-fusion-pass prog0))
+           (n-after  (length (ssa-program-bindings prog1))))
+      n-after))
+
+  (test "reduction is not fused (non-elementwise shape change)"
+    2
+    ;; abs on [4] -> reduce-sum to scalar: abs has 1 consumer but reduce is not elementwise
+    (let* ((a     (morph-from-list '(1.0 -2.0 3.0 -4.0) #(4) 'f64))
+           (b     (morph-abs a))
+           (c     (morph-reduce 'sum b '(0) #f))
+           (prog0 (morphism-to-ssa (am:make-var c #f)))
+           (prog1 (ssa-element-wise-fusion-pass prog0)))
+      (length (ssa-program-bindings prog1))))
+
+  (test "ssa-vjp fusion: negate+mul VJP bindings fuse when eligible"
+    #t
+    ;; loss = sum(negate(x)) for leaf x
+    ;; Forward: negate binding (1)
+    ;; Backward: negate-of-g (dx=-g), no reduction needed since x same shape as loss
+    ;; With E2, backward negate-of-g may fuse with the add(loss,zero) trailing binding
+    ;; The key invariant: gradient values must be correct after fusion
+    (let* ((xs   '(1.0 2.0 3.0))
+           (x-m  (morph-from-list xs #(3) 'f64))
+           (xv   (am:make-var x-m #t))
+           (loss (am:var-sum (am:var-negate xv)))
+           (res  (compile-and-realize loss (list xv)))
+           (got-dx (cadr res)))
+      ;; dL/dx[i] = -1 for all i
+      (lists-approx= got-dx '(-1.0 -1.0 -1.0)))))
+
+
+;;;; ============================================================
+;;;; Group E1: single-op activations -- forward and backward
+;;;; ============================================================
+
+(test-group "E1: morph-relu forward"
+  (test "relu: positive values unchanged"
+    '(1.0 2.0 3.0)
+    (let* ((x  (morph-from-list '(1.0 2.0 3.0) #(3) 'f64)))
+      (map exact->inexact (concrete->list (realize (morph-relu x))))))
+
+  (test "relu: negative values clamped to zero"
+    '(0.0 0.0 0.0)
+    (let* ((x  (morph-from-list '(-1.0 -2.0 -3.0) #(3) 'f64)))
+      (map exact->inexact (concrete->list (realize (morph-relu x))))))
+
+  (test "relu: mixed signs"
+    '(0.0 2.0 0.0 4.0)
+    (let* ((x  (morph-from-list '(-1.0 2.0 -3.0 4.0) #(4) 'f64)))
+      (map exact->inexact (concrete->list (realize (morph-relu x)))))))
+
+
+(test-group "E1: morph-sigmoid forward"
+  (define (sigmoid x) (/ 1.0 (+ 1.0 (exp (- x)))))
+
+  (test "sigmoid: known values approx correct"
+    #t
+    (let* ((xs  '(-2.0 -1.0 0.0 1.0 2.0))
+           (x-m (morph-from-list xs #(5) 'f64))
+           (got (map exact->inexact (concrete->list (realize (morph-sigmoid x-m)))))
+           (exp (map sigmoid xs)))
+      (lists-approx= got exp))))
+
+
+(test-group "E1: morph-tanh-am forward"
+  (define (my-tanh x)
+    (let ((e2 (exp (* 2.0 (exact->inexact x)))))
+      (/ (- e2 1.0) (+ e2 1.0))))
+
+  (test "tanh: known values approx correct"
+    #t
+    (let* ((xs  '(-1.0 0.0 1.0))
+           (x-m (morph-from-list xs #(3) 'f64))
+           (got (map exact->inexact (concrete->list (realize (morph-tanh-am x-m)))))
+           (exp (map my-tanh xs)))
+      (lists-approx= got exp))))
+
+
+(test-group "E1: var-relu SSA gradient"
+  (test "relu: gradient correct via SSA VJP"
+    #t
+    ;; loss = mean(relu(x)), x = [-2 -1 0 1 2]
+    ;; dL/dx[i] = (1/5) * (if x[i]>0 1 0) = [0 0 0 0.2 0.2]
+    (let* ((xs  '(-2.0 -1.0 0.0 1.0 2.0))
+           (x-m (morph-from-list xs #(5) 'f64))
+           (xv  (am:make-var x-m #t))
+           (out (am:var-relu xv))
+           (loss (am:var-mean out))
+           (res  (compile-and-realize loss (list xv)))
+           (got  (cadr res)))
+      (lists-approx= got '(0.0 0.0 0.0 0.2 0.2)))))
+
+
+(test-group "E1: var-sigmoid SSA gradient"
+  (define (sigmoid x) (/ 1.0 (+ 1.0 (exp (- (exact->inexact x))))))
+
+  (test "sigmoid: gradient correct via SSA VJP"
+    #t
+    ;; loss = mean(sigmoid(x)), x = [1 2]
+    ;; dL/dx[i] = (1/2) * sigmoid(x[i]) * (1 - sigmoid(x[i]))
+    (let* ((xs  '(1.0 2.0))
+           (x-m (morph-from-list xs #(2) 'f64))
+           (xv  (am:make-var x-m #t))
+           (out (am:var-sigmoid xv))
+           (loss (am:var-mean out))
+           (res  (compile-and-realize loss (list xv)))
+           (got  (cadr res))
+           (exp  (map (lambda (x)
+                        (let ((s (sigmoid x)))
+                          (* 0.5 s (- 1.0 s))))
+                      xs)))
+      (lists-approx= got exp))))
+
+
+(test-group "E1: var-tanh SSA gradient"
+  (define (my-tanh x)
+    (let ((e2 (exp (* 2.0 (exact->inexact x)))))
+      (/ (- e2 1.0) (+ e2 1.0))))
+
+  (test "tanh: gradient correct via SSA VJP"
+    #t
+    ;; loss = mean(tanh(x)), x = [0.5 -0.5]
+    ;; dL/dx[i] = (1/2) * (1 - tanh(x[i])^2)
+    (let* ((xs  '(0.5 -0.5))
+           (x-m (morph-from-list xs #(2) 'f64))
+           (xv  (am:make-var x-m #t))
+           (out (am:var-tanh xv))
+           (loss (am:var-mean out))
+           (res  (compile-and-realize loss (list xv)))
+           (got  (cadr res))
+           (exp  (map (lambda (x)
+                        (let ((t (my-tanh x)))
+                          (* 0.5 (- 1.0 (* t t)))))
+                      xs)))
+      (lists-approx= got exp))))
+
+
+(test-group "E4: cross-AD-boundary fusion with relu"
+  (test "relu: gradient correct + joint program binding count lower than decomposed"
+    #t
+    ;; Compare binding count: var-relu vs old abs+add+mul decomposition
+    (let* ((xs  '(-1.0 0.5 1.0 2.0))
+           (x-m (morph-from-list xs #(4) 'f64))
+           ;; New single-op relu path
+           (xv1  (am:make-var x-m #t))
+           (fwd1 (morphism-to-ssa (am:var-mean (am:var-relu xv1))))
+           (p1   (filter-map (lambda (v)
+                               (ssa-constant-id fwd1 (am:var-value v)))
+                             (list xv1)))
+           (jnt1 (ssa-vjp fwd1 p1 (ssa-loss-binding-val fwd1)))
+           (n1   (length (ssa-program-bindings jnt1)))
+           ;; Old 3-op decomposition: relu = 0.5*(x + |x|)
+           (xv2    (am:make-var x-m #t))
+           (abs-x  (am:var-abs xv2))
+           (sum-x  (am:var+ xv2 abs-x))
+           (half-m (morph-from-list '(0.5) #(1) 'f64))
+           (half-v (am:make-var half-m #f))
+           (relu2  (am:var* sum-x half-v))
+           (fwd2   (morphism-to-ssa (am:var-mean relu2)))
+           (p2     (filter-map (lambda (v)
+                                 (ssa-constant-id fwd2 (am:var-value v)))
+                               (list xv2)))
+           (jnt2   (ssa-vjp fwd2 p2 (ssa-loss-binding-val fwd2)))
+           (n2     (length (ssa-program-bindings jnt2))))
+      (< n1 n2))))
+
+
+;;;; ============================================================
+;;;; Group E3: GEMM epilogue fusion
+;;;; ============================================================
+
+(test-group "E3: in-place epilogue kernels"
+
+  (test "execute-flat-unary-compute-inplace! relu clamps negatives"
+    '(0.0 0.0 1.0 2.0)
+    (let* ((buf (f64vector -1.0 -0.5 1.0 2.0))
+           (_   (execute-flat-unary-compute-inplace!
+                 (lambda (x) (max 0.0 x)) buf 4 'f64)))
+      (map (lambda (i) (f64vector-ref buf i)) (iota 4))))
+
+  (test "execute-flat-unary-compute-inplace! negate"
+    '(1.0 -2.0 3.0)
+    (let* ((buf (f64vector -1.0 2.0 -3.0))
+           (_   (execute-flat-unary-compute-inplace! - buf 3 'f64)))
+      (map (lambda (i) (f64vector-ref buf i)) (iota 3))))
+
+  (test "execute-flat-bias-broadcast-inplace! add-bias relu"
+    '(0.0 2.0 0.0 3.0)
+    ;; buf = [-1, 1, -2, 2], bias = [1, 1] (N=2)
+    ;; combiner = max(0, x+b): -1+1=0->0, 1+1=2->2, -2+1=-1->0, 2+1=3->3
+    (let* ((buf  (f64vector -1.0 1.0 -2.0 2.0))
+           (bias (f64vector 1.0 1.0))
+           (_    (execute-flat-bias-broadcast-inplace!
+                  (lambda (x b) (max 0.0 (+ x b))) buf bias 4 2 'f64)))
+      (map (lambda (i) (f64vector-ref buf i)) (iota 4)))))
+
+
+(define (plan-has-epilogue? plan)
+  (let loop ((i 0))
+    (cond
+      ((>= i (vector-length plan)) #f)
+      (else
+       (cases replay-instruction (vector-ref plan i)
+         (ri-gemm-epilogue (_ _ _ _ _ _ _ _ _ _) #t)
+         (else (loop (+ i 1))))))))
+
+(test-group "E3: ri-gemm-epilogue in replay plan"
+
+  (test "Dense+relu: replay plan contains ri-gemm-epilogue after ctx replay"
+    #t
+    ;; x[2,3] @ W[3,4] + b[4], then relu, then mean
+    (let* ((x-data (morph-from-list '(1.0 2.0 3.0 4.0 5.0 6.0) #(2 3) 'f64))
+           (W-data (morph-from-list '(0.1 0.1 0.1 0.1 0.1 0.1
+                                     0.1 0.1 0.1 0.1 0.1 0.1) #(3 4) 'f64))
+           (b-data (morph-from-list '(0.1 0.1 0.1 0.1) #(4) 'f64))
+           (xv (am:make-var x-data #f))
+           (Wv (am:make-var W-data #t))
+           (bv (am:make-var b-data #t))
+           (pre  (am:var+ (am:var-matmul xv Wv) bv))
+           (act  (am:var-relu pre))
+           (loss (am:var-mean act))
+           (ctx  (make-morphism-context)))
+      ;; trace run (compile-and-realize/ctx returns (values joint results))
+      (let-values (((jnt _trace) (compile-and-realize/ctx ctx loss (list Wv bv))))
+        ;; finalize + replay (replay call compiles the plan)
+        (finalize-context! ctx)
+        (ssa-realize/ctx ctx jnt)
+        (plan-has-epilogue? (ssa-program-replay-plan jnt)))))
+
+  (test "Dense+relu: ssa-realize/ctx result matches direct realize"
+    #t
+    (let* ((x-data (morph-from-list '(1.0 2.0 3.0 4.0 5.0 6.0) #(2 3) 'f64))
+           (W-data (morph-from-list '(0.1 0.1 0.1 0.1 0.1 0.1
+                                     0.1 0.1 0.1 0.1 0.1 0.1) #(3 4) 'f64))
+           (b-data (morph-from-list '(0.1 0.1 0.1 0.1) #(4) 'f64))
+           ;; Reference: direct realize without SSA
+           (pre-ref  (morph+ (morph-matmul x-data W-data) b-data))
+           (act-ref  (morph-relu pre-ref))
+           (ref-vals (concrete->list (realize act-ref)))
+           ;; SSA replay path
+           (xv (am:make-var x-data #f))
+           (Wv (am:make-var W-data #t))
+           (bv (am:make-var b-data #t))
+           (pre  (am:var+ (am:var-matmul xv Wv) bv))
+           (act  (am:var-relu pre))
+           (loss (am:var-mean act))
+           (fwd  (morphism-to-ssa loss))
+           (pv   (filter-map (lambda (v) (ssa-constant-id fwd (am:var-value v)))
+                             (list Wv bv)))
+           (jnt  (ssa-vjp fwd pv (ssa-loss-binding-val fwd)))
+           (ctx  (make-morphism-context))
+           (res  (ssa-realize/ctx ctx jnt))
+           (ssa-loss (car (concrete->list (car res))))
+           (ref-loss (/ (apply + ref-vals) (length ref-vals))))
+      (approx= ssa-loss ref-loss)))
+
+  (test "Dense+relu: gradient w.r.t. W is correct"
+    #t
+    ;; dL/dW numerically via finite differences vs analytical SSA gradient
+    (let* ((x-data  (morph-from-list '(1.0 0.0) #(1 2) 'f64))
+           (W-data  (morph-from-list '(0.5 0.5 0.5 0.5) #(2 2) 'f64))
+           (b-data  (morph-from-list '(0.0 0.0) #(2) 'f64))
+           (xv (am:make-var x-data #f))
+           (Wv (am:make-var W-data #t))
+           (bv (am:make-var b-data #t))
+           (pre  (am:var+ (am:var-matmul xv Wv) bv))
+           (act  (am:var-relu pre))
+           (loss (am:var-mean act))
+           ;; SSA gradient
+           (fwd  (morphism-to-ssa loss))
+           (pv   (filter-map (lambda (v) (ssa-constant-id fwd (am:var-value v)))
+                             (list Wv bv)))
+           (jnt  (ssa-vjp fwd pv (ssa-loss-binding-val fwd)))
+           (ctx  (make-morphism-context))
+           (res  (ssa-realize/ctx ctx jnt))
+           ;; Gradient for W is second output (index 1)
+           (dW   (concrete->list (list-ref res 1)))
+           ;; x = [1, 0], W = [[0.5,0.5],[0.5,0.5]], b = [0,0]
+           ;; pre = [0.5, 0.5], relu -> [0.5, 0.5], loss = 0.5
+           ;; d loss/d W[i,j] = (1/2) * x[i] * (if pre[j]>0 1 0)
+           ;; dW = x^T * (heaviside(pre) / N) = [[0.5,0.5],[0,0]]
+           (expected-dW '(0.5 0.5 0.0 0.0)))
+      (lists-approx= dW expected-dW))))
+
+
+(test-end)

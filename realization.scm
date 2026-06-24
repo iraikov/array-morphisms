@@ -54,6 +54,8 @@
    execute-flat-unary-compute
    execute-flat-binary-compute
    execute-flat-bias-broadcast-compute
+   execute-flat-unary-compute-inplace!
+   execute-flat-bias-broadcast-inplace!
    )
 
   (import scheme chicken.base chicken.module)
@@ -973,6 +975,26 @@
                (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (s64vector-ref data1 i)
                                                                                     (s64vector-ref data2 (modulo i N))))))))
       (else (error "execute-flat-bias-broadcast-compute: unsupported dtype" dtype))))
+
+  (define (execute-flat-unary-compute-inplace! combiner buf size dtype)
+    (case dtype
+      ((f64) (do ((i 0 (+ i 1))) ((= i size))
+               (f64vector-set! buf i (exact->inexact (combiner (f64vector-ref buf i))))))
+      ((f32) (do ((i 0 (+ i 1))) ((= i size))
+               (f32vector-set! buf i (exact->inexact (combiner (f32vector-ref buf i))))))
+      (else (error "execute-flat-unary-compute-inplace!: unsupported dtype" dtype))))
+
+  (define (execute-flat-bias-broadcast-inplace! combiner buf bias-data size N dtype)
+    (case dtype
+      ((f64) (do ((i 0 (+ i 1))) ((= i size))
+               (f64vector-set! buf i
+                 (exact->inexact (combiner (f64vector-ref buf i)
+                                           (f64vector-ref bias-data (modulo i N)))))))
+      ((f32) (do ((i 0 (+ i 1))) ((= i size))
+               (f32vector-set! buf i
+                 (exact->inexact (combiner (f32vector-ref buf i)
+                                           (f32vector-ref bias-data (modulo i N)))))))
+      (else (error "execute-flat-bias-broadcast-inplace!: unsupported dtype" dtype))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Window Morphism Execution (im2col, Padding)

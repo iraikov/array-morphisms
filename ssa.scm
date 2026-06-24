@@ -38,6 +38,7 @@
    ssa-program?
    ssa-program-constants ssa-program-morph-to-val
    ssa-program-bindings ssa-program-outputs ssa-program-n-params
+   ssa-program-replay-plan
 
    ;; Compilation
    morphism-to-ssa
@@ -54,16 +55,22 @@
    ;; Replay plan ADTs
    replay-ref?
    rr-val rr-const
-   replay-instruction?
+   replay-instruction replay-instruction?
    ri-gemm ri-gemm-strided ri-index ri-reduce ri-view
    ri-flat-unary ri-flat-binary ri-flat-bias-broadcast
+   ri-gemm-epilogue ri-alias
+
+   ;; Fusion pass
+   ssa-compute-use-counts
+   ssa-fusion-eligible?
+   ssa-element-wise-fusion-pass
 
    ;; Replay plan compilation and execution
    compile-replay-plan
    execute-replay-plan)
 
   (import scheme (chicken base))
-  (import (only srfi-1 iota fold filter map for-each append-map filter-map))
+  (import (only srfi-1 iota fold filter map for-each append-map filter-map every))
   (import (only srfi-4
                 f64vector f64vector-set! f64vector-length
                 f32vector f32vector-set! f32vector-length))
@@ -231,7 +238,188 @@
     (combiner     procedure?)
     (bias-N       integer?)
     (in-A         replay-ref?)
-    (in-B         replay-ref?)))
+    (in-B         replay-ref?))
+
+  ;; GEMM with in-place element-wise epilogue: one buffer, one combined kernel.
+  ;; BLAS GEMM writes out-pool-idx buffer C[M,N] = A[M,K]*B[K,N],
+  ;; then epilogue applied in-place to C.
+  ;; epilogue-kind: 'unary | 'bias-broadcast
+  ;; epilogue-N:    bias length for 'bias-broadcast; 0 for 'unary
+  ;; bias-ref:      unused sentinel for 'unary; bias replay-ref for 'bias-broadcast
+  (ri-gemm-epilogue
+    (out-pool-idx  integer?)
+    (out-shape     vector?)
+    (out-strides   vector?)
+    (out-dtype     symbol?)
+    (in-A          replay-ref?)
+    (in-B          replay-ref?)
+    (epilogue-kind symbol?)
+    (epilogue-comb procedure?)
+    (epilogue-N    integer?)
+    (bias-ref      replay-ref?))
+
+  ;; Alias for the epilogue binding position after ri-gemm-epilogue.
+  ;; Advances alloc-ctr to stay in sync with trace-time pool allocation.
+  ;; Returns the already-computed epilogue result from in-ref (the GEMM step).
+  (ri-alias
+    (pool-idx  integer?)
+    (shape     vector?)
+    (strides   vector?)
+    (dtype     symbol?)
+    (in-ref    replay-ref?)))
+
+
+;;; ============================================================
+;;; SSA Fusion Helpers (element-wise fusion pass)
+;;;
+;;; Implements MoA's psi-composition theorem at the SSA IR level:
+;;;   Psi(f, Psi(g, A)) = Psi(f o g, A)
+;;; Two adjacent element-wise bindings with use-count=1 are collapsed
+;;; into a single binding whose combiner is the composition of theirs.
+;;; ============================================================
+
+(define (ssa-binding-combiner b)
+  "Extract element-wise combiner from an SSA binding's meta.
+   Forward bindings carry (index-fn . compute-index-fn); backward bindings
+   carry explicit (combiner . proc) embedded during ssa-vjp."
+  (let* ((meta (ssa-binding-meta b))
+         (cp   (assq 'combiner meta)))
+    (if cp
+        (cdr cp)
+        (let ((ip (assq 'index-fn meta)))
+          (if (and ip (compute-index-fn? (cdr ip)))
+              (compute-index-fn-combiner (cdr ip))
+              (error "ssa-binding-combiner: no combiner in meta"
+                     (ssa-binding-name b) (ssa-binding-op b)))))))
+
+(define (ssa-binding-elementwise? b)
+  "True when b is an element-wise compute op (not matmul, reduce, or structural)."
+  (let ((op (ssa-binding-op b)))
+    (and (not (eq? op 'matmul))
+         (not (and (pair? op) (eq? (car op) 'reduce)))
+         (not (memq op '(reshape transpose broadcast-expand slice))))))
+
+(define (ssa-compute-use-counts bindings)
+  "Return hash-table: binding-name-sym -> integer (number of consuming bindings)."
+  (let ((counts (make-hash-table)))
+    (for-each (lambda (b)
+                (hash-table-set! counts (ssa-binding-name b) 0))
+              bindings)
+    (for-each
+     (lambda (b)
+       (for-each
+        (lambda (v)
+          (cases ssa-value v
+            (binding-ref (bid)
+              (when (hash-table-ref/default counts bid #f)
+                (hash-table-set! counts bid
+                  (+ 1 (hash-table-ref counts bid)))))
+            (const-ref (_) #f)))
+        (ssa-binding-inputs b)))
+     bindings)
+    counts))
+
+(define (ssa-binding-has-combiner? b)
+  "True when b carries an extractable element-wise combiner in meta."
+  (let ((meta (ssa-binding-meta b)))
+    (or (and (assq 'combiner meta) #t)
+        (let ((ip (assq 'index-fn meta)))
+          (and ip (compute-index-fn? (cdr ip)))))))
+
+(define (ssa-fusion-eligible? producer consumer use-counts)
+  "True when producer and consumer can be fused by MoA psi-composition.
+   Requires: use-count(producer)=1, consumer's first input is producer's output,
+   same shape, both element-wise, both have extractable combiners."
+  (let* ((p-name  (ssa-binding-name producer))
+         (p-count (hash-table-ref/default use-counts p-name 0))
+         (c-in0   (and (pair? (ssa-binding-inputs consumer))
+                       (car (ssa-binding-inputs consumer)))))
+    (and (= p-count 1)
+         (cases ssa-value c-in0
+           (binding-ref (bid) (eq? bid p-name))
+           (else #f))
+         (equal? (ssa-binding-shape producer) (ssa-binding-shape consumer))
+         (ssa-binding-elementwise? producer)
+         (ssa-binding-elementwise? consumer)
+         (ssa-binding-has-combiner? producer)
+         (ssa-binding-has-combiner? consumer))))
+
+(define (fuse-two-ssa-bindings producer consumer)
+  "Fuse producer into consumer via combiner composition.
+   The fused binding inherits consumer's name (preserving downstream refs).
+   Producer's intermediate buffer is eliminated."
+  (let* ((p-inputs (ssa-binding-inputs producer))
+         (c-inputs (ssa-binding-inputs consumer))
+         (c-other  (cdr c-inputs))
+         (fused-inputs (append p-inputs c-other))
+         (p-comb  (ssa-binding-combiner producer))
+         (c-comb  (ssa-binding-combiner consumer))
+         (p-nargs (length p-inputs))
+         (fused-comb (compose-flat-combiners p-comb p-nargs c-comb (length c-other)))
+         (base-meta (filter (lambda (kv)
+                                 (not (memq (car kv) '(combiner index-fn fused?))))
+                               (ssa-binding-meta consumer)))
+         (fused-meta (cons `(combiner . ,fused-comb)
+                           (cons `(fused? . #t) base-meta))))
+    (make-ssa-binding (ssa-binding-name consumer)
+                      (ssa-binding-op consumer)
+                      fused-inputs
+                      (ssa-binding-shape consumer)
+                      (ssa-binding-dtype consumer)
+                      fused-meta)))
+
+(define (ssa-element-wise-fusion-pass prog)
+  "Apply MoA psi-composition to eligible adjacent binding pairs.
+   Greedy left-to-right scan: whenever a producer P has use-count=1 and
+   its only consumer C immediately follows, fuse them into one binding F.
+   Chains of length > 2 are handled by re-presenting F as the new producer.
+   Safety constraint: fusion is only applied when ALL of producer's inputs
+   have the same shape as the producer's output (flat/non-broadcasting ops),
+   ensuring identity index functions are valid in the fused binding."
+  (let* ((bindings   (ssa-program-bindings prog))
+         (use-counts (ssa-compute-use-counts bindings))
+         ;; Shape lookup: id-sym -> shape vector (bindings + constants)
+         (shape-of   (make-hash-table)))
+    (for-each (lambda (b)
+                (hash-table-set! shape-of (ssa-binding-name b) (ssa-binding-shape b)))
+              bindings)
+    (hash-table-walk (ssa-program-constants prog)
+      (lambda (k v) (hash-table-set! shape-of k (morph-shape v))))
+
+    ;; True when all inputs of b have the same shape as b's output.
+    (define (flat-producer? b)
+      (let ((b-shape (ssa-binding-shape b)))
+        (every (lambda (inp)
+                 (let ((id (cases ssa-value inp
+                             (binding-ref (bid) bid)
+                             (const-ref   (cid) cid))))
+                   (equal? (hash-table-ref/default shape-of id #f) b-shape)))
+               (ssa-binding-inputs b))))
+
+    (let loop ((bs bindings) (result '()) (eliminated (make-hash-table)))
+      (cond
+        ((null? bs)
+         (make-ssa-program
+          (ssa-program-constants prog)
+          (ssa-program-morph-to-val prog)
+          (reverse result)
+          (ssa-program-outputs prog)
+          (ssa-program-n-params prog)
+          #f #f #f))
+        ((hash-table-ref/default eliminated (ssa-binding-name (car bs)) #f)
+         (loop (cdr bs) result eliminated))
+        ((and (pair? (cdr bs))
+              (not (hash-table-ref/default eliminated
+                     (ssa-binding-name (cadr bs)) #f))
+              (ssa-fusion-eligible? (car bs) (cadr bs) use-counts)
+              (flat-producer? (car bs)))
+         (let ((fused (fuse-two-ssa-bindings (car bs) (cadr bs))))
+           (hash-table-set! eliminated (ssa-binding-name (car bs)) #t)
+           ;; Update shape-of for the fused binding (inherits consumer's name+shape)
+           (hash-table-set! shape-of (ssa-binding-name fused) (ssa-binding-shape fused))
+           (loop (cons fused (cddr bs)) result eliminated)))
+        (else
+         (loop (cdr bs) (cons (car bs) result) eliminated))))))
 
 
 ;;; ============================================================
@@ -477,7 +665,7 @@
              (_ (hash-table-set! binding-dtype ones-cid dtype))
              (ones-val (const-ref ones-cid)))
         ;; morph* broadcasts: g-kd * ones -> src-shape
-        (emit! 'mul (list g-kd ones-val) src-shape dtype '())))
+        (emit! 'mul (list g-kd ones-val) src-shape dtype `((combiner . ,*)))))
 
     ;; emit-scalar-const! -- emit a scalar constant of given value
     (define (emit-scalar-const! value dtype)
@@ -541,7 +729,8 @@
                        (y-shape (val-shape y-val)))
                   (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype)))
                     (accumulate-input-adjoint! x-val dx))
-                  (let* ((neg-g (emit! 'negate (list g-val) g-shape dtype '()))
+                  (let* ((neg-g (emit! 'negate (list g-val) g-shape dtype
+                                        `((combiner . ,(lambda (x) (- x))))))
                          (dy    (emit-reduce-sum-to! neg-g g-shape y-shape dtype)))
                     (accumulate-input-adjoint! y-val dy))))
 
@@ -551,10 +740,12 @@
                        (y-val (list-ref inputs 1))
                        (x-shape (val-shape x-val))
                        (y-shape (val-shape y-val)))
-                  (let* ((gy    (emit! 'mul (list g-val y-val) g-shape dtype '()))
+                  (let* ((gy    (emit! 'mul (list g-val y-val) g-shape dtype
+                                        `((combiner . ,*))))
                          (dx    (emit-reduce-sum-to! gy g-shape x-shape dtype)))
                     (accumulate-input-adjoint! x-val dx))
-                  (let* ((gx    (emit! 'mul (list g-val x-val) g-shape dtype '()))
+                  (let* ((gx    (emit! 'mul (list g-val x-val) g-shape dtype
+                                        `((combiner . ,*))))
                          (dy    (emit-reduce-sum-to! gx g-shape y-shape dtype)))
                     (accumulate-input-adjoint! y-val dy))))
 
@@ -564,13 +755,18 @@
                        (y-val (list-ref inputs 1))
                        (x-shape (val-shape x-val))
                        (y-shape (val-shape y-val)))
-                  (let* ((g-over-y (emit! 'div (list g-val y-val) g-shape dtype '()))
+                  (let* ((g-over-y (emit! 'div (list g-val y-val) g-shape dtype
+                                           `((combiner . ,/))))
                          (dx       (emit-reduce-sum-to! g-over-y g-shape x-shape dtype)))
                     (accumulate-input-adjoint! x-val dx))
-                  (let* ((y2      (emit! 'mul (list y-val y-val) y-shape dtype '()))
-                         (x-over-y2 (emit! 'div (list x-val y2) g-shape dtype '()))
-                         (neg-dy  (emit! 'mul (list g-val x-over-y2) g-shape dtype '()))
-                         (neg-dy2 (emit! 'negate (list neg-dy) g-shape dtype '()))
+                  (let* ((y2      (emit! 'mul (list y-val y-val) y-shape dtype
+                                          `((combiner . ,*))))
+                         (x-over-y2 (emit! 'div (list x-val y2) g-shape dtype
+                                            `((combiner . ,/))))
+                         (neg-dy  (emit! 'mul (list g-val x-over-y2) g-shape dtype
+                                          `((combiner . ,*))))
+                         (neg-dy2 (emit! 'negate (list neg-dy) g-shape dtype
+                                          `((combiner . ,(lambda (x) (- x))))))
                          (dy      (emit-reduce-sum-to! neg-dy2 g-shape y-shape dtype)))
                     (accumulate-input-adjoint! y-val dy))))
 
@@ -582,10 +778,14 @@
                   ;; n_minus_1 = n - 1  (using scalar 1 constant)
                   (let* ((one-val (emit-scalar-const! 1.0 dtype))
                          (nm1     (emit! 'sub (list n-val one-val)
-                                         (val-shape n-val) dtype '()))
-                         (xpow    (emit! 'pow (list x-val nm1) g-shape dtype '()))
-                         (n-xpow  (emit! 'mul (list n-val xpow) g-shape dtype '()))
-                         (dx-raw  (emit! 'mul (list g-val n-xpow) g-shape dtype '()))
+                                         (val-shape n-val) dtype
+                                         `((combiner . ,(lambda (a b) (- a b))))))
+                         (xpow    (emit! 'pow (list x-val nm1) g-shape dtype
+                                          `((combiner . ,expt))))
+                         (n-xpow  (emit! 'mul (list n-val xpow) g-shape dtype
+                                          `((combiner . ,*))))
+                         (dx-raw  (emit! 'mul (list g-val n-xpow) g-shape dtype
+                                          `((combiner . ,*))))
                          (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
                     (accumulate-input-adjoint! x-val dx))))
 
@@ -593,7 +793,8 @@
                ((eq? op 'negate)
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
-                       (neg-g   (emit! 'negate (list g-val) g-shape dtype '()))
+                       (neg-g   (emit! 'negate (list g-val) g-shape dtype
+                                        `((combiner . ,(lambda (x) (- x))))))
                        (dx      (emit-reduce-sum-to! neg-g g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -607,7 +808,8 @@
                                         (else         0.0))))
                        (sign-x  (emit! 'map (list x-val) x-shape dtype
                                        (list (cons 'fn sign-fn))))
-                       (dx-raw  (emit! 'mul (list g-val sign-x) g-shape dtype '()))
+                       (dx-raw  (emit! 'mul (list g-val sign-x) g-shape dtype
+                                        `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -619,8 +821,10 @@
                        (two-val (emit-scalar-const! 2.0 dtype))
                        ;; fwd output = this binding
                        (fwd-out (binding-ref bid-sym))
-                       (two-out (emit! 'mul (list two-val fwd-out) g-shape dtype '()))
-                       (dx-raw  (emit! 'div (list g-val two-out) g-shape dtype '()))
+                       (two-out (emit! 'mul (list two-val fwd-out) g-shape dtype
+                                        `((combiner . ,*))))
+                       (dx-raw  (emit! 'div (list g-val two-out) g-shape dtype
+                                        `((combiner . ,/))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -629,7 +833,8 @@
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
                        (fwd-out (binding-ref bid-sym))
-                       (dx-raw  (emit! 'mul (list g-val fwd-out) g-shape dtype '()))
+                       (dx-raw  (emit! 'mul (list g-val fwd-out) g-shape dtype
+                                        `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -637,7 +842,8 @@
                ((eq? op 'log)
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
-                       (dx-raw  (emit! 'div (list g-val x-val) g-shape dtype '()))
+                       (dx-raw  (emit! 'div (list g-val x-val) g-shape dtype
+                                        `((combiner . ,/))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -645,8 +851,10 @@
                ((eq? op 'sin)
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
-                       (cos-x   (emit! 'cos (list x-val) x-shape dtype '()))
-                       (dx-raw  (emit! 'mul (list g-val cos-x) g-shape dtype '()))
+                       (cos-x   (emit! 'cos (list x-val) x-shape dtype
+                                        `((combiner . ,cos))))
+                       (dx-raw  (emit! 'mul (list g-val cos-x) g-shape dtype
+                                        `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -654,9 +862,52 @@
                ((eq? op 'cos)
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
-                       (sin-x   (emit! 'sin (list x-val) x-shape dtype '()))
-                       (neg-sin (emit! 'negate (list sin-x) x-shape dtype '()))
-                       (dx-raw  (emit! 'mul (list g-val neg-sin) g-shape dtype '()))
+                       (sin-x   (emit! 'sin (list x-val) x-shape dtype
+                                        `((combiner . ,sin))))
+                       (neg-sin (emit! 'negate (list sin-x) x-shape dtype
+                                        `((combiner . ,(lambda (x) (- x))))))
+                       (dx-raw  (emit! 'mul (list g-val neg-sin) g-shape dtype
+                                        `((combiner . ,*))))
+                       (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
+                  (accumulate-input-adjoint! x-val dx)))
+
+               ;; relu(x) -- dx = g * heaviside(x)
+               ;; Decomposed as: hx = map(heaviside, x); dx = mul(g, hx)
+               ;; (abs-style decomposition keeps rebuild-morphism simple)
+               ((eq? op 'relu)
+                (let* ((x-val   (list-ref inputs 0))
+                       (x-shape (val-shape x-val))
+                       (hx      (emit! 'map (list x-val) x-shape dtype
+                                        `((fn . ,(lambda (xv) (if (> xv 0.0) 1.0 0.0)))
+                                          (combiner . ,(lambda (xv) (if (> xv 0.0) 1.0 0.0))))))
+                       (dx-raw  (emit! 'mul (list g-val hx) g-shape dtype
+                                        `((combiner . ,*))))
+                       (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
+                  (accumulate-input-adjoint! x-val dx)))
+
+               ;; sigmoid(x) -- dx = g * deriv where deriv = s*(1-s), s = forward output
+               ((eq? op 'sigmoid)
+                (let* ((x-val   (list-ref inputs 0))
+                       (x-shape (val-shape x-val))
+                       (fwd-out (binding-ref bid-sym))
+                       (deriv   (emit! 'map (list fwd-out) g-shape dtype
+                                        `((fn . ,(lambda (sv) (* sv (- 1.0 sv))))
+                                          (combiner . ,(lambda (sv) (* sv (- 1.0 sv)))))))
+                       (dx-raw  (emit! 'mul (list g-val deriv) g-shape dtype
+                                        `((combiner . ,*))))
+                       (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
+                  (accumulate-input-adjoint! x-val dx)))
+
+               ;; tanh(x) -- dx = g * (1-t^2) where t = tanh(x) = forward output
+               ((eq? op 'tanh)
+                (let* ((x-val   (list-ref inputs 0))
+                       (x-shape (val-shape x-val))
+                       (fwd-out (binding-ref bid-sym))
+                       (deriv   (emit! 'map (list fwd-out) g-shape dtype
+                                        `((fn . ,(lambda (tv) (- 1.0 (* tv tv))))
+                                          (combiner . ,(lambda (tv) (- 1.0 (* tv tv)))))))
+                       (dx-raw  (emit! 'mul (list g-val deriv) g-shape dtype
+                                        `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -759,7 +1010,8 @@
            (_ (hash-table-set! binding-shape zero-cid loss-shape))
            (_ (hash-table-set! binding-dtype zero-cid loss-dtype))
            (zero-val    (const-ref zero-cid))
-           (loss-out-val (emit! 'add (list loss-binding-val zero-val) loss-shape loss-dtype '()))
+           (loss-out-val (emit! 'add (list loss-binding-val zero-val) loss-shape loss-dtype
+                                      `((combiner . ,+))))
            ;; Collect param grad outputs in order of param-const-vals
            (grad-vals   (filter-map
                          (lambda (pcv)
@@ -768,13 +1020,17 @@
                          param-const-vals))
            (all-outputs  (cons loss-out-val grad-vals))
            (all-bindings (append fwd-bindings bwd-bindings)))
-      (make-ssa-program
-       (ssa-program-constants fwd-prog)
-       (ssa-program-morph-to-val fwd-prog)
-       all-bindings
-       all-outputs
-       (length param-const-vals)
-       #f #f #f))))
+      ;; Apply MoA psi-composition fusion to the full joint forward+backward program.
+      ;; Cross-AD-boundary fusion is automatic: backward element-wise bindings
+      ;; with use-count=1 are eligible under the same rules as forward ones.
+      (ssa-element-wise-fusion-pass
+       (make-ssa-program
+        (ssa-program-constants fwd-prog)
+        (ssa-program-morph-to-val fwd-prog)
+        all-bindings
+        all-outputs
+        (length param-const-vals)
+        #f #f #f)))))
 
 
 ;;; Helper: find a forward binding by its bid-symbol
@@ -813,6 +1069,16 @@
         (meta (ssa-binding-meta b))
         (shp  (ssa-binding-shape b)))
     (cond
+      ;; Fused binding: op is consumer's op, inputs are the fused (producer's) inputs.
+      ;; Dispatch on the stored combiner instead of rebuilding from op name.
+      ((and (assq 'fused? meta) (assq 'combiner meta))
+       (let* ((comb   (cdr (assq 'combiner meta)))
+              (shapes (map morph-shape inputs))
+              (ifn    (make-compute-index-fn
+                        (map (lambda (_) (lambda (idx) idx)) inputs)
+                        comb
+                        shapes)))
+         (morphism-expr op inputs ifn shp (ssa-binding-dtype b) '() -1)))
       ((equal? op '(reduce mean))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
@@ -844,6 +1110,9 @@
       ((eq? op 'log)    (morph-log (car inputs)))
       ((eq? op 'sin)    (morph-sin (car inputs)))
       ((eq? op 'cos)    (morph-cos (car inputs)))
+      ((eq? op 'relu)    (morph-relu    (car inputs)))
+      ((eq? op 'sigmoid) (morph-sigmoid (car inputs)))
+      ((eq? op 'tanh)    (morph-tanh-am (car inputs)))
       ((eq? op 'map)
        (let ((fn (cdr (assq 'fn meta))))
          (morph-map fn (car inputs))))
@@ -1007,15 +1276,23 @@
     ;; (VJP-emitted bindings whose meta never carries 'index-fn).
     ;; rebuild-morphism can return morphism-expr (most ops) or reduction-morphism.
     (define (get-index-fn)
-      (let ((p (assq 'index-fn meta)))
-        (if p
-            (cdr p)
-            (let ((trace-inputs (map trace-arr-of (ssa-binding-inputs b))))
-              (cases array-morphism (rebuild-morphism b trace-inputs)
-                (morphism-expr (_ _ ifn _ _ _ _) ifn)
-                (reduction-morphism (_ _ _ ifn _ _ _) ifn)
-                (else (error "compile-one-instruction: rebuild-morphism returned unexpected type"
-                             op meta)))))))
+      (let ((ip (assq 'index-fn meta)))
+        (if ip
+            (cdr ip)
+            ;; Fused binding: (fused? . #t) + (combiner . proc); build compute-index-fn directly.
+            (let ((fp (assq 'fused? meta)))
+              (if fp
+                  (let ((cp (assq 'combiner meta)))
+                    (make-compute-index-fn
+                     (map (lambda (_) (lambda (idx) idx)) (ssa-binding-inputs b))
+                     (cdr cp)
+                     (map (lambda (_) shape) (ssa-binding-inputs b))))
+                  (let ((trace-inputs (map trace-arr-of (ssa-binding-inputs b))))
+                    (cases array-morphism (rebuild-morphism b trace-inputs)
+                      (morphism-expr (_ _ ifn _ _ _ _) ifn)
+                      (reduction-morphism (_ _ _ ifn _ _ _) ifn)
+                      (else (error "compile-one-instruction: rebuild-morphism returned unexpected type"
+                                   op meta)))))))))
 
     (cond
       ;; Zero-copy view: any op where the trace did not allocate (counter not incremented).
@@ -1122,17 +1399,88 @@
                             (hash-table-set! ht (ssa-binding-name (car bs)) i)
                             (loop (cdr bs) (+ i 1))))
                         ht)))
+    ;; Detect GEMM bindings whose only consumer is an adjacent element-wise
+    ;; binding that compiles to a flat fast-path instruction.
+    ;; When found, pre-compile ri-gemm-epilogue for the GEMM position and
+    ;; arrange for ri-alias at the epilogue position.
+    (define use-counts (ssa-compute-use-counts bindings))
+    (define gemm-epilogue-instr (make-hash-table))  ;; g.name -> ri-gemm-epilogue
+    (define epilogue-gemm-pos   (make-hash-table))  ;; e.name -> g's position index
+    (let lp ((bs bindings) (i 0))
+      (when (and (pair? bs) (pair? (cdr bs)))
+        (let ((g (car bs)) (e (cadr bs)))
+          (when (and (eq? (ssa-binding-op g) 'matmul)
+                     (= 1 (hash-table-ref/default use-counts (ssa-binding-name g) 0))
+                     (let ((in0 (and (pair? (ssa-binding-inputs e))
+                                     (car (ssa-binding-inputs e)))))
+                       (cases ssa-value in0
+                         (binding-ref (bid) (eq? bid (ssa-binding-name g)))
+                         (else #f)))
+                     (ssa-binding-elementwise? e))
+            ;; Try to compile e as a flat instruction
+            (let* ((e-in-refs  (map (lambda (v) (compile-replay-ref v name->pos))
+                                    (ssa-binding-inputs e)))
+                   (e-info     (hash-table-ref trace-info (ssa-binding-name e)))
+                   (e-pool-idx (if (cdr e-info)
+                                   (context-alloc->pool-idx ctx (concrete-alloc-id (car e-info)))
+                                   -1))
+                   (e-instr    (compile-one-instruction e e-in-refs e-pool-idx
+                                                        trace-info constants))
+                   ;; g's pool-idx and refs for the GEMM part
+                   (g-info     (hash-table-ref trace-info (ssa-binding-name g)))
+                   (g-pool-idx (if (cdr g-info)
+                                   (context-alloc->pool-idx ctx (concrete-alloc-id (car g-info)))
+                                   -1))
+                   (g-in-refs  (map (lambda (v) (compile-replay-ref v name->pos))
+                                    (ssa-binding-inputs g)))
+                   (g-shape    (ssa-binding-shape g))
+                   (g-strides  (compute-strides g-shape))
+                   (g-dtype    (ssa-binding-dtype g)))
+              (cases replay-instruction e-instr
+                (ri-flat-unary (_ _ _ _ e-comb _)
+                  (hash-table-set! gemm-epilogue-instr (ssa-binding-name g)
+                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
+                                      (car g-in-refs) (cadr g-in-refs)
+                                      'unary e-comb 0 (rr-val 0)))
+                  (hash-table-set! epilogue-gemm-pos (ssa-binding-name e) i))
+                (ri-flat-bias-broadcast (_ _ _ _ e-comb N _ e-in-B)
+                  (hash-table-set! gemm-epilogue-instr (ssa-binding-name g)
+                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
+                                      (car g-in-refs) (cadr g-in-refs)
+                                      'bias-broadcast e-comb N e-in-B))
+                  (hash-table-set! epilogue-gemm-pos (ssa-binding-name e) i))
+                (else #f)))))
+        (lp (cdr bs) (+ i 1))))
+
     (let loop ((bs bindings) (i 0))
       (unless (null? bs)
-        (let* ((b        (car bs))
-               (in-refs  (map (lambda (v) (compile-replay-ref v name->pos))
-                              (ssa-binding-inputs b)))
-               (info     (hash-table-ref trace-info (ssa-binding-name b)))
-               (is-pool? (cdr info))
-               (pool-idx (if is-pool?
-                             (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
-                             -1))
-               (instr    (compile-one-instruction b in-refs pool-idx trace-info constants)))
+        (let* ((b     (car bs))
+               (bname (ssa-binding-name b))
+               (instr
+                (cond
+                  ;; GEMM with epilogue: use pre-compiled ri-gemm-epilogue
+                  ((hash-table-ref/default gemm-epilogue-instr bname #f) => (lambda (ri) ri))
+                  ;; Epilogue position: the GEMM already applied it in-place
+                  ((hash-table-ref/default epilogue-gemm-pos bname #f) =>
+                   (lambda (g-pos)
+                     (let* ((info     (hash-table-ref trace-info bname))
+                            (pool-idx (if (cdr info)
+                                          (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
+                                          -1))
+                            (shape    (ssa-binding-shape b))
+                            (strides  (compute-strides shape))
+                            (dtype    (ssa-binding-dtype b)))
+                       (ri-alias pool-idx shape strides dtype (rr-val g-pos)))))
+                  ;; Normal path
+                  (else
+                   (let* ((in-refs  (map (lambda (v) (compile-replay-ref v name->pos))
+                                         (ssa-binding-inputs b)))
+                          (info     (hash-table-ref trace-info bname))
+                          (is-pool? (cdr info))
+                          (pool-idx (if is-pool?
+                                        (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
+                                        -1)))
+                     (compile-one-instruction b in-refs pool-idx trace-info constants))))))
           (vector-set! plan-vec i instr)
           (loop (cdr bs) (+ i 1)))))
 
@@ -1256,7 +1604,37 @@
                             (execute-flat-bias-broadcast-compute combiner data1 data2 buf size N dtype)
                             (make-pool-arr pool-idx shape strides dtype))
                           (else (error "ri-flat-bias-broadcast: B not concrete" B))))
-                      (else (error "ri-flat-bias-broadcast: A not concrete" A))))))))
+                      (else (error "ri-flat-bias-broadcast: A not concrete" A)))))
+
+                (ri-gemm-epilogue (pool-idx shape strides dtype A-ref B-ref
+                                   epilogue-kind epilogue-comb epilogue-N bias-ref)
+                  (let* ((buf (vector-ref pool-bufs pool-idx))
+                         (sz  (shape-size shape)))
+                    (execute-blas-gemm-strided/into! (deref A-ref) (deref B-ref) buf)
+                    (case epilogue-kind
+                      ((unary)
+                       (execute-flat-unary-compute-inplace! epilogue-comb buf sz dtype))
+                      ((bias-broadcast)
+                       (cases array-morphism (deref bias-ref)
+                         (concrete-array (bias-data _ _ _ _ _ _)
+                           (execute-flat-bias-broadcast-inplace!
+                            epilogue-comb buf bias-data sz epilogue-N dtype))
+                         (else (error "ri-gemm-epilogue: bias not concrete"))))
+                      (else (error "ri-gemm-epilogue: unknown epilogue-kind" epilogue-kind)))
+                    (make-pool-arr pool-idx shape strides dtype)))
+
+                (ri-alias (pool-idx shape strides dtype in-ref)
+                  ;; The epilogue was applied in-place by the preceding ri-gemm-epilogue.
+                  ;; Advance alloc-ctr to stay in sync with trace-time pool allocation,
+                  ;; then return the GEMM result (already epilogue-applied) with the
+                  ;; correct alloc-id for this binding position.
+                  (let* ((src (deref in-ref))
+                         (aid alloc-ctr))
+                    (set! alloc-ctr (+ alloc-ctr 1))
+                    (cases array-morphism src
+                      (concrete-array (src-data _ _ _ _ _ _)
+                        (concrete-array src-data shape strides 0 dtype aid -1))
+                      (else (error "ri-alias: source not concrete" src))))))))
         (vector-set! vals i result)))
 
     vals))

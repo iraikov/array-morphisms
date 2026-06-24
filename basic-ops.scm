@@ -12,6 +12,8 @@
                 morph-sqrt morph-exp morph-log morph-sin morph-cos morph-tan
                 ;; Unary arithmetic
                 morph-negate morph-abs morph-floor morph-ceiling
+                ;; Activation functions
+                morph-relu morph-sigmoid morph-tanh-am
                 ;; Comparisons
                 morph> morph< morph= morph>= morph<=
                 ;; Higher-order
@@ -267,7 +269,16 @@
     ((abs) abs)
     ((floor) floor)
     ((ceiling) ceiling)
-    
+
+    ;; Activations
+    ((relu)    (lambda (x) (max 0.0 (exact->inexact x))))
+    ((sigmoid) (lambda (x) (let ((xf (exact->inexact x)))
+                              (/ 1.0 (+ 1.0 (exp (- xf)))))))
+    ((tanh)    (lambda (x)
+                 (let* ((xf (exact->inexact x))
+                        (e2 (exp (* 2.0 xf))))
+                   (/ (- e2 1.0) (+ e2 1.0)))))
+
     (else (error "Unknown unary operation" operation))))
 
 (define (infer-unary-dtype operation dtype)
@@ -277,7 +288,7 @@
   
   (case operation
     ;; Transcendental always returns float
-    ((sqrt exp log sin cos tan)
+    ((sqrt exp log sin cos tan relu sigmoid tanh)
      (if (floating-point-type? dtype)
          dtype
          'f64))
@@ -353,9 +364,13 @@
 
 (define (morph-ceiling m)
   "Element-wise ceiling
-   
+
    Preserves dtype"
   (create-unary-morphism 'ceiling m))
+
+(define (morph-relu m)    (create-unary-morphism 'relu    m))
+(define (morph-sigmoid m) (create-unary-morphism 'sigmoid m))
+(define (morph-tanh-am m) (create-unary-morphism 'tanh    m))
 
 ;;; ============================================================================
 ;;; Helper Functions for Comparison Operations

@@ -33,7 +33,10 @@
    morphism-context-pool
    buffer-pool-assignment
    buffer-pool-buffers
-   context-alloc->pool-idx)
+   context-alloc->pool-idx
+
+   ;; Stable identity (GC-safe gensym, for use as hash table key)
+   morphism-context-id)
 
   (import scheme chicken.base chicken.format chicken.port)
   (import (only srfi-1 iota fold every filter find))
@@ -66,8 +69,9 @@
   ;; Use define-record-type to give the raw constructor a private name,
   ;; allowing the public make-morphism-context to be a 0-arg wrapper.
   (define-record-type morphism-context
-    (%make-morphism-context mode allocs pool counter)
+    (%make-morphism-context id mode allocs pool counter)
     morphism-context?
+    (id      morphism-context-id)
     (mode    morphism-context-mode    morphism-context-mode-set!)
     (allocs  morphism-context-allocs  morphism-context-allocs-set!)
     (pool    morphism-context-pool    morphism-context-pool-set!)
@@ -79,7 +83,7 @@
 
   (define (make-morphism-context)
     "Create a fresh trace-mode execution context."
-    (%make-morphism-context 'trace '() #f 0))
+    (%make-morphism-context (gensym 'ctx) 'trace '() #f 0))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Dispatch Vector Construction
