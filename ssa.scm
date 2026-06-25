@@ -992,7 +992,7 @@
     ;; a pre-computed constant), so loss.alloc-id's last-use stays at its birth
     ;; step and backward bindings can reuse its buffer slot in replay mode.
     ;;
-    ;; add(loss, zero) is a two-operand op — can-zero-copy? returns #f so a real
+    ;; add(loss, zero) is a two-operand op -- can-zero-copy? returns #f so a real
     ;; allocation is recorded.  input-ids includes loss.alloc-id, which forces
     ;; compute-last-uses! to extend loss's lifetime to this final step, preventing
     ;; any backward binding from aliasing its buffer.
@@ -1312,7 +1312,7 @@
 
       ;; matmul: use trace-time input arrays to determine BLAS variant once.
       ;; morph-matmul uses (identity-fn) as a placeholder, so matmul can never
-      ;; use the ri-index path — it always needs the BLAS/Scheme kernel dispatch.
+      ;; use the ri-index path -- it always needs the BLAS/Scheme kernel dispatch.
       ;; execute-blas-gemm/into! handles the row-major case; execute-blas-gemm-strided/into!
       ;; handles transposed/non-contiguous inputs via a stride-aware Scheme triple loop.
       ((eq? op 'matmul)
@@ -1327,7 +1327,7 @@
                                                 (car in-refs) (cadr in-refs)))
                (else           (ri-gemm pool-idx shape strides dtype
                                         (car in-refs) (cadr in-refs))))
-             ;; Not compatible (shapes mismatch etc.) — shouldn't reach here in practice.
+             ;; Not compatible (shapes mismatch etc.) -- shouldn't reach here in practice.
              (error "compile-one-instruction: matmul not BLAS-compatible" (ssa-binding-name b)))))
 
       ;; Reductions: op is (list 'reduce rop).
@@ -1739,7 +1739,7 @@
               (pool  (morphism-context-pool ctx))
               (vals  (execute-replay-plan plan pool constants))
               ;; output-specs pre-computed by compile-replay-plan: list of
-              ;; (integer | concrete-array) — no hash-table rebuild per step.
+              ;; (integer | concrete-array) -- no hash-table rebuild per step.
               (specs (ssa-program-output-specs prog)))
          (map (lambda (spec)
                 (if (integer? spec)
