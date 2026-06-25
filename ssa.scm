@@ -138,7 +138,7 @@
 ;;   outputs     : list of ssa-value  (loss first, then param grads)
 ;;   n-params    : count of trainable parameter constants
 ;;   replay-plan   : #f until compiled; vector of replay-instruction (one per binding)
-;;   trace-info    : #f until trace; hash-table bid-sym -> (concrete-array . is-pool?)
+;;   trace-info    : #f until trace; morph-env bid-sym -> (concrete-array . is-pool?)
 ;;   output-specs  : #f until compiled; list of (integer | concrete-array) per output
 ;;                   integer = index into vals vector; concrete-array = const-ref value
 (define-record ssa-program constants morph-to-val bindings outputs n-params
@@ -377,15 +377,18 @@
    Safety constraint: fusion is only applied when ALL of producer's inputs
    have the same shape as the producer's output (flat/non-broadcasting ops),
    ensuring identity index functions are valid in the fused binding."
-  (let* ((bindings   (ssa-program-bindings prog))
-         (use-counts (ssa-compute-use-counts bindings))
+  (let* ((bindings    (ssa-program-bindings prog))
+         (use-counts  (ssa-compute-use-counts bindings))
          ;; Shape lookup: id-sym -> shape vector (bindings + constants)
-         (shape-of   (make-hash-table)))
+         (shape-of-eb (make-env-builder))
+         ;; Eliminated-binding membership set: id-sym -> #t
+         (elim-eb     (make-env-builder)))
     (for-each (lambda (b)
-                (hash-table-set! shape-of (ssa-binding-name b) (ssa-binding-shape b)))
+                (env-builder-extend! shape-of-eb
+                                     (ssa-binding-name b) (ssa-binding-shape b)))
               bindings)
     (hash-table-walk (ssa-program-constants prog)
-      (lambda (k v) (hash-table-set! shape-of k (morph-shape v))))
+      (lambda (k v) (env-builder-extend! shape-of-eb k (morph-shape v))))
 
     ;; True when all inputs of b have the same shape as b's output.
     (define (flat-producer? b)
@@ -394,10 +397,10 @@
                  (let ((id (cases ssa-value inp
                              (binding-ref (bid) bid)
                              (const-ref   (cid) cid))))
-                   (equal? (hash-table-ref/default shape-of id #f) b-shape)))
+                   (equal? (env-builder-lookup shape-of-eb id) b-shape)))
                (ssa-binding-inputs b))))
 
-    (let loop ((bs bindings) (result '()) (eliminated (make-hash-table)))
+    (let loop ((bs bindings) (result '()))
       (cond
         ((null? bs)
          (make-ssa-program
@@ -407,20 +410,20 @@
           (ssa-program-outputs prog)
           (ssa-program-n-params prog)
           #f #f #f))
-        ((hash-table-ref/default eliminated (ssa-binding-name (car bs)) #f)
-         (loop (cdr bs) result eliminated))
+        ((env-builder-lookup elim-eb (ssa-binding-name (car bs)))
+         (loop (cdr bs) result))
         ((and (pair? (cdr bs))
-              (not (hash-table-ref/default eliminated
-                     (ssa-binding-name (cadr bs)) #f))
+              (not (env-builder-lookup elim-eb (ssa-binding-name (cadr bs))))
               (ssa-fusion-eligible? (car bs) (cadr bs) use-counts)
               (flat-producer? (car bs)))
          (let ((fused (fuse-two-ssa-bindings (car bs) (cadr bs))))
-           (hash-table-set! eliminated (ssa-binding-name (car bs)) #t)
+           (env-builder-extend! elim-eb (ssa-binding-name (car bs)) #t)
            ;; Update shape-of for the fused binding (inherits consumer's name+shape)
-           (hash-table-set! shape-of (ssa-binding-name fused) (ssa-binding-shape fused))
-           (loop (cons fused (cddr bs)) result eliminated)))
+           (env-builder-extend! shape-of-eb
+                                 (ssa-binding-name fused) (ssa-binding-shape fused))
+           (loop (cons fused (cddr bs)) result)))
         (else
-         (loop (cdr bs) (cons (car bs) result) eliminated))))))
+         (loop (cdr bs) (cons (car bs) result)))))))
 
 
 ;;; ============================================================
@@ -523,11 +526,11 @@
          ;; Accumulate backward bindings in reverse order; reverse at end
          (bwd-bindings  '())
          ;; Adjoint table: bid-symbol -> ssa-value (the accumulated dL/d(bid))
-         (adjoint-val   (make-hash-table))
+         (adjoint-eb    (make-env-builder))
          ;; Param gradient table: cid-symbol -> ssa-value
-         (param-grad-val (make-hash-table))
+         (param-grad-eb (make-env-builder))
          ;; Set of trainable param cid-symbols for fast membership test
-         (param-cid-set  (make-hash-table))
+         (param-cid-eb  (make-env-builder))
          ;; Loss shape/dtype
          (loss-bid-sym  (ssa-value-id loss-binding-val)))
 
@@ -545,7 +548,7 @@
 
     ;; Register trainable param cid-symbols
     (for-each (lambda (v)
-                (hash-table-set! param-cid-set (ssa-value-id v) #t))
+                (env-builder-extend! param-cid-eb (ssa-value-id v) #t))
               param-const-vals)
 
     ;; Lookup helpers
@@ -566,19 +569,19 @@
 
     ;; Accumulate adjoint for a binding-ref input
     (define (accumulate-adjoint! bid-sym new-val shape dtype)
-      (let ((existing (hash-table-ref/default adjoint-val bid-sym #f)))
+      (let ((existing (env-builder-lookup adjoint-eb bid-sym)))
         (if existing
             (let ((sum (emit! 'add (list existing new-val) shape dtype '())))
-              (hash-table-set! adjoint-val bid-sym sum))
-            (hash-table-set! adjoint-val bid-sym new-val))))
+              (env-builder-extend! adjoint-eb bid-sym sum))
+            (env-builder-extend! adjoint-eb bid-sym new-val))))
 
     ;; Accumulate gradient for a const-ref param input
     (define (accumulate-param-grad! cid-sym new-val shape dtype)
-      (let ((existing (hash-table-ref/default param-grad-val cid-sym #f)))
+      (let ((existing (env-builder-lookup param-grad-eb cid-sym)))
         (if existing
             (let ((sum (emit! 'add (list existing new-val) shape dtype '())))
-              (hash-table-set! param-grad-val cid-sym sum))
-            (hash-table-set! param-grad-val cid-sym new-val))))
+              (env-builder-extend! param-grad-eb cid-sym sum))
+            (env-builder-extend! param-grad-eb cid-sym new-val))))
 
     ;; Dispatch adjoint accumulation based on ssa-value type
     (define (accumulate-input-adjoint! input-val new-val)
@@ -588,7 +591,7 @@
           (binding-ref (bid)
             (accumulate-adjoint! bid new-val shape dtype))
           (const-ref (cid)
-            (when (hash-table-ref/default param-cid-set cid #f)
+            (when (env-builder-lookup param-cid-eb cid)
               (accumulate-param-grad! cid new-val shape dtype))))))
 
     ;; emit-reduce-sum-to! -- reduce g-val to target-shape
@@ -691,13 +694,13 @@
            (_ (hash-table-set! (ssa-program-constants fwd-prog) seed-cid seed-const))
            (_ (env-builder-extend! binding-sd-eb seed-cid (cons loss-shape loss-dtype)))
            (seed-val    (const-ref seed-cid)))
-      (hash-table-set! adjoint-val loss-bid-sym seed-val))
+      (env-builder-extend! adjoint-eb loss-bid-sym seed-val))
 
     ;; Backward sweep: iterate bindings in reverse order
     (for-each
      (lambda (b)
        (let* ((bid-sym  (ssa-binding-name b))
-              (g-val    (hash-table-ref/default adjoint-val bid-sym #f)))
+              (g-val    (env-builder-lookup adjoint-eb bid-sym)))
          (when g-val
            (let* ((op      (ssa-binding-op b))
                   (inputs  (ssa-binding-inputs b))
@@ -1013,7 +1016,7 @@
            (grad-vals   (filter-map
                          (lambda (pcv)
                            (let ((cid-sym (ssa-value-id pcv)))
-                             (hash-table-ref/default param-grad-val cid-sym #f)))
+                             (env-builder-lookup param-grad-eb cid-sym)))
                          param-const-vals))
            (all-outputs  (cons loss-out-val grad-vals))
            (all-bindings (append fwd-bindings (reverse bwd-bindings))))
@@ -1232,41 +1235,46 @@
 ;;; Replay Plan: compile-replay-ref
 ;;; ============================================================
 
-(define (compile-replay-ref v name->pos)
+(define (compile-replay-ref v name->pos-eb)
   "Compile an ssa-value to a replay-ref.
    v: ssa-value (binding-ref or const-ref)
-   name->pos: hash-table bid-sym -> integer (0-based binding position)"
+   name->pos-eb: env-builder bid-sym -> integer (0-based binding position)"
   (cases ssa-value v
     (const-ref   (cid) (rr-const cid))
-    (binding-ref (bid) (rr-val (hash-table-ref name->pos bid)))))
+    (binding-ref (bid) (rr-val (or (env-builder-lookup name->pos-eb bid)
+                                   (error "compile-replay-ref: unknown binding" bid))))))
 
 
 ;;; ============================================================
 ;;; Replay Plan: compile-one-instruction
 ;;; ============================================================
 
-(define (compile-one-instruction b in-refs pool-idx trace-info-table constants)
+(define (compile-one-instruction b in-refs pool-idx trace-info-env constants)
   "Compile one SSA binding into a replay-instruction.
-   b:                ssa-binding
-   in-refs:          list of replay-ref? (already compiled from inputs)
-   pool-idx:         integer (physical buffer slot) or -1 (zero-copy)
-   trace-info-table: hash-table bid-sym -> (concrete-array . is-pool?)
-   constants:        hash-table cid-sym -> concrete-array"
+   b:               ssa-binding
+   in-refs:         list of replay-ref? (already compiled from inputs)
+   pool-idx:        integer (physical buffer slot) or -1 (zero-copy)
+   trace-info-env:  morph-env bid-sym -> (concrete-array . is-pool?)
+   constants:       hash-table cid-sym -> concrete-array"
   (let* ((op        (ssa-binding-op b))
          (meta      (ssa-binding-meta b))
          (shape     (ssa-binding-shape b))
          (dtype     (ssa-binding-dtype b))
          (strides   (if (vector? shape) (compute-strides shape) '#()))
-         (info      (hash-table-ref trace-info-table (ssa-binding-name b)))
+         (info      (or (morph-env-lookup trace-info-env (ssa-binding-name b))
+                        (error "compile-one-instruction: no trace-info for binding"
+                               (ssa-binding-name b))))
          (trace-arr (car info))
          (is-pool?  (cdr info)))
 
     ;; Look up trace-time concrete-array for any ssa-value input:
-    ;; binding-ref -> trace-info-table; const-ref -> constants.
+    ;; binding-ref -> trace-info-env; const-ref -> constants.
     (define (trace-arr-of v)
       (cases ssa-value v
         (const-ref   (cid) (hash-table-ref constants cid))
-        (binding-ref (bid) (car (hash-table-ref trace-info-table bid)))))
+        (binding-ref (bid) (car (or (morph-env-lookup trace-info-env bid)
+                                    (error "compile-one-instruction: no trace-info for input"
+                                           bid))))))
 
     ;; Extract index-fn from meta when present (morphism-to-ssa bindings),
     ;; or rebuild the morphism with trace-time inputs to obtain it
@@ -1390,19 +1398,19 @@
          (trace-info  (ssa-program-trace-info prog))
          (plan-vec    (make-vector n #f))
          ;; Map binding name -> 0-based position in bindings list
-         (name->pos   (let ((ht (make-hash-table)))
-                        (let loop ((bs bindings) (i 0))
-                          (unless (null? bs)
-                            (hash-table-set! ht (ssa-binding-name (car bs)) i)
-                            (loop (cdr bs) (+ i 1))))
-                        ht)))
+         (name->pos-eb (let ((eb (make-env-builder)))
+                         (let loop ((bs bindings) (i 0))
+                           (unless (null? bs)
+                             (env-builder-extend! eb (ssa-binding-name (car bs)) i)
+                             (loop (cdr bs) (+ i 1))))
+                         eb)))
     ;; Detect GEMM bindings whose only consumer is an adjacent element-wise
     ;; binding that compiles to a flat fast-path instruction.
     ;; When found, pre-compile ri-gemm-epilogue for the GEMM position and
     ;; arrange for ri-alias at the epilogue position.
     (define use-counts (ssa-compute-use-counts bindings))
-    (define gemm-epilogue-instr (make-hash-table))  ;; g.name -> ri-gemm-epilogue
-    (define epilogue-gemm-pos   (make-hash-table))  ;; e.name -> g's position index
+    (define gemm-epilogue-eb (make-env-builder))  ;; g.name -> ri-gemm-epilogue
+    (define epilogue-gemm-eb (make-env-builder))  ;; e.name -> g's position index
     (let lp ((bs bindings) (i 0))
       (when (and (pair? bs) (pair? (cdr bs)))
         (let ((g (car bs)) (e (cadr bs)))
@@ -1415,37 +1423,41 @@
                          (else #f)))
                      (ssa-binding-elementwise? e))
             ;; Try to compile e as a flat instruction
-            (let* ((e-in-refs  (map (lambda (v) (compile-replay-ref v name->pos))
+            (let* ((e-in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
                                     (ssa-binding-inputs e)))
-                   (e-info     (hash-table-ref trace-info (ssa-binding-name e)))
+                   (e-info     (or (morph-env-lookup trace-info (ssa-binding-name e))
+                        (error "compile-replay-plan: no trace-info for epilogue binding"
+                               (ssa-binding-name e))))
                    (e-pool-idx (if (cdr e-info)
                                    (context-alloc->pool-idx ctx (concrete-alloc-id (car e-info)))
                                    -1))
                    (e-instr    (compile-one-instruction e e-in-refs e-pool-idx
                                                         trace-info constants))
                    ;; g's pool-idx and refs for the GEMM part
-                   (g-info     (hash-table-ref trace-info (ssa-binding-name g)))
+                   (g-info     (or (morph-env-lookup trace-info (ssa-binding-name g))
+                       (error "compile-replay-plan: no trace-info for gemm binding"
+                              (ssa-binding-name g))))
                    (g-pool-idx (if (cdr g-info)
                                    (context-alloc->pool-idx ctx (concrete-alloc-id (car g-info)))
                                    -1))
-                   (g-in-refs  (map (lambda (v) (compile-replay-ref v name->pos))
+                   (g-in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
                                     (ssa-binding-inputs g)))
                    (g-shape    (ssa-binding-shape g))
                    (g-strides  (compute-strides g-shape))
                    (g-dtype    (ssa-binding-dtype g)))
               (cases replay-instruction e-instr
                 (ri-flat-unary (_ _ _ _ e-comb _)
-                  (hash-table-set! gemm-epilogue-instr (ssa-binding-name g)
+                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
                     (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
                                       (car g-in-refs) (cadr g-in-refs)
                                       'unary e-comb 0 (rr-val 0)))
-                  (hash-table-set! epilogue-gemm-pos (ssa-binding-name e) i))
+                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
                 (ri-flat-bias-broadcast (_ _ _ _ e-comb N _ e-in-B)
-                  (hash-table-set! gemm-epilogue-instr (ssa-binding-name g)
+                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
                     (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
                                       (car g-in-refs) (cadr g-in-refs)
                                       'bias-broadcast e-comb N e-in-B))
-                  (hash-table-set! epilogue-gemm-pos (ssa-binding-name e) i))
+                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
                 (else #f)))))
         (lp (cdr bs) (+ i 1))))
 
@@ -1456,11 +1468,13 @@
                (instr
                 (cond
                   ;; GEMM with epilogue: use pre-compiled ri-gemm-epilogue
-                  ((hash-table-ref/default gemm-epilogue-instr bname #f) => (lambda (ri) ri))
+                  ((env-builder-lookup gemm-epilogue-eb bname) => (lambda (ri) ri))
                   ;; Epilogue position: the GEMM already applied it in-place
-                  ((hash-table-ref/default epilogue-gemm-pos bname #f) =>
+                  ((env-builder-lookup epilogue-gemm-eb bname) =>
                    (lambda (g-pos)
-                     (let* ((info     (hash-table-ref trace-info bname))
+                     (let* ((info     (or (morph-env-lookup trace-info bname)
+                                          (error "compile-replay-plan: no trace-info for alias"
+                                                 bname)))
                             (pool-idx (if (cdr info)
                                           (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
                                           -1))
@@ -1470,9 +1484,11 @@
                        (ri-alias pool-idx shape strides dtype (rr-val g-pos)))))
                   ;; Normal path
                   (else
-                   (let* ((in-refs  (map (lambda (v) (compile-replay-ref v name->pos))
+                   (let* ((in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
                                          (ssa-binding-inputs b)))
-                          (info     (hash-table-ref trace-info bname))
+                          (info     (or (morph-env-lookup trace-info bname)
+                                        (error "compile-replay-plan: no trace-info for binding"
+                                               bname)))
                           (is-pool? (cdr info))
                           (pool-idx (if is-pool?
                                         (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
@@ -1487,7 +1503,8 @@
     (let ((output-specs
            (map (lambda (ov)
                   (cases ssa-value ov
-                    (binding-ref (bid) (hash-table-ref name->pos bid))
+                    (binding-ref (bid) (or (env-builder-lookup name->pos-eb bid)
+                                           (error "compile-replay-plan: output binding not found" bid)))
                     (const-ref   (cid) (hash-table-ref constants cid))))
                 (ssa-program-outputs prog))))
       (ssa-program-output-specs-set! prog output-specs))
@@ -1671,15 +1688,15 @@
       ;; trace-info, and return the outputs.  Output pinning via
       ;; context-pin-output! is only performed in true trace mode.
       ((or trace-mode? (not (ssa-program-trace-info prog)))
-       (let* ((values      (make-hash-table))
-              (trace-info  (make-hash-table))
-              (output-bids (make-hash-table eq? eq?-hash)))
-         ;; Index output binding names for O(1) lookup
+       (let* ((values       (make-hash-table))
+              (trace-info-eb (make-env-builder))
+              (output-bids-eb (make-env-builder)))
+         ;; Index output binding names for membership lookup
          (for-each (lambda (ov)
                      (when (ssa-binding-ref? ov)
-                       (hash-table-set! output-bids (ssa-value-id ov) #t)))
+                       (env-builder-extend! output-bids-eb (ssa-value-id ov) #t)))
                    (ssa-program-outputs prog))
-         ;; Pre-populate constants
+         ;; Pre-populate constants (values is kept as hash-table: hot O(1) lookup path)
          (hash-table-walk constants
            (lambda (k v) (hash-table-set! values k v)))
          ;; Execute each binding; record trace-info
@@ -1687,7 +1704,7 @@
           (lambda (b)
             (let* ((inputs     (map (lambda (v) (hash-table-ref values (ssa-value-id v)))
                                     (ssa-binding-inputs b)))
-                   (is-output? (hash-table-ref/default output-bids (ssa-binding-name b) #f))
+                   (is-output? (env-builder-lookup output-bids-eb (ssa-binding-name b)))
                    (ctr-before (context-counter ctx))
                    (result     (realize/ctx ctx (rebuild-morphism b inputs)))
                    (is-pool?   (> (context-counter ctx) ctr-before))
@@ -1703,10 +1720,10 @@
                         result)))
               (hash-table-set! values (ssa-binding-name b) stored)
               ;; Record per-binding (concrete-array . is-pool?) for replay-plan compilation
-              (hash-table-set! trace-info (ssa-binding-name b) (cons result is-pool?))))
+              (env-builder-extend! trace-info-eb (ssa-binding-name b) (cons result is-pool?))))
           bindings)
-         ;; Save trace-info for lazy replay-plan compilation
-         (ssa-program-trace-info-set! prog trace-info)
+         ;; Save morph-env snapshot for lazy replay-plan compilation
+         (ssa-program-trace-info-set! prog (env-builder-env trace-info-eb))
          ;; Return outputs
          (map (lambda (ov) (hash-table-ref values (ssa-value-id ov)))
               (ssa-program-outputs prog))))

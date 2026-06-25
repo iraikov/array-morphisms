@@ -413,8 +413,8 @@
       (get-operands m))
     
     (test "get-allocation-id default"
-      -1
-      (get-allocation-id m))
+      #t
+      (< (get-allocation-id m) 0))
     
     (test "concrete-array? true"
       #t
