@@ -249,7 +249,7 @@
              (K     (vector-ref sa 1))
              (dtype (promote-types (get-morphism-dtype A) (get-morphism-dtype B))))
         (morphism-expr
-         'matmul (list A B)
+         (gensym 'morph-) 'matmul (list A B)
          (identity-fn)
          (vector M N)
          dtype
@@ -276,7 +276,7 @@
              (N     (vector-ref sa 1))
              (dtype (promote-types (get-morphism-dtype A) (get-morphism-dtype v))))
         (morphism-expr
-         'matvec (list A v)
+         (gensym 'morph-) 'matvec (list A v)
          (identity-fn)
          (vector M)
          dtype
@@ -302,7 +302,7 @@
       (let* ((N     (vector-ref s1 0))
              (dtype (promote-types (get-morphism-dtype v1) (get-morphism-dtype v2))))
         (morphism-expr
-         'dot (list v1 v2)
+         (gensym 'morph-) 'dot (list v1 v2)
          (identity-fn)
          #()                  ; scalar output
          dtype
@@ -324,7 +324,7 @@
         (error "morph-axpy: x and y must have the same shape" sx sy)))
     (let ((dtype (promote-types (get-morphism-dtype x) (get-morphism-dtype y))))
       (morphism-expr
-       'axpy (list x y)
+       (gensym 'morph-) 'axpy (list x y)
        (identity-fn)
        (get-morphism-shape x)
        dtype
@@ -386,7 +386,7 @@
                        (promote-types (get-morphism-dtype Q) (get-morphism-dtype K))
                        (get-morphism-dtype V))))
           (morphism-expr
-           'attention (list Q K V)
+           (gensym 'morph-) 'attention (list Q K V)
            (identity-fn)
            out-shape
            dtype

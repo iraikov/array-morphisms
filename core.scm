@@ -20,7 +20,11 @@
    concrete-array              ; Constructor
    morphism-expr               ; Constructor
    reduction-morphism          ; Constructor
-   
+
+   ;; Stable per-node identity (GC-safe symbol, survives minor GC moves)
+   morph-id           ; accessor: morphism-expr, reduction-morphism -> symbol
+   morph-stable-id    ; unified helper for all three variants
+
    ;; Morphism classification
    concrete-array?
    abstract-morphism?
@@ -244,6 +248,7 @@
   
   ;; Abstract morphism: deferred computation
   (morphism-expr
+   (morph-id symbol?)       ; Stable gensym for DAG node identity (GC-safe key)
    (operation symbol?)      ; Operation name (add, mul, im2col, etc.)
    (operands list?)         ; List of morphism operands
    (index-fn index-fn?)     ; MoA index function (output -> input indices)
@@ -251,9 +256,10 @@
    (dtype symbol?)          ; Result type
    (metadata list?)         ; Optional metadata (alist)
    (batch-axis exact-integer?))  ; Batch dimension tracking
-  
+
   ;; Reduction morphism: reduces rank/dimensions
   (reduction-morphism
+   (morph-id symbol?)       ; Stable gensym for DAG node identity (GC-safe key)
    (operation symbol?)      ; Reduction op (sum, mean, max, etc.)
    (operand array-morphism?) ; Single operand
    (reduce-axes list?)      ; Axes to reduce
@@ -264,9 +270,25 @@
 
 (define (morphism-expr? x)
   (cases array-morphism x
-         (morphism-expr (op operands idx-fn shape dtype metadata batch-axis)
+         (morphism-expr (mid op operands idx-fn shape dtype metadata batch-axis)
                         #t)
          (else #f)))
+
+(define (morph-id m)
+  (cases array-morphism m
+    (morphism-expr (mid op operands idx-fn shape dtype metadata batch-axis) mid)
+    (reduction-morphism (mid op operand reduce-axes idx-fn shape dtype batch-axis) mid)
+    (else (error "morph-id: not a morphism-expr or reduction-morphism" m))))
+
+(define (morph-stable-id m)
+  "Return a GC-safe symbol uniquely identifying morphism node m.
+   For concrete-array, converts allocation-id to symbol.
+   For morphism-expr / reduction-morphism, returns the embedded morph-id gensym."
+  (cases array-morphism m
+    (concrete-array (_ _ _ _ _ alloc-id _)
+      (string->symbol (string-append "ca-" (number->string alloc-id))))
+    (morphism-expr (mid op operands idx-fn shape dtype metadata batch-axis) mid)
+    (reduction-morphism (mid op operand reduce-axes idx-fn shape dtype batch-axis) mid)))
   
 ;;; Index Function Types
 
@@ -644,9 +666,9 @@
   (cases array-morphism m
     (concrete-array (data shape strides offset dtype alloc-id batch-axis)
                     shape)
-    (morphism-expr (op operands idx-fn shape dtype metadata batch-axis)
+    (morphism-expr (morph-id op operands idx-fn shape dtype metadata batch-axis)
                    shape)
-    (reduction-morphism (op operand axes idx-fn shape dtype batch-axis)
+    (reduction-morphism (morph-id op operand axes idx-fn shape dtype batch-axis)
                         shape)))
 
 (define (get-morphism-dtype m)
@@ -654,9 +676,9 @@
   (cases array-morphism m
     (concrete-array (data shape strides offset dtype alloc-id batch-axis)
                     dtype)
-    (morphism-expr (op operands idx-fn shape dtype metadata batch-axis)
+    (morphism-expr (morph-id op operands idx-fn shape dtype metadata batch-axis)
                    dtype)
-    (reduction-morphism (op operand axes idx-fn shape dtype batch-axis)
+    (reduction-morphism (morph-id op operand axes idx-fn shape dtype batch-axis)
                         dtype)))
 
 (define (get-morphism-batch-axis m)
@@ -664,9 +686,9 @@
   (cases array-morphism m
     (concrete-array (data shape strides offset dtype alloc-id batch-axis)
                     batch-axis)
-    (morphism-expr (op operands idx-fn shape dtype metadata batch-axis)
+    (morphism-expr (morph-id op operands idx-fn shape dtype metadata batch-axis)
                    batch-axis)
-    (reduction-morphism (op operand axes idx-fn shape dtype batch-axis)
+    (reduction-morphism (morph-id op operand axes idx-fn shape dtype batch-axis)
                         batch-axis)))
 
 (define (get-index-fn m)
@@ -675,9 +697,9 @@
     (concrete-array (data shape strides offset dtype alloc-id batch-axis)
                     ;; Identity index function for concrete arrays
                     (identity-fn))
-    (morphism-expr (op operands idx-fn shape dtype metadata batch-axis)
+    (morphism-expr (morph-id op operands idx-fn shape dtype metadata batch-axis)
                    idx-fn)
-    (reduction-morphism (op operand axes idx-fn shape dtype batch-axis)
+    (reduction-morphism (morph-id op operand axes idx-fn shape dtype batch-axis)
                         idx-fn)))
 
 (define (get-operands m)
@@ -685,9 +707,9 @@
   (cases array-morphism m
     (concrete-array (data shape strides offset dtype alloc-id batch-axis)
                     '())
-    (morphism-expr (op operands idx-fn shape dtype metadata batch-axis)
+    (morphism-expr (morph-id op operands idx-fn shape dtype metadata batch-axis)
                    operands)
-    (reduction-morphism (op operand axes idx-fn shape dtype batch-axis)
+    (reduction-morphism (morph-id op operand axes idx-fn shape dtype batch-axis)
                         (list operand))))
 
 (define (get-allocation-id m)
@@ -711,9 +733,16 @@
 ;;;; Basic Morphism Construction
 ;;;; ============================================================
 
-(define (make-morphism data shape dtype #!key 
+;; Counter for user-created arrays (no context).  Decrements to ensure
+;; unique negative IDs distinct from context alloc-ids (which are >= 0).
+(define morph-user-alloc-ctr 0)
+(define (next-user-alloc-id!)
+  (set! morph-user-alloc-ctr (- morph-user-alloc-ctr 1))
+  morph-user-alloc-ctr)
+
+(define (make-morphism data shape dtype #!key
                       (batch-axis -1)
-                      (allocation-id -1))
+                      (allocation-id #f))
   "Create concrete morphism from data
    
    Args:
@@ -721,7 +750,7 @@
      shape: shape vector or list
      dtype: element type symbol
      batch-axis: batch dimension (default: -1, not batched)
-     allocation-id: allocation ID for memory reuse (default: -1)
+     allocation-id: allocation ID for memory reuse (default: unique negative ID)
    
    Returns:
      Concrete array morphism"
@@ -746,12 +775,12 @@
         (error "Data size mismatch" 
                `((expected ,expected-size) (actual ,actual-size)))))
     
-    (concrete-array data 
+    (concrete-array data
                    shape-vec
                    (compute-strides shape-vec)
                    0  ; offset
                    dtype
-                   allocation-id
+                   (or allocation-id (next-user-alloc-id!))
                    batch-axis)))
 
 (define (morph-from-list lst shape dtype #!key (batch-axis -1))

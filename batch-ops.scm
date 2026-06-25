@@ -82,8 +82,8 @@
       ;; Reconstruct the morphism with the correct batch-axis.
       (let ((reshaped (morph-unsqueeze m axis)))
         (cases array-morphism reshaped
-          (morphism-expr (op operands index-fn shape dtype metadata _)
-            (morphism-expr op operands index-fn shape dtype metadata norm-axis))
+          (morphism-expr (mid op operands index-fn shape dtype metadata _)
+            (morphism-expr mid op operands index-fn shape dtype metadata norm-axis))
           (concrete-array (data shape strides offset dtype alloc-id _)
             (concrete-array data shape strides offset dtype alloc-id norm-axis))
           (else

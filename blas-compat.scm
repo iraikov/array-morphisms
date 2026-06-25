@@ -243,7 +243,7 @@
     Note: All operands must already be concrete.  Phase 3 realizes
     operands before calling this predicate."
     (cases array-morphism morphism
-      (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+      (morphism-expr (morph-id op operands index-fn shape dtype metadata batch-axis)
         (cond
 
           ;; Matrix-matrix multiply -> GEMM (row-major: BLAS or Scheme)

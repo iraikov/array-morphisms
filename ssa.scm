@@ -90,6 +90,7 @@
   (import array-morphisms-blas-compat)
   (import array-morphisms-realization)
   (import array-morphisms-context)
+  (import array-morphisms-morph-env)
   (import (prefix array-morphisms-grad am:))
 
 
@@ -132,7 +133,7 @@
 
 ;; The compiled SSA program.
 ;;   constants   : hash-table cid-symbol -> concrete-array
-;;   morph-to-val: hash-table morphism-object (eq?) -> ssa-value  (for ssa-constant-id)
+;;   morph-to-val: morph-env stable-id (symbol) -> ssa-value  (for ssa-constant-id)
 ;;   bindings    : list of ssa-binding in topological order
 ;;   outputs     : list of ssa-value  (loss first, then param grads)
 ;;   n-params    : count of trainable parameter constants
@@ -433,28 +434,28 @@
 (define (morphism-to-ssa loss-mv)
   "Compile the morph-variable graph rooted at loss-mv into an SSA program.
    Returns an ssa-program with outputs = (list loss-binding-val) and n-params = 0."
-  (let* ((constants   (make-hash-table))          ; cid-symbol -> concrete-array
-         (visited     (make-hash-table eq? eq?-hash)) ; morphism -> ssa-value
-         (bindings    '()))                         ; accumulated in topo order
+  (let* ((constants   (make-hash-table))  ; cid-symbol -> concrete-array
+         (visited-eb  (make-env-builder)) ; stable-id (symbol) -> ssa-value
+         (bindings    '()))               ; accumulated in reverse topo order
 
     (define (emit-binding! op inputs shape dtype meta)
       (let* ((bid (gensym 'bid-))
              (b   (make-ssa-binding bid op inputs shape dtype meta)))
-        (set! bindings (append bindings (list b)))
+        (set! bindings (cons b bindings))  ; O(1); reversed at end
         (binding-ref bid)))
 
     (define (visit m)
-      (or (hash-table-ref/default visited m #f)
+      (or (env-builder-lookup visited-eb (morph-stable-id m))
           (cases array-morphism m
 
             (concrete-array (data shape strides offset dtype alloc-id batch-axis)
               (let* ((cid (gensym 'cid-))
                      (v   (const-ref cid)))
                 (hash-table-set! constants cid m)
-                (hash-table-set! visited m v)
+                (env-builder-extend! visited-eb (morph-stable-id m) v)
                 v))
 
-            (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+            (morphism-expr (morph-id op operands index-fn shape dtype metadata batch-axis)
               (let* ((input-vals (map visit operands))
                      ;; Normalize: morph-transpose stores key 'permutation; we use 'perm
                      (norm-meta  (if (eq? op 'transpose)
@@ -468,22 +469,23 @@
                                      metadata))
                      (meta       (cons (cons 'index-fn index-fn) norm-meta))
                      (v          (emit-binding! op input-vals shape dtype meta)))
-                (hash-table-set! visited m v)
+                (env-builder-extend! visited-eb (morph-stable-id m) v)
                 v))
 
-            (reduction-morphism (rop operand reduce-axes index-fn shape dtype batch-axis)
+            (reduction-morphism (morph-id rop operand reduce-axes index-fn shape dtype batch-axis)
               (let* ((src-val (visit operand))
                      (meta    (list (cons 'axes reduce-axes)
                                     (cons 'index-fn index-fn)
                                     (cons 'src-shape (morph-shape operand))
                                     (cons 'keepdims? (reduction-index-fn-keepdims? index-fn))))
                      (v       (emit-binding! (list 'reduce rop) (list src-val) shape dtype meta)))
-                (hash-table-set! visited m v)
+                (env-builder-extend! visited-eb (morph-stable-id m) v)
                 v)))))
 
     (let* ((loss-m   (am:var-value loss-mv))
            (loss-val (visit loss-m)))
-      (make-ssa-program constants visited bindings (list loss-val) 0 #f #f #f))))
+      (make-ssa-program constants (env-builder-env visited-eb)
+                        (reverse bindings) (list loss-val) 0 #f #f #f))))
 
 
 ;;; ============================================================
@@ -492,7 +494,7 @@
 
 (define (ssa-constant-id prog m)
   "Return (const-ref cid) for morphism m if it is a constant in prog, else #f."
-  (let ((v (hash-table-ref/default (ssa-program-morph-to-val prog) m #f)))
+  (let ((v (morph-env-lookup (ssa-program-morph-to-val prog) (morph-stable-id m))))
     (and v (ssa-const-ref? v) v)))
 
 (define (ssa-loss-binding-val prog)
@@ -515,11 +517,10 @@
    loss-binding-val: (binding-ref bid) ssa-value for the loss node.
    Returns extended ssa-program."
 
-  (let* (;; Build shape/dtype lookup from forward bindings
+  (let* (;; Build shape/dtype lookup from forward bindings (single env-builder)
          (fwd-bindings  (ssa-program-bindings fwd-prog))
-         (binding-shape (make-hash-table))   ; bid-symbol -> vector
-         (binding-dtype (make-hash-table))   ; bid-symbol -> symbol
-         ;; Accumulate backward bindings here
+         (binding-sd-eb (make-env-builder)) ; sym -> (shape . dtype)
+         ;; Accumulate backward bindings in reverse order; reverse at end
          (bwd-bindings  '())
          ;; Adjoint table: bid-symbol -> ssa-value (the accumulated dL/d(bid))
          (adjoint-val   (make-hash-table))
@@ -532,15 +533,15 @@
 
     ;; Index forward binding shapes and dtypes
     (for-each (lambda (b)
-                (hash-table-set! binding-shape (ssa-binding-name b) (ssa-binding-shape b))
-                (hash-table-set! binding-dtype (ssa-binding-name b) (ssa-binding-dtype b)))
+                (env-builder-extend! binding-sd-eb
+                                     (ssa-binding-name b)
+                                     (cons (ssa-binding-shape b) (ssa-binding-dtype b))))
               fwd-bindings)
 
     ;; Also index constant shapes/dtypes
     (hash-table-walk (ssa-program-constants fwd-prog)
       (lambda (cid m)
-        (hash-table-set! binding-shape cid (morph-shape m))
-        (hash-table-set! binding-dtype cid (morph-dtype m))))
+        (env-builder-extend! binding-sd-eb cid (cons (morph-shape m) (morph-dtype m)))))
 
     ;; Register trainable param cid-symbols
     (for-each (lambda (v)
@@ -549,18 +550,18 @@
 
     ;; Lookup helpers
     (define (val-shape v)
-      (hash-table-ref/default binding-shape (ssa-value-id v) #f))
+      (let ((sd (env-builder-lookup binding-sd-eb (ssa-value-id v))))
+        (and sd (car sd))))
     (define (val-dtype v)
-      (hash-table-ref/default binding-dtype (ssa-value-id v) #f))
+      (let ((sd (env-builder-lookup binding-sd-eb (ssa-value-id v))))
+        (and sd (cdr sd))))
 
-    ;; emit! -- create a new backward SSA binding
+    ;; emit! -- create a new backward SSA binding (O(1) cons; reversed at end)
     (define (emit! op inputs shape dtype meta)
       (let* ((adj-id (gensym 'adj-))
              (b      (make-ssa-binding adj-id op inputs shape dtype meta)))
-        (set! bwd-bindings (append bwd-bindings (list b)))
-        ;; Index into binding-shape/dtype tables immediately
-        (hash-table-set! binding-shape adj-id shape)
-        (hash-table-set! binding-dtype adj-id dtype)
+        (set! bwd-bindings (cons b bwd-bindings))
+        (env-builder-extend! binding-sd-eb adj-id (cons shape dtype))
         (binding-ref adj-id)))
 
     ;; Accumulate adjoint for a binding-ref input
@@ -661,8 +662,7 @@
              (ones-const (make-morphism ones-data (vector->list src-shape) dtype))
              (ones-cid   (gensym 'cid-))
              (_ (hash-table-set! (ssa-program-constants fwd-prog) ones-cid ones-const))
-             (_ (hash-table-set! binding-shape ones-cid src-shape))
-             (_ (hash-table-set! binding-dtype ones-cid dtype))
+             (_ (env-builder-extend! binding-sd-eb ones-cid (cons src-shape dtype)))
              (ones-val (const-ref ones-cid)))
         ;; morph* broadcasts: g-kd * ones -> src-shape
         (emit! 'mul (list g-kd ones-val) src-shape dtype `((combiner . ,*)))))
@@ -674,8 +674,7 @@
              (m   (make-morphism data '(1) dtype))
              (cid (gensym 'cid-)))
         (hash-table-set! (ssa-program-constants fwd-prog) cid m)
-        (hash-table-set! binding-shape cid (vector 1))
-        (hash-table-set! binding-dtype cid dtype)
+        (env-builder-extend! binding-sd-eb cid (cons (vector 1) dtype))
         (const-ref cid)))
 
     ;; Seed: dL/dL = ones-like(loss) stored as a constant
@@ -690,8 +689,7 @@
            (seed-const  (make-morphism seed-data (vector->list loss-shape) loss-dtype))
            (seed-cid    (gensym 'cid-))
            (_ (hash-table-set! (ssa-program-constants fwd-prog) seed-cid seed-const))
-           (_ (hash-table-set! binding-shape seed-cid loss-shape))
-           (_ (hash-table-set! binding-dtype seed-cid loss-dtype))
+           (_ (env-builder-extend! binding-sd-eb seed-cid (cons loss-shape loss-dtype)))
            (seed-val    (const-ref seed-cid)))
       (hash-table-set! adjoint-val loss-bid-sym seed-val))
 
@@ -1007,8 +1005,7 @@
            (zero-const  (make-morphism zero-data (vector->list loss-shape) loss-dtype))
            (zero-cid    (gensym 'cid-))
            (_ (hash-table-set! (ssa-program-constants fwd-prog) zero-cid zero-const))
-           (_ (hash-table-set! binding-shape zero-cid loss-shape))
-           (_ (hash-table-set! binding-dtype zero-cid loss-dtype))
+           (_ (env-builder-extend! binding-sd-eb zero-cid (cons loss-shape loss-dtype)))
            (zero-val    (const-ref zero-cid))
            (loss-out-val (emit! 'add (list loss-binding-val zero-val) loss-shape loss-dtype
                                       `((combiner . ,+))))
@@ -1019,7 +1016,7 @@
                              (hash-table-ref/default param-grad-val cid-sym #f)))
                          param-const-vals))
            (all-outputs  (cons loss-out-val grad-vals))
-           (all-bindings (append fwd-bindings bwd-bindings)))
+           (all-bindings (append fwd-bindings (reverse bwd-bindings))))
       ;; Apply MoA psi-composition fusion to the full joint forward+backward program.
       ;; Cross-AD-boundary fusion is automatic: backward element-wise bindings
       ;; with use-count=1 are eligible under the same rules as forward ones.
@@ -1078,7 +1075,7 @@
                         (map (lambda (_) (lambda (idx) idx)) inputs)
                         comb
                         shapes)))
-         (morphism-expr op inputs ifn shp (ssa-binding-dtype b) '() -1)))
+         (morphism-expr (gensym 'morph-) op inputs ifn shp (ssa-binding-dtype b) '() -1)))
       ((equal? op '(reduce mean))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
@@ -1289,8 +1286,8 @@
                      (map (lambda (_) shape) (ssa-binding-inputs b))))
                   (let ((trace-inputs (map trace-arr-of (ssa-binding-inputs b))))
                     (cases array-morphism (rebuild-morphism b trace-inputs)
-                      (morphism-expr (_ _ ifn _ _ _ _) ifn)
-                      (reduction-morphism (_ _ _ ifn _ _ _) ifn)
+                      (morphism-expr (_ _ _ ifn _ _ _ _) ifn)
+                      (reduction-morphism (_ _ _ _ ifn _ _ _) ifn)
                       (else (error "compile-one-instruction: rebuild-morphism returned unexpected type"
                                    op meta)))))))))
 

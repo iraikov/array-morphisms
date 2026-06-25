@@ -53,7 +53,7 @@
     (let* ((m (morph-from-list '(1 2 3 4) #(4) 'f32))
            (reshaped (morph-reshape m #(2 2))))
       (cases array-morphism reshaped
-        (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+        (morphism-expr (_ op operands index-fn shape dtype metadata batch-axis)
           (equal? 'reshape op))
         (else #f))))
   
@@ -146,7 +146,7 @@
     (let* ((m (morph-from-list '((1 2) (3 4)) #(2 2) 'f64))
            (transposed (morph-transpose m)))
       (cases array-morphism transposed
-        (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+        (morphism-expr (_ op operands index-fn shape dtype metadata batch-axis)
           (equal? 'transpose op))
         (else (test-assert #f)))))
   
@@ -242,7 +242,7 @@
     (let* ((m (morph-from-list '(1 2 3 4 5) #(5) 'f64))
            (sliced (morph-slice m '(0) '(3))))
       (cases array-morphism sliced
-        (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+        (morphism-expr (_ op operands index-fn shape dtype metadata batch-axis)
           (equal? 'slice op))
         (else #f))))
   
@@ -470,7 +470,7 @@
     (let* ((m (morph-from-list (make-list 18 1) #(2 3 3) 'f64))
            (col (im2col-morph m '(2 2))))
       (cases array-morphism col
-        (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+        (morphism-expr (_ op operands index-fn shape dtype metadata batch-axis)
           (equal? 'im2col op))
         (else #f))))
   
@@ -551,7 +551,7 @@
     (let* ((col (morph-from-list (make-list 32 1) #(8 4) 'f64))
            (im (col2im-morph col #(2 3 3) '(2 2))))
       (cases array-morphism im
-        (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+        (morphism-expr (_ op operands index-fn shape dtype metadata batch-axis)
           (equal? 'col2im op))
         (else #f))))
   

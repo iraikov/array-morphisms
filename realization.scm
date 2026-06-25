@@ -103,13 +103,13 @@
           m)
 
         ;; Abstract morphism - needs realization
-        (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+        (morphism-expr (morph-id op operands index-fn shape dtype metadata batch-axis)
           (if ctx
               (realize-morphism-expr/ctx ctx m)
               (realize-morphism-expr m)))
 
         ;; Reduction morphism
-        (reduction-morphism (op operand reduce-axes index-fn shape dtype batch-axis)
+        (reduction-morphism (morph-id op operand reduce-axes index-fn shape dtype batch-axis)
           (if ctx
               (realize-reduction/ctx ctx m)
               (realize-reduction m))))))
@@ -145,15 +145,15 @@
       im2col-meta - the metadata alist from the im2col morphism-expr, which
                    contains at minimum keys: kernel-size, stride, padding."
     (cases array-morphism m
-      (morphism-expr (op operands _ _ _ _ _)
+      (morphism-expr (morph-id op operands _ _ _ _ _)
         (and (eq? op 'reshape)
              (= (length operands) 1)
              (cases array-morphism (car operands)
-               (morphism-expr (mm-op mm-operands _ _ _ _ _)
+               (morphism-expr (morph-id mm-op mm-operands _ _ _ _ _)
                  (and (eq? mm-op 'matmul)
                       (= (length mm-operands) 2)
                       (cases array-morphism (cadr mm-operands)
-                        (morphism-expr (ic-op ic-operands _ _ _ ic-meta _)
+                        (morphism-expr (morph-id ic-op ic-operands _ _ _ ic-meta _)
                           (and (eq? ic-op 'im2col)
                                (= (length ic-operands) 1)
                                (list (car ic-operands)   ; input
@@ -335,7 +335,7 @@
     Scratch vectors s and e (length n) are allocated once and shared across
     all batch elements, keeping peak scratch at O(n) regardless of batch size."
     (cases array-morphism m
-      (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+      (morphism-expr (morph-id op operands index-fn shape dtype metadata batch-axis)
         (let* ((scale     (cdr (assq 'scale     metadata)))
                (n         (cdr (assq 'n         metadata)))
                (dk        (cdr (assq 'dk        metadata)))
@@ -413,7 +413,7 @@
   Standard path: zero-copy view or generic kernel execution."
 
   (cases array-morphism m
-    (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+    (morphism-expr (morph-id op operands index-fn shape dtype metadata batch-axis)
 
       ;; Fused attention: explicit op tag, no tree scan needed.
       (if (eq? op 'attention)
@@ -442,7 +442,7 @@
                        ;; execute-index-fn cannot handle.
                        (blas-result
                         (execute-blas-operation
-                         (morphism-expr op realized-operands index-fn
+                         (morphism-expr morph-id op realized-operands index-fn
                                         shape dtype metadata batch-axis))))
 
                   (if blas-result
@@ -486,7 +486,7 @@
     the prior limitation where ctx always used the pure Scheme kernel path."
 
     (cases array-morphism m
-      (morphism-expr (op operands index-fn shape dtype metadata batch-axis)
+      (morphism-expr (morph-id op operands index-fn shape dtype metadata batch-axis)
         ;; Fused attention: delegate outside the context buffer pool.
         ;; The attention kernel allocates its own output; context integration
         ;; for attention output buffers is future work.
@@ -530,7 +530,7 @@
                      ;; identity-fn with two operands.
                      (blas-info
                       (blas-compatible-operation?
-                       (morphism-expr op realized-operands index-fn
+                       (morphism-expr morph-id op realized-operands index-fn
                                       shape dtype metadata batch-axis))))
                 ;; Fill result-data via BLAS/into! or the generic index kernel.
                 (if blas-info
@@ -579,7 +579,7 @@
     "Realize reduction-morphism with an active dispatch context vector."
 
     (cases array-morphism m
-      (reduction-morphism (op operand reduce-axes index-fn shape dtype batch-axis)
+      (reduction-morphism (morph-id op operand reduce-axes index-fn shape dtype batch-axis)
         ;; Realize operand - inherits active context via parameter
         (let ((src (realize operand)))
           (cases array-morphism src
@@ -1277,7 +1277,7 @@
     Performs accumulation over specified axes"
     
     (cases array-morphism m
-      (reduction-morphism (op operand reduce-axes index-fn shape dtype batch-axis)
+      (reduction-morphism (morph-id op operand reduce-axes index-fn shape dtype batch-axis)
         
         ;; Realize source first
         (let ((src-realized (realize operand)))

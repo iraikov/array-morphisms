@@ -49,7 +49,7 @@
     (let ((result (morph+ m1 m2)))
       (test-assert "morph+ creates morphism-expr with correct operation"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (and (eq? op 'add)
                  (= (length operands) 2)
                  (equal? shape #(3))
@@ -62,7 +62,7 @@
     (let ((result (morph- m1 m2)))
       (test-assert "morph- creates morphism-expr"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (and (eq? op 'sub)
                  (= (length operands) 2)))
           (else #f)))))
@@ -73,7 +73,7 @@
     (let ((result (morph* m1 m2)))
       (test-assert "morph* creates morphism-expr"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (eq? op 'mul))
           (else #f)))))
   
@@ -83,7 +83,7 @@
     (let ((result (morph/ m1 m2)))
       (test-assert "morph/ creates morphism-expr"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (eq? op 'div))
           (else #f)))))
   
@@ -93,7 +93,7 @@
     (let ((result (morph-pow m1 m2)))
       (test-assert "morph-pow creates morphism-expr"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (eq? op 'pow))
           (else #f)))))
 )
@@ -200,7 +200,7 @@
     (let ((result (morph-sqrt m)))
       (test-assert "morph-sqrt creates morphism-expr"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (and (eq? op 'sqrt)
                  (= (length operands) 1)
                  (equal? shape #(3))))
@@ -210,7 +210,7 @@
   (let ((m (morph-from-list '(0.0 1.0) #(2) 'f32)))
     (test-assert "morph-exp creates morphism-expr"
       (cases array-morphism (morph-exp m)
-        (morphism-expr (op operands idx-fn shape dtype meta batch)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch)
           (eq? op 'exp))
         (else #f))))
   
@@ -218,7 +218,7 @@
   (let ((m (morph-from-list '(1.0 2.718281828) #(2) 'f64)))
     (test-assert "morph-log creates morphism-expr"
       (cases array-morphism (morph-log m)
-        (morphism-expr (op operands idx-fn shape dtype meta batch)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch)
           (eq? op 'log))
         (else #f))))
   
@@ -226,7 +226,7 @@
   (let ((m (morph-from-list '(0.0 1.5708) #(2) 'f64)))
     (test-assert "morph-sin creates morphism-expr"
       (cases array-morphism (morph-sin m)
-        (morphism-expr (op operands idx-fn shape dtype meta batch)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch)
           (eq? op 'sin))
         (else #f))))
   
@@ -234,7 +234,7 @@
   (let ((m (morph-from-list '(1 -2 3) #(3) 's32)))
     (test-assert "morph-negate creates morphism-expr"
       (cases array-morphism (morph-negate m)
-        (morphism-expr (op operands idx-fn shape dtype meta batch)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch)
           (eq? op 'negate))
         (else #f))))
   
@@ -242,7 +242,7 @@
   (let ((m (morph-from-list '(-5 3 -7) #(3) 's32)))
     (test-assert "morph-abs creates morphism-expr"
       (cases array-morphism (morph-abs m)
-        (morphism-expr (op operands idx-fn shape dtype meta batch)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch)
           (eq? op 'abs))
         (else #f))))
 )
@@ -308,7 +308,7 @@
     (let ((result (morph> m1 m2)))
       (test-assert "morph> creates morphism-expr"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (and (eq? op 'gt)
                  (= (length operands) 2)
                  (equal? shape #(3))
@@ -321,7 +321,7 @@
     (let ((result (morph< m1 m2)))
       (test-assert "morph< creates morphism-expr with f64 result"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (and (eq? op 'lt)
                  (eq? dtype 'f64)))
           (else #f)))))
@@ -331,7 +331,7 @@
         (m2 (morph-from-list '(1.0 3.0) #(2) 'f32)))
     (test-assert "morph= creates morphism-expr"
       (cases array-morphism (morph= m1 m2)
-        (morphism-expr (op operands idx-fn shape dtype meta batch)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch)
           (eq? op 'eq))
         (else #f))))
   
@@ -340,7 +340,7 @@
         (m2 (morph-from-list '(1 2 3) #(3) 'f64)))
     (test-assert "morph>= creates morphism-expr"
       (cases array-morphism (morph>= m1 m2)
-        (morphism-expr (op operands idx-fn shape dtype meta batch)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch)
           (eq? op 'ge))
         (else #f))))
   
@@ -349,7 +349,7 @@
         (m2 (morph-from-list '(2 1) #(2) 's64)))
     (test-assert "morph<= creates morphism-expr"
       (cases array-morphism (morph<= m1 m2)
-        (morphism-expr (op operands idx-fn shape dtype meta batch)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch)
           (eq? op 'le))
         (else #f))))
   
@@ -379,7 +379,7 @@
     (let ((result (morph-map (lambda (x) (* x x)) m)))
       (test-assert "morph-map creates morphism-expr"
         (cases array-morphism result
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (and (eq? op 'map)
                  (= (length operands) 1)
                  (equal? shape #(3))))
@@ -407,7 +407,7 @@
   (let ((m (morph-from-list '(0.0 1.0) #(2) 'f64)))
     (test-assert "morph-map with complex function"
       (cases array-morphism (morph-map (lambda (x) (sin (* x 3.14159))) m)
-        (morphism-expr (op operands idx-fn shape dtype meta batch) #t)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch) #t)
         (else #f))))
 )
 
@@ -422,7 +422,7 @@
     (let ((result (morph-reduce 'sum m)))
       (test-assert "morph-reduce creates reduction-morphism"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (and (eq? op 'sum)
                  (equal? shape #())
                  (eq? dtype 'f64)))
@@ -433,7 +433,7 @@
     (let ((result (morph-reduce 'sum m '(0))))
       (test-assert "Reduce axis 0 - shape"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (equal? shape #(2)))
           (else #f)))))
   
@@ -442,7 +442,7 @@
     (let ((result (morph-reduce 'mean m '(1))))
       (test-assert "Reduce axis 1 - shape"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (equal? shape #(2)))
           (else #f)))))
   
@@ -451,7 +451,7 @@
     (let ((result (morph-reduce 'sum m '(0) #t)))
       (test-assert "Reduce with keepdims - shape"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (equal? shape #(1 2)))
           (else #f)))))
   
@@ -460,7 +460,7 @@
     (let ((result (morph-reduce 'max m '(0 2))))
       (test-assert "Reduce multiple axes - shape"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (equal? shape #(2)))
           (else #f)))))
   
@@ -469,7 +469,7 @@
     (let ((result (morph-reduce 'prod m)))
       (test-assert "Reduce all axes - scalar result"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (equal? shape #()))
           (else #f)))))
   
@@ -478,7 +478,7 @@
     (let ((result (morph-reduce 'sum m '(-1))))
       (test-assert "Reduce with negative axis"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (equal? shape #(2)))
           (else #f)))))
   
@@ -487,7 +487,7 @@
     (let ((result (morph-reduce 'mean m)))
       (test-assert "Mean: s32 -> f64"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (eq? dtype 'f64))
           (else #f)))))
   
@@ -496,7 +496,7 @@
     (let ((result (morph-reduce 'sum m)))
       (test-assert "Sum preserves s64"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (eq? dtype 's64))
           (else #f)))))
 )
@@ -545,7 +545,7 @@
     (let ((result (morph-reduce 'sum m '(0))))
       (test-assert "Reduce along batch axis -> not batched"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (= batch -1))
           (else #f)))))
   
@@ -554,7 +554,7 @@
     (let ((result (morph-reduce 'sum m '(1))))
       (test-assert "Reduce non-batch axis -> still batched"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (= batch 0))
           (else #f)))))
   
@@ -563,7 +563,7 @@
     (let ((result (morph-reduce 'sum m '(0) #t)))
       (test-assert "Reduce with keepdims preserves batch axis"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (= batch 0))
           (else #f)))))
 )
@@ -579,7 +579,7 @@
     (let ((result (morph-reduce 'sum m '())))
       (test-assert "Empty axes reduces all"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (equal? shape #()))
           (else #f)))))
   
@@ -588,7 +588,7 @@
     (let ((result (morph-reduce 'max m)))
       (test-assert "Single element reduction"
         (cases array-morphism result
-          (reduction-morphism (op operand axes idx-fn shape dtype batch)
+          (reduction-morphism (_ op operand axes idx-fn shape dtype batch)
             (equal? shape #()))
           (else #f)))))
   
@@ -605,7 +605,7 @@
            (final (morph-sqrt plus-one)))
       (test-assert "Chained operations create valid structure"
         (cases array-morphism final
-          (morphism-expr (op operands idx-fn shape dtype meta batch)
+          (morphism-expr (_ op operands idx-fn shape dtype meta batch)
             (eq? op 'sqrt))
           (else #f)))))
   

@@ -127,6 +127,7 @@
           
           ;; Create morphism-expr with identity index function
           (morphism-expr
+           (gensym 'morph-)
            'reshape
            (list m)
            (make-reshape-index-fn current-shape inferred-shape)
@@ -215,6 +216,7 @@
       
       ;; Create morphism-expr with transpose index function
       (morphism-expr
+       (gensym 'morph-)
        'transpose
        (list m)
        (make-transpose-index-fn perm)
@@ -321,6 +323,7 @@
       
       ;; Create morphism-expr with slice index function
       (morphism-expr
+       (gensym 'morph-)
        'slice
        (list m)
        (make-slice-index-fn norm-start norm-end step-list)
@@ -432,6 +435,7 @@
                   padding))))
       
       (morphism-expr
+       (gensym 'morph-)
        'pad
        (list m)
        (make-pad-index-fn padding mode value shape)
@@ -562,6 +566,7 @@
                             (vector (* C KH KW) (* OH OW)))))
       
       (morphism-expr
+       (gensym 'morph-)
        'im2col
        (list input)
        (make-im2col-index-fn C H W KH KW SH SW PH PW OH OW batched?)
@@ -669,6 +674,7 @@
                    padding)))
       
       (morphism-expr
+       (gensym 'morph-)
        'col2im
        (list col)
        (make-col2im-index-fn kernel-size stride padding col-batched?)
@@ -766,6 +772,7 @@
            (result-dtype (fold promote-types (car dtypes) (cdr dtypes))))
       
       (morphism-expr
+       (gensym 'morph-)
        'stack
        morphisms
        (%make-stack-index-fn norm-axis (length morphisms))
@@ -897,6 +904,7 @@
            (result-dtype (fold promote-types (car dtypes) (cdr dtypes))))
       
       (morphism-expr
+       (gensym 'morph-)
        'concat
        morphisms
        (%make-concat-index-fn norm-axis (map get-morphism-shape morphisms))

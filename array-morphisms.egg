@@ -15,7 +15,8 @@
 
  (synopsis "Structure-preserving transformations between arrays.")
 
- (components (extension array-morphisms-core (source "core.scm") (csc-options "-O3" "-d1"))
+ (components (extension array-morphisms-morph-env (source "morph-env.scm") (csc-options "-O3" "-d1"))
+             (extension array-morphisms-core (source "core.scm") (csc-options "-O3" "-d1"))
              (extension array-morphisms-index-fn (source "index-functions.scm") (csc-options "-O3" "-d1"))
              (extension array-morphisms-basic-ops (source "basic-ops.scm") (csc-options "-O3" "-d1"))
              (extension array-morphisms-blas-compat (source "blas-compat.scm")   (csc-options "-O0" "-d2"))

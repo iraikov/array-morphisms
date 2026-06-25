@@ -169,14 +169,14 @@
   (test-assert "explicit scale stored in metadata"
     (let ((m (attention-morphism Q3-morph K3-morph V3-morph 0.25)))
       (cases array-morphism m
-        (morphism-expr (_ _ _ _ _ meta _)
+        (morphism-expr (_ _ _ _ _ _ meta _)
           (approx= (cdr (assq 'scale meta)) 0.25))
         (else #f))))
 
   (test-assert "default scale = 1/sqrt(dk)"
     (let ((m (attention-morphism Q3-morph K3-morph V3-morph)))
       (cases array-morphism m
-        (morphism-expr (_ _ _ _ _ meta _)
+        (morphism-expr (_ _ _ _ _ _ meta _)
           (approx= (cdr (assq 'scale meta)) scale-default))
         (else #f))))
 

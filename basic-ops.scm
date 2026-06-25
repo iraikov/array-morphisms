@@ -72,7 +72,8 @@
          ;; Determine batch axis (if both batched, must match)
          (batch-axis (infer-binary-batch-axis m1 m2)))
     
-    (morphism-expr operation 
+    (morphism-expr (gensym 'morph-)
+                   operation
                    (list m1 m2)
                    index-fn
                    result-shape
@@ -231,7 +232,8 @@
          ;; Preserve batch axis
          (batch-axis (get-morphism-batch-axis m)))
     
-    (morphism-expr operation
+    (morphism-expr (gensym 'morph-)
+                   operation
                    (list m)
                    index-fn
                    shape
@@ -413,7 +415,8 @@
          ;; Determine batch axis
          (batch-axis (infer-binary-batch-axis m1 m2)))
     
-    (morphism-expr operation
+    (morphism-expr (gensym 'morph-)
+                   operation
                    (list m1 m2)
                    index-fn
                    result-shape
@@ -494,7 +497,8 @@
          ;; Preserve batch axis
          (batch-axis (get-morphism-batch-axis m)))
     
-    (morphism-expr 'map
+    (morphism-expr (gensym 'morph-)
+                   'map
                    (list m)
                    index-fn
                    shape
@@ -594,7 +598,8 @@
                     (length (filter (lambda (ax) (< ax batch-axis))
                                    normalized-axes))))))))
     
-    (reduction-morphism op
+    (reduction-morphism (gensym 'morph-)
+                        op
                         m
                         normalized-axes
                         index-fn

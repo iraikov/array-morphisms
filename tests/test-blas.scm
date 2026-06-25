@@ -540,7 +540,7 @@
            (B (morph-from-list '((5 6) (7 8)) #(2 2) 'f64))
            (C (morph-matmul A B)))
       (cases array-morphism C
-        (morphism-expr (op operands idx-fn shape dtype meta batch-axis)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch-axis)
           (eq? op 'matmul))
         (else #f))))
 
@@ -555,7 +555,7 @@
            (B (morph-from-list '((1 2) (3 4) (5 6)) #(3 2) 'f64))
            (C (morph-matmul A B)))
       (cases array-morphism C
-        (morphism-expr (op operands idx-fn shape dtype meta batch-axis)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch-axis)
           (= 3 (cdr (assq 'k-dim meta))))
         (else #f))))
 
@@ -570,7 +570,7 @@
            (v (morph-from-list '(1 2) #(2) 'f64))
            (y (morph-matvec A v)))
       (cases array-morphism y
-        (morphism-expr (op operands idx-fn shape dtype meta batch-axis)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch-axis)
           (eq? op 'matvec))
         (else #f))))
 
@@ -585,7 +585,7 @@
            (v2 (morph-from-list '(3 4) #(2) 'f64))
            (r  (morph-dot v1 v2)))
       (cases array-morphism r
-        (morphism-expr (op operands idx-fn shape dtype meta batch-axis)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch-axis)
           (eq? op 'dot))
         (else #f))))
 
@@ -600,7 +600,7 @@
            (y (morph-from-list '(3 4) #(2) 'f64))
            (r (morph-axpy 3.14 x y)))
       (cases array-morphism r
-        (morphism-expr (op operands idx-fn shape dtype meta batch-axis)
+        (morphism-expr (_ op operands idx-fn shape dtype meta batch-axis)
           (approx= 3.14 (cdr (assq 'alpha meta))))
         (else #f))))
 )
