@@ -1,0 +1,5 @@
+
+(repo git "git://github.com/iraikov/array-morphisms.git")
+(uri targz "https://github.com/iraikov/array-morphisms/tarball/{egg-release}")
+
+(release "1.0" )
