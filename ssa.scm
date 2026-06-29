@@ -59,6 +59,7 @@
    ri-gemm ri-gemm-strided ri-index ri-reduce ri-view
    ri-flat-unary ri-flat-binary ri-flat-bias-broadcast
    ri-gemm-epilogue ri-alias
+   ri-im2col ri-col2im
 
    ;; Fusion pass
    ssa-compute-use-counts
@@ -67,9 +68,16 @@
 
    ;; Replay plan compilation and execution
    compile-replay-plan
-   execute-replay-plan)
+   execute-replay-plan
 
-  (import scheme (chicken base))
+   ;; Diagnostics
+   replay-plan-stats
+
+   ;; Per-instruction timing
+   replay-timing-reset!
+   replay-timing-results)
+
+  (import scheme (chicken base) (chicken time))
   (import (only srfi-1 iota fold filter map for-each append-map filter-map every))
   (import (only srfi-4
                 f64vector f64vector-set! f64vector-length
@@ -80,6 +88,7 @@
                 hash-table-ref/default
                 hash-table-set!
                 hash-table-walk
+                hash-table->alist
                 eq?-hash))
   (import datatype matchable)
   (import array-morphisms-core)
@@ -267,7 +276,49 @@
     (shape     vector?)
     (strides   vector?)
     (dtype     symbol?)
-    (in-ref    replay-ref?)))
+    (in-ref    replay-ref?))
+
+  ;; Fast im2col: all index parameters baked in at compile time from morph meta.
+  ;; Calls execute-im2col-batched or execute-im2col-unbatched (no per-element alloc).
+  (ri-im2col
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (src-ref      replay-ref?)
+    (N            integer?)
+    (C            integer?)
+    (H            integer?)
+    (W            integer?)
+    (KH           integer?)
+    (KW           integer?)
+    (SH           integer?)
+    (SW           integer?)
+    (PH           integer?)
+    (PW           integer?)
+    (OH           integer?)
+    (OW           integer?)
+    (batched?     boolean?))
+
+  ;; Fast col2im: all index parameters baked in at compile time from VJP meta.
+  ;; Calls execute-col2im-batched or execute-col2im-unbatched (no per-element alloc).
+  (ri-col2im
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (col-ref      replay-ref?)
+    (N            integer?)
+    (C            integer?)
+    (H            integer?)
+    (W            integer?)
+    (KH           integer?)
+    (KW           integer?)
+    (SH           integer?)
+    (SW           integer?)
+    (PH           integer?)
+    (PW           integer?)
+    (batched?     boolean?)))
 
 
 ;;; ============================================================
@@ -942,14 +993,29 @@
                                         (list (cons 'perm inv-perm)))))
                   (accumulate-input-adjoint! x-val dx)))
 
-               ;; reshape(x) -- dx = reshape(g, original-shape)
-               ((eq? op 'reshape)
-                (let* ((x-val   (list-ref inputs 0))
-                       (x-shape (val-shape x-val))
-                       (dx      (emit! 'reshape (list g-val) x-shape dtype '())))
-                  (accumulate-input-adjoint! x-val dx)))
+                ;; reshape(x) -- dx = reshape(g, original-shape)
+                ((eq? op 'reshape)
+                 (let* ((x-val   (list-ref inputs 0))
+                        (x-shape (val-shape x-val))
+                        (dx      (emit! 'reshape (list g-val) x-shape dtype '())))
+                   (accumulate-input-adjoint! x-val dx)))
 
-               ;; (reduce mean) -- dx = broadcast(g / n, src-shape)
+                ;; im2col(x) -- dx = col2im(g, shape(x), kernel, stride, padding)
+                ((eq? op 'im2col)
+                 (let* ((x-val       (list-ref inputs 0))
+                        (x-shape     (val-shape x-val))
+                        (kernel-size (cdr (assq 'kernel-size meta)))
+                        (stride      (cdr (assq 'stride meta)))
+                        (padding     (cdr (assq 'padding meta)))
+                        (dx          (emit! 'col2im (list g-val)
+                                            x-shape dtype
+                                            (list (cons 'output-shape x-shape)
+                                                  (cons 'kernel-size kernel-size)
+                                                  (cons 'stride stride)
+                                                  (cons 'padding padding)))))
+                   (accumulate-input-adjoint! x-val dx)))
+
+                ;; (reduce mean) -- dx = broadcast(g / n, src-shape)
                ((equal? op '(reduce mean))
                 (let* ((src-val    (list-ref inputs 0))
                        (src-shape  (cdr (assq 'src-shape meta)))
@@ -1113,11 +1179,27 @@
       ((eq? op 'relu)    (morph-relu    (car inputs)))
       ((eq? op 'sigmoid) (morph-sigmoid (car inputs)))
       ((eq? op 'tanh)    (morph-tanh-am (car inputs)))
-      ((eq? op 'map)
-       (let ((fn (cdr (assq 'fn meta))))
-         (morph-map fn (car inputs))))
-      (else
-       (error "rebuild-morphism: unknown op" op)))))
+       ((eq? op 'map)
+        (let ((fn (cdr (assq 'fn meta))))
+          (morph-map fn (car inputs))))
+
+       ;; im2col: forward image-to-column
+       ((eq? op 'im2col)
+        (let* ((kernel-size (cdr (assq 'kernel-size meta)))
+               (stride      (cdr (assq 'stride meta)))
+               (padding     (cdr (assq 'padding meta))))
+          (im2col-morph (car inputs) kernel-size stride padding)))
+
+       ;; col2im: column-to-image (backward of im2col)
+       ((eq? op 'col2im)
+        (let* ((output-shape (cdr (assq 'output-shape meta)))
+               (kernel-size  (cdr (assq 'kernel-size meta)))
+               (stride       (cdr (assq 'stride meta)))
+               (padding      (cdr (assq 'padding meta))))
+          (col2im-morph (car inputs) output-shape kernel-size stride padding)))
+
+       (else
+        (error "rebuild-morphism: unknown op" op)))))
 
 
 ;;; ============================================================
@@ -1346,6 +1428,54 @@
          (ri-reduce pool-idx shape strides dtype src-dtype rop axes reducer keepdims?
                     (car in-refs))))
 
+      ;; Fast im2col: extract kernel/stride/padding from morph meta; bake into ri-im2col.
+      ;; The morph meta carries kernel-size/stride/padding/spatial-output from im2col-morph.
+      ;; Source shape comes from the trace-time concrete-array for the input binding.
+      ((eq? op 'im2col)
+       (let* ((meta-ks  (cdr (assq 'kernel-size meta)))
+              (meta-st  (cdr (assq 'stride meta)))
+              (meta-pd  (cdr (assq 'padding meta)))
+              (meta-so  (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
+              (KH       (car  meta-ks)) (KW (cadr meta-ks))
+              (SH       (car  meta-st)) (SW (cadr meta-st))
+              (PH       (car  meta-pd)) (PW (cadr meta-pd))
+              (src-arr  (trace-arr-of (car (ssa-binding-inputs b))))
+              (src-shape (cases array-morphism src-arr
+                           (concrete-array (_ s _ _ _ _ _) s)
+                           (else (error "compile-one-instruction im2col: source not concrete"
+                                        (ssa-binding-name b)))))
+              (rank     (vector-length src-shape))
+              (batched? (= rank 4))
+              (N        (if batched? (vector-ref src-shape 0) 1))
+              (C        (vector-ref src-shape (if batched? 1 0)))
+              (H        (vector-ref src-shape (if batched? 2 1)))
+              (W        (vector-ref src-shape (if batched? 3 2)))
+              (OH       (if meta-so (car  meta-so)
+                           (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
+              (OW       (if meta-so (cadr meta-so)
+                           (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))))
+         (ri-im2col pool-idx shape strides dtype
+                    (car in-refs) N C H W KH KW SH SW PH PW OH OW batched?)))
+
+      ;; Fast col2im: VJP-emitted backward of im2col.
+      ;; Meta carries output-shape (= grad target shape), kernel-size, stride, padding.
+      ;; The output shape (= col2im output = im2col input gradient shape) is ssa-binding-shape.
+      ((eq? op 'col2im)
+       (let* ((meta-ks  (cdr (assq 'kernel-size meta)))
+              (meta-st  (cdr (assq 'stride meta)))
+              (meta-pd  (cdr (assq 'padding meta)))
+              (KH       (car  meta-ks)) (KW (cadr meta-ks))
+              (SH       (car  meta-st)) (SW (cadr meta-st))
+              (PH       (car  meta-pd)) (PW (cadr meta-pd))
+              (rank     (vector-length shape))
+              (batched? (= rank 4))
+              (N        (if batched? (vector-ref shape 0) 1))
+              (C        (vector-ref shape (if batched? 1 0)))
+              (H        (vector-ref shape (if batched? 2 1)))
+              (W        (vector-ref shape (if batched? 3 2))))
+         (ri-col2im pool-idx shape strides dtype
+                    (car in-refs) N C H W KH KW SH SW PH PW batched?)))
+
       ;; Element-wise and all other pool-backed ops.
       ;; VJP-emitted bindings have empty meta; get-index-fn rebuilds via trace inputs.
       ;; classify once at compile time into flat fast-paths or generic ri-index fallback.
@@ -1513,6 +1643,39 @@
 
 
 ;;; ============================================================
+;;; Replay Plan: per-instruction timing accumulators
+;;; ============================================================
+
+;; Timing is accumulated in a hash table tag -> total-ms across all steps.
+;; Call replay-timing-reset! before a timing run; replay-timing-results after.
+(define *timing-enabled?* #f)
+(define *timing-table* (make-hash-table eq?))
+(define *timing-steps* 0)
+
+(define (replay-timing-reset!)
+  (set! *timing-table* (make-hash-table eq?))
+  (set! *timing-steps* 0)
+  (set! *timing-enabled?* #t))
+
+(define (replay-timing-results)
+  (set! *timing-enabled?* #f)
+  (list (cons 'steps *timing-steps*)
+        (cons 'per-tag (hash-table->alist *timing-table*))))
+
+(define-syntax time-instr
+  (syntax-rules ()
+    ((_ tag body ...)
+     (if *timing-enabled?*
+         (let ((t0 (cpu-time)))
+           (let ((result (begin body ...)))
+             (let ((elapsed (- (cpu-time) t0)))
+               (hash-table-set! *timing-table* tag
+                 (+ elapsed (hash-table-ref/default *timing-table* tag 0)))
+               result)))
+         (begin body ...)))))
+
+
+;;; ============================================================
 ;;; Replay Plan: execute-replay-plan
 ;;; ============================================================
 
@@ -1545,6 +1708,9 @@
         (concrete-array (vector-ref pool-bufs pool-idx)
                         shape strides 0 dtype aid -1)))
 
+    (when *timing-enabled?*
+      (set! *timing-steps* (+ *timing-steps* 1)))
+
     (do ((i 0 (+ i 1)))
         ((= i n))
       (let* ((instr (vector-ref plan i))
@@ -1552,90 +1718,99 @@
               (cases replay-instruction instr
 
                 (ri-gemm (pool-idx shape strides dtype A-ref B-ref)
-                  (let ((buf (vector-ref pool-bufs pool-idx)))
-                    (execute-blas-gemm/into! (deref A-ref) (deref B-ref) buf)
-                    (make-pool-arr pool-idx shape strides dtype)))
+                  (time-instr 'ri-gemm
+                    (let ((buf (vector-ref pool-bufs pool-idx)))
+                      (execute-blas-gemm/into! (deref A-ref) (deref B-ref) buf)
+                      (make-pool-arr pool-idx shape strides dtype))))
 
                 (ri-gemm-strided (pool-idx shape strides dtype A-ref B-ref)
-                  (let ((buf (vector-ref pool-bufs pool-idx)))
-                    (execute-blas-gemm-strided/into! (deref A-ref) (deref B-ref) buf)
-                    (make-pool-arr pool-idx shape strides dtype)))
+                  (time-instr 'ri-gemm-strided
+                    (let ((buf (vector-ref pool-bufs pool-idx)))
+                      (execute-blas-gemm-strided/into! (deref A-ref) (deref B-ref) buf)
+                      (make-pool-arr pool-idx shape strides dtype))))
 
                 (ri-index (pool-idx shape strides dtype index-fn in-refs)
-                  (let ((buf (vector-ref pool-bufs pool-idx)))
-                    (execute-index-fn index-fn buf shape (map deref in-refs) dtype)
-                    (make-pool-arr pool-idx shape strides dtype)))
+                  (time-instr 'ri-index
+                    (let ((buf (vector-ref pool-bufs pool-idx)))
+                      (execute-index-fn index-fn buf shape (map deref in-refs) dtype)
+                      (make-pool-arr pool-idx shape strides dtype))))
 
                 (ri-reduce (pool-idx shape strides dtype src-dtype rop axes reducer keepdims? in-ref)
-                  (let* ((src (deref in-ref))
-                         (buf (vector-ref pool-bufs pool-idx)))
-                    (cases array-morphism src
-                      (concrete-array (src-data src-shape src-strides src-offset _ _ _)
-                        (execute-reduction-morphism
-                         rop buf shape
-                         src-data src-shape src-strides src-offset
-                         axes reducer keepdims? dtype src-dtype)
-                        (make-pool-arr pool-idx shape strides dtype))
-                      (else
-                       (error "execute-replay-plan ri-reduce: source not concrete" src)))))
+                  (time-instr 'ri-reduce
+                    (let* ((src (deref in-ref))
+                           (buf (vector-ref pool-bufs pool-idx)))
+                      (cases array-morphism src
+                        (concrete-array (src-data src-shape src-strides src-offset _ _ _)
+                          (execute-reduction-morphism
+                           rop buf shape
+                           src-data src-shape src-strides src-offset
+                           axes reducer keepdims? dtype src-dtype)
+                          (make-pool-arr pool-idx shape strides dtype))
+                        (else
+                         (error "execute-replay-plan ri-reduce: source not concrete" src))))))
 
                 (ri-view (view-fn in-ref)
-                  (view-fn (deref in-ref)))
+                  (time-instr 'ri-view
+                    (view-fn (deref in-ref))))
 
                 (ri-flat-unary (pool-idx shape strides dtype combiner in-A)
-                  (let* ((src  (deref in-A))
-                         (buf  (vector-ref pool-bufs pool-idx))
-                         (size (shape-size shape)))
-                    (cases array-morphism src
-                      (concrete-array (data _ _ _ _ _ _)
-                        (execute-flat-unary-compute combiner data buf size dtype)
-                        (make-pool-arr pool-idx shape strides dtype))
-                      (else (error "ri-flat-unary: source not concrete" src)))))
+                  (time-instr 'ri-flat-unary
+                    (let* ((src  (deref in-A))
+                           (buf  (vector-ref pool-bufs pool-idx))
+                           (size (shape-size shape)))
+                      (cases array-morphism src
+                        (concrete-array (data _ _ _ _ _ _)
+                          (execute-flat-unary-compute combiner data buf size dtype)
+                          (make-pool-arr pool-idx shape strides dtype))
+                        (else (error "ri-flat-unary: source not concrete" src))))))
 
                 (ri-flat-binary (pool-idx shape strides dtype combiner in-A in-B)
-                  (let* ((A    (deref in-A))
-                         (B    (deref in-B))
-                         (buf  (vector-ref pool-bufs pool-idx))
-                         (size (shape-size shape)))
-                    (cases array-morphism A
-                      (concrete-array (data1 _ _ _ _ _ _)
-                        (cases array-morphism B
-                          (concrete-array (data2 _ _ _ _ _ _)
-                            (execute-flat-binary-compute combiner data1 data2 buf size dtype)
-                            (make-pool-arr pool-idx shape strides dtype))
-                          (else (error "ri-flat-binary: B not concrete" B))))
-                      (else (error "ri-flat-binary: A not concrete" A)))))
+                  (time-instr 'ri-flat-binary
+                    (let* ((A    (deref in-A))
+                           (B    (deref in-B))
+                           (buf  (vector-ref pool-bufs pool-idx))
+                           (size (shape-size shape)))
+                      (cases array-morphism A
+                        (concrete-array (data1 _ _ _ _ _ _)
+                          (cases array-morphism B
+                            (concrete-array (data2 _ _ _ _ _ _)
+                              (execute-flat-binary-compute combiner data1 data2 buf size dtype)
+                              (make-pool-arr pool-idx shape strides dtype))
+                            (else (error "ri-flat-binary: B not concrete" B))))
+                        (else (error "ri-flat-binary: A not concrete" A))))))
 
                 (ri-flat-bias-broadcast (pool-idx shape strides dtype combiner N in-A in-B)
-                  (let* ((A    (deref in-A))
-                         (B    (deref in-B))
-                         (buf  (vector-ref pool-bufs pool-idx))
-                         (size (shape-size shape)))
-                    (cases array-morphism A
-                      (concrete-array (data1 _ _ _ _ _ _)
-                        (cases array-morphism B
-                          (concrete-array (data2 _ _ _ _ _ _)
-                            (execute-flat-bias-broadcast-compute combiner data1 data2 buf size N dtype)
-                            (make-pool-arr pool-idx shape strides dtype))
-                          (else (error "ri-flat-bias-broadcast: B not concrete" B))))
-                      (else (error "ri-flat-bias-broadcast: A not concrete" A)))))
+                  (time-instr 'ri-flat-bias-broadcast
+                    (let* ((A    (deref in-A))
+                           (B    (deref in-B))
+                           (buf  (vector-ref pool-bufs pool-idx))
+                           (size (shape-size shape)))
+                      (cases array-morphism A
+                        (concrete-array (data1 _ _ _ _ _ _)
+                          (cases array-morphism B
+                            (concrete-array (data2 _ _ _ _ _ _)
+                              (execute-flat-bias-broadcast-compute combiner data1 data2 buf size N dtype)
+                              (make-pool-arr pool-idx shape strides dtype))
+                            (else (error "ri-flat-bias-broadcast: B not concrete" B))))
+                        (else (error "ri-flat-bias-broadcast: A not concrete" A))))))
 
                 (ri-gemm-epilogue (pool-idx shape strides dtype A-ref B-ref
                                    epilogue-kind epilogue-comb epilogue-N bias-ref)
-                  (let* ((buf (vector-ref pool-bufs pool-idx))
-                         (sz  (shape-size shape)))
-                    (execute-blas-gemm-strided/into! (deref A-ref) (deref B-ref) buf)
-                    (case epilogue-kind
-                      ((unary)
-                       (execute-flat-unary-compute-inplace! epilogue-comb buf sz dtype))
-                      ((bias-broadcast)
-                       (cases array-morphism (deref bias-ref)
-                         (concrete-array (bias-data _ _ _ _ _ _)
-                           (execute-flat-bias-broadcast-inplace!
-                            epilogue-comb buf bias-data sz epilogue-N dtype))
-                         (else (error "ri-gemm-epilogue: bias not concrete"))))
-                      (else (error "ri-gemm-epilogue: unknown epilogue-kind" epilogue-kind)))
-                    (make-pool-arr pool-idx shape strides dtype)))
+                  (time-instr 'ri-gemm-epilogue
+                    (let* ((buf (vector-ref pool-bufs pool-idx))
+                           (sz  (shape-size shape)))
+                      (execute-blas-gemm-strided/into! (deref A-ref) (deref B-ref) buf)
+                      (case epilogue-kind
+                        ((unary)
+                         (execute-flat-unary-compute-inplace! epilogue-comb buf sz dtype))
+                        ((bias-broadcast)
+                         (cases array-morphism (deref bias-ref)
+                           (concrete-array (bias-data _ _ _ _ _ _)
+                             (execute-flat-bias-broadcast-inplace!
+                              epilogue-comb buf bias-data sz epilogue-N dtype))
+                           (else (error "ri-gemm-epilogue: bias not concrete"))))
+                        (else (error "ri-gemm-epilogue: unknown epilogue-kind" epilogue-kind)))
+                      (make-pool-arr pool-idx shape strides dtype))))
 
                 (ri-alias (pool-idx shape strides dtype in-ref)
                   ;; The epilogue was applied in-place by the preceding ri-gemm-epilogue.
@@ -1648,10 +1823,39 @@
                     (cases array-morphism src
                       (concrete-array (src-data _ _ _ _ _ _)
                         (concrete-array src-data shape strides 0 dtype aid -1))
-                      (else (error "ri-alias: source not concrete" src))))))))
-        (vector-set! vals i result)))
+                      (else (error "ri-alias: source not concrete" src)))))
 
+                (ri-im2col (pool-idx shape strides dtype src-ref
+                             N C H W KH KW SH SW PH PW OH OW batched?)
+                  (time-instr 'ri-im2col
+                    (let* ((src (deref src-ref))
+                           (buf (vector-ref pool-bufs pool-idx)))
+                      (cases array-morphism src
+                        (concrete-array (src-data _ _ _ _ _ _)
+                          (if batched?
+                              (execute-im2col-batched   buf src-data N C H W KH KW SH SW PH PW OH OW dtype)
+                              (execute-im2col-unbatched buf src-data   C H W KH KW SH SW PH PW OH OW dtype))
+                          (make-pool-arr pool-idx shape strides dtype))
+                        (else (error "ri-im2col: source not concrete" src))))))
+
+                (ri-col2im (pool-idx shape strides dtype col-ref
+                             N C H W KH KW SH SW PH PW batched?)
+                  (time-instr 'ri-col2im
+                    (let* ((col (deref col-ref))
+                           (buf (vector-ref pool-bufs pool-idx)))
+                      (cases array-morphism col
+                        (concrete-array (col-data col-shape _ _ _ _ _)
+                          (if batched?
+                              (execute-col2im-batched   buf shape col-data col-shape KH KW SH SW PH PW dtype)
+                              (execute-col2im-unbatched buf shape col-data col-shape KH KW SH SW PH PW dtype))
+                          (make-pool-arr pool-idx shape strides dtype))
+                        (else (error "ri-col2im: col not concrete" col))))))
+                ))
+             )
+        (vector-set! vals i result)))
+    
     vals))
+      
 
 
 ;;; ============================================================
@@ -1747,5 +1951,42 @@
                       (if (concrete-row-major? v) v (copy-concrete-array v)))
                     spec))   ; const-ref: direct concrete-array from constants
               specs))))))
+
+
+  (define (replay-plan-stats prog)
+    "Return alist with:
+       (counts . alist-of-tag.count)
+       (ri-index-shapes . list-of-(i . shape-vector))
+       (ri-reduce-specs . list-of-(i axes keepdims? shape))"
+    (let ((plan (ssa-program-replay-plan prog)))
+      (if (not plan)
+          '()
+          (let ((counts       (make-hash-table))
+                (index-shapes '())
+                (reduce-specs '()))
+            (do ((i 0 (+ i 1))) ((= i (vector-length plan)))
+              (let* ((instr (vector-ref plan i))
+                     (tag (cases replay-instruction instr
+                            (ri-gemm             (_ _ _ _ _ _)           'ri-gemm)
+                            (ri-gemm-strided     (_ _ _ _ _ _)           'ri-gemm-strided)
+                            (ri-index            (_ shape _ _ _ _)
+                             (set! index-shapes (cons (cons i shape) index-shapes))
+                             'ri-index)
+                            (ri-reduce           (_ shape _ _ _ _ axes _ keepdims? _)
+                             (set! reduce-specs (cons (list i axes keepdims? shape) reduce-specs))
+                             'ri-reduce)
+                            (ri-view             (_ _)                   'ri-view)
+                            (ri-flat-unary       (_ _ _ _ _ _)           'ri-flat-unary)
+                            (ri-flat-binary      (_ _ _ _ _ _ _)         'ri-flat-binary)
+                            (ri-flat-bias-broadcast (_ _ _ _ _ _ _ _)   'ri-flat-bias-broadcast)
+                            (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _)  'ri-gemm-epilogue)
+                            (ri-alias            (_ _ _ _ _)             'ri-alias)
+                            (ri-im2col           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-im2col)
+                            (ri-col2im           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)     'ri-col2im))))
+                (hash-table-set! counts tag
+                                 (+ (hash-table-ref/default counts tag 0) 1))))
+            `((counts . ,(hash-table->alist counts))
+              (ri-index-shapes . ,(reverse index-shapes))
+              (ri-reduce-specs . ,(reverse reduce-specs)))))))
 
 ) ; end module array-morphisms-ssa

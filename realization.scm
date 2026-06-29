@@ -56,6 +56,12 @@
    execute-flat-bias-broadcast-compute
    execute-flat-unary-compute-inplace!
    execute-flat-bias-broadcast-inplace!
+
+   ;; Fast im2col / col2im kernels (dtype-specialized tight loops; called by SSA ri-im2col/ri-col2im)
+   execute-im2col-unbatched
+   execute-im2col-batched
+   execute-col2im-unbatched
+   execute-col2im-batched
    )
 
   (import scheme chicken.base chicken.module)
@@ -827,7 +833,60 @@
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Affine Morphism Execution (Reshape, Transpose, Slice)
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  
+
+  (define (affine-effective-strides fn src-strides src-offset)
+    "Compute (eff-offset . eff-strides-vector) for any affine index fn.
+     physical = eff-offset + sum(out[k] * eff-strides[k]) for each output dim k.
+     Lets execute-affine-morphism iterate over output shape with tight loops
+     instead of calling linear-to-multi-index + apply-affine-index-fn per element."
+    (cases affine-index-fn fn
+      (identity-fn ()
+       (cons src-offset src-strides))
+      (permutation-fn (perm)
+       ;; source-idx[j] = output[perm[j]] => eff-strides[perm[j]] = src-strides[j]
+       (let* ((src-rank (vector-length src-strides))
+              (eff      (make-vector src-rank 0)))
+         (let loop ((ps perm) (j 0))
+           (unless (null? ps)
+             (vector-set! eff (car ps) (vector-ref src-strides j))
+             (loop (cdr ps) (+ j 1))))
+         (cons src-offset eff)))
+      (diagonal-fn (diag bias)
+       ;; source-idx[j] = diag[j]*out[j] + bias[j]
+       ;; eff-strides[j] = diag[j]*src-strides[j]; eff-offset adds bias terms
+       (let* ((src-rank (vector-length src-strides))
+              (eff      (make-vector src-rank 0))
+              (eff-offset
+               (let loop ((ds diag) (bs bias) (j 0) (acc src-offset))
+                 (if (null? ds)
+                     acc
+                     (begin
+                       (vector-set! eff j (* (car ds) (vector-ref src-strides j)))
+                       (loop (cdr ds) (cdr bs) (+ j 1)
+                             (+ acc (* (car bs) (vector-ref src-strides j)))))))))
+         (cons eff-offset eff)))
+      (general-fn (matrix bias)
+       ;; matrix: src-rank rows x out-rank cols
+       ;; eff-strides[k] = sum_j matrix[j][k]*src-strides[j]
+       (let* ((src-rank  (vector-length src-strides))
+              (out-rank  (if (null? matrix) 0 (length (car matrix))))
+              (eff       (make-vector out-rank 0))
+              (eff-offset
+               (let loop ((rows matrix) (j 0) (acc src-offset))
+                 (if (null? rows)
+                     acc
+                     (let* ((row  (car rows))
+                            (sj   (vector-ref src-strides j))
+                            (acc2 (if bias
+                                      (+ acc (* (list-ref bias j) sj))
+                                      acc)))
+                       (let upd ((cols row) (k 0))
+                         (unless (null? cols)
+                           (vector-set! eff k (+ (vector-ref eff k) (* (car cols) sj)))
+                           (upd (cdr cols) (+ k 1))))
+                       (loop (cdr rows) (+ j 1) acc2))))))
+         (cons eff-offset eff)))))
+
   (define (execute-affine-morphism fn output-buffer shape operands dtype)
     "Execute affine index function: A·i + b
     
@@ -848,26 +907,200 @@
 
           (if (identity-index-fn? fn)
               ;; Reshape (identity-fn): output flat index i corresponds to
-              ;; source flat index i.  Convert i → source multi-index via
-              ;; src-shape, then compute physical address.  This is correct
-              ;; even for non-contiguous sources (e.g. slice views with
-              ;; non-zero offset) and for rank-changing reshapes (squeeze /
-              ;; unsqueeze) where the output and source ranks differ.
-              (do ((i 0 (+ i 1))) ((= i size))
-                (let* ((src-multi (vector->list (linear-to-multi-index i src-shape)))
-                       (physical  (multi-to-linear-index (list->vector src-multi)
-                                                         src-strides
-                                                         src-offset))
-                       (value (typed-vector-ref src-data src-dtype physical)))
-                  (typed-vector-set! output-buffer dtype i value)))
-              ;; Other affine transforms: apply index mapping normally.
-              (do ((i 0 (+ i 1))) ((= i size))
-                (let* ((out-idx (vector->list (linear-to-multi-index i shape)))
-                       (src-idx (apply-affine-index-fn fn out-idx))
-                       (value   (retrieve-value source src-idx)))
-                  (typed-vector-set! output-buffer dtype i value)))))
+              ;; source flat index i.  Use direct nested loops over src-shape
+              ;; dimensions to compute physical address without per-element
+              ;; vector allocation.  Handles ranks 1-4 with specialized loops;
+              ;; falls back to linear-to-multi-index for rank > 4 (rare).
+              (let ((rank (vector-length src-shape)))
+                (case rank
+                  ((1)
+                   (let* ((d0 (vector-ref src-shape 0))
+                          (s0 (vector-ref src-strides 0)))
+                     (case dtype
+                       ((f32) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (f32vector-set! output-buffer i0
+                                  (f32vector-ref src-data (+ src-offset (* i0 s0))))))
+                       ((f64) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (f64vector-set! output-buffer i0
+                                  (f64vector-ref src-data (+ src-offset (* i0 s0))))))
+                       (else (do ((i 0 (+ i 1))) ((= i size))
+                               (let* ((src-multi (vector->list (linear-to-multi-index i src-shape)))
+                                      (physical  (multi-to-linear-index (list->vector src-multi) src-strides src-offset))
+                                      (value (typed-vector-ref src-data src-dtype physical)))
+                                 (typed-vector-set! output-buffer dtype i value)))))))
+                  ((2)
+                   (let* ((d0 (vector-ref src-shape 0)) (d1 (vector-ref src-shape 1))
+                          (s0 (vector-ref src-strides 0)) (s1 (vector-ref src-strides 1)))
+                     (case dtype
+                       ((f32) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                  (f32vector-set! output-buffer (+ (* i0 d1) i1)
+                                    (f32vector-ref src-data (+ src-offset (* i0 s0) (* i1 s1)))))))
+                       ((f64) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                  (f64vector-set! output-buffer (+ (* i0 d1) i1)
+                                    (f64vector-ref src-data (+ src-offset (* i0 s0) (* i1 s1)))))))
+                       (else (do ((i 0 (+ i 1))) ((= i size))
+                               (let* ((src-multi (vector->list (linear-to-multi-index i src-shape)))
+                                      (physical  (multi-to-linear-index (list->vector src-multi) src-strides src-offset))
+                                      (value (typed-vector-ref src-data src-dtype physical)))
+                                 (typed-vector-set! output-buffer dtype i value)))))))
+                  ((3)
+                   (let* ((d0 (vector-ref src-shape 0)) (d1 (vector-ref src-shape 1)) (d2 (vector-ref src-shape 2))
+                          (s0 (vector-ref src-strides 0)) (s1 (vector-ref src-strides 1)) (s2 (vector-ref src-strides 2)))
+                     (case dtype
+                       ((f32) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                  (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                                    (f32vector-set! output-buffer (+ (* (+ (* i0 d1) i1) d2) i2)
+                                      (f32vector-ref src-data (+ src-offset (* i0 s0) (* i1 s1) (* i2 s2))))))))
+                       ((f64) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                  (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                                    (f64vector-set! output-buffer (+ (* (+ (* i0 d1) i1) d2) i2)
+                                      (f64vector-ref src-data (+ src-offset (* i0 s0) (* i1 s1) (* i2 s2))))))))
+                       (else (do ((i 0 (+ i 1))) ((= i size))
+                               (let* ((src-multi (vector->list (linear-to-multi-index i src-shape)))
+                                      (physical  (multi-to-linear-index (list->vector src-multi) src-strides src-offset))
+                                      (value (typed-vector-ref src-data src-dtype physical)))
+                                 (typed-vector-set! output-buffer dtype i value)))))))
+                  ((4)
+                   (let* ((d0 (vector-ref src-shape 0)) (d1 (vector-ref src-shape 1))
+                          (d2 (vector-ref src-shape 2)) (d3 (vector-ref src-shape 3))
+                          (s0 (vector-ref src-strides 0)) (s1 (vector-ref src-strides 1))
+                          (s2 (vector-ref src-strides 2)) (s3 (vector-ref src-strides 3)))
+                     (case dtype
+                       ((f32) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                  (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                                    (do ((i3 0 (+ i3 1))) ((= i3 d3))
+                                      (f32vector-set! output-buffer (+ (* (+ (* (+ (* i0 d1) i1) d2) i2) d3) i3)
+                                        (f32vector-ref src-data (+ src-offset (* i0 s0) (* i1 s1) (* i2 s2) (* i3 s3)))))))))
+                       ((f64) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                  (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                                    (do ((i3 0 (+ i3 1))) ((= i3 d3))
+                                      (f64vector-set! output-buffer (+ (* (+ (* (+ (* i0 d1) i1) d2) i2) d3) i3)
+                                        (f64vector-ref src-data (+ src-offset (* i0 s0) (* i1 s1) (* i2 s2) (* i3 s3)))))))))
+                       (else (do ((i 0 (+ i 1))) ((= i size))
+                               (let* ((src-multi (vector->list (linear-to-multi-index i src-shape)))
+                                      (physical  (multi-to-linear-index (list->vector src-multi) src-strides src-offset))
+                                      (value (typed-vector-ref src-data src-dtype physical)))
+                                 (typed-vector-set! output-buffer dtype i value)))))))
+                  (else
+                   ;; Fallback for rank > 4 (rare): original path
+                   (do ((i 0 (+ i 1))) ((= i size))
+                     (let* ((src-multi (vector->list (linear-to-multi-index i src-shape)))
+                            (physical  (multi-to-linear-index (list->vector src-multi)
+                                                              src-strides
+                                                              src-offset))
+                            (value (typed-vector-ref src-data src-dtype physical)))
+                       (typed-vector-set! output-buffer dtype i value))))))
+              
+              ;; Non-identity affine (transpose, slice, composed): precompute
+              ;; effective strides so nested loops need no per-element allocation.
+              (let* ((ae         (affine-effective-strides fn src-strides src-offset))
+                     (eff-offset (car ae))
+                     (eff        (cdr ae))
+                     (out-rank   (vector-length shape)))
+                (case out-rank
+                  ((1)
+                   (let ((d0 (vector-ref shape 0))
+                         (e0 (vector-ref eff 0)))
+                     (case dtype
+                       ((f32) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (f32vector-set! output-buffer i0
+                                  (f32vector-ref src-data (+ eff-offset (* i0 e0))))))
+                       ((f64) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (f64vector-set! output-buffer i0
+                                  (f64vector-ref src-data (+ eff-offset (* i0 e0))))))
+                       (else (do ((i 0 (+ i 1))) ((= i size))
+                               (let* ((out-idx (vector->list (linear-to-multi-index i shape)))
+                                      (src-idx (apply-affine-index-fn fn out-idx))
+                                      (value   (retrieve-value source src-idx)))
+                                 (typed-vector-set! output-buffer dtype i value)))))))
+                  ((2)
+                   (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1))
+                         (e0 (vector-ref eff 0))   (e1 (vector-ref eff 1)))
+                     (case dtype
+                       ((f32) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (let ((base0 (+ eff-offset (* i0 e0))))
+                                  (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                    (f32vector-set! output-buffer (+ (* i0 d1) i1)
+                                      (f32vector-ref src-data (+ base0 (* i1 e1))))))))
+                       ((f64) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (let ((base0 (+ eff-offset (* i0 e0))))
+                                  (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                    (f64vector-set! output-buffer (+ (* i0 d1) i1)
+                                      (f64vector-ref src-data (+ base0 (* i1 e1))))))))
+                       (else (do ((i 0 (+ i 1))) ((= i size))
+                               (let* ((out-idx (vector->list (linear-to-multi-index i shape)))
+                                      (src-idx (apply-affine-index-fn fn out-idx))
+                                      (value   (retrieve-value source src-idx)))
+                                 (typed-vector-set! output-buffer dtype i value)))))))
+                  ((3)
+                   (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1)) (d2 (vector-ref shape 2))
+                         (e0 (vector-ref eff 0))   (e1 (vector-ref eff 1))   (e2 (vector-ref eff 2)))
+                     (case dtype
+                       ((f32) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (let ((base0 (+ eff-offset (* i0 e0))))
+                                  (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                    (let ((base1 (+ base0 (* i1 e1))))
+                                      (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                                        (f32vector-set! output-buffer (+ (* (+ (* i0 d1) i1) d2) i2)
+                                          (f32vector-ref src-data (+ base1 (* i2 e2))))))))))
+                       ((f64) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (let ((base0 (+ eff-offset (* i0 e0))))
+                                  (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                    (let ((base1 (+ base0 (* i1 e1))))
+                                      (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                                        (f64vector-set! output-buffer (+ (* (+ (* i0 d1) i1) d2) i2)
+                                          (f64vector-ref src-data (+ base1 (* i2 e2))))))))))
+                       (else (do ((i 0 (+ i 1))) ((= i size))
+                               (let* ((out-idx (vector->list (linear-to-multi-index i shape)))
+                                      (src-idx (apply-affine-index-fn fn out-idx))
+                                      (value   (retrieve-value source src-idx)))
+                                 (typed-vector-set! output-buffer dtype i value)))))))
+                  ((4)
+                   (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1))
+                         (d2 (vector-ref shape 2)) (d3 (vector-ref shape 3))
+                         (e0 (vector-ref eff 0))   (e1 (vector-ref eff 1))
+                         (e2 (vector-ref eff 2))   (e3 (vector-ref eff 3)))
+                     (case dtype
+                       ((f32) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (let ((base0 (+ eff-offset (* i0 e0))))
+                                  (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                    (let ((base1 (+ base0 (* i1 e1))))
+                                      (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                                        (let ((base2 (+ base1 (* i2 e2))))
+                                          (do ((i3 0 (+ i3 1))) ((= i3 d3))
+                                            (f32vector-set! output-buffer
+                                              (+ (* (+ (* (+ (* i0 d1) i1) d2) i2) d3) i3)
+                                              (f32vector-ref src-data (+ base2 (* i3 e3))))))))))))
+                       ((f64) (do ((i0 0 (+ i0 1))) ((= i0 d0))
+                                (let ((base0 (+ eff-offset (* i0 e0))))
+                                  (do ((i1 0 (+ i1 1))) ((= i1 d1))
+                                    (let ((base1 (+ base0 (* i1 e1))))
+                                      (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                                        (let ((base2 (+ base1 (* i2 e2))))
+                                          (do ((i3 0 (+ i3 1))) ((= i3 d3))
+                                            (f64vector-set! output-buffer
+                                              (+ (* (+ (* (+ (* i0 d1) i1) d2) i2) d3) i3)
+                                              (f64vector-ref src-data (+ base2 (* i3 e3))))))))))))
+                       (else (do ((i 0 (+ i 1))) ((= i size))
+                               (let* ((out-idx (vector->list (linear-to-multi-index i shape)))
+                                      (src-idx (apply-affine-index-fn fn out-idx))
+                                      (value   (retrieve-value source src-idx)))
+                                 (typed-vector-set! output-buffer dtype i value)))))))
+                  (else
+                   (do ((i 0 (+ i 1))) ((= i size))
+                     (let* ((out-idx (vector->list (linear-to-multi-index i shape)))
+                            (src-idx (apply-affine-index-fn fn out-idx))
+                            (value   (retrieve-value source src-idx)))
+                       (typed-vector-set! output-buffer dtype i value))))))))
 
-        (else (error "Affine source must be concrete array")))))
+        (else (error "Affine source must be concrete array")))
+      ))
   
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Computational Morphism Execution (Arithmetic, Transcendental)
@@ -935,9 +1168,9 @@
   (define (execute-flat-unary-compute combiner data output-buffer size dtype)
     (case dtype
       ((f64) (do ((i 0 (+ i 1))) ((= i size))
-               (f64vector-set! output-buffer i (exact->inexact (combiner (f64vector-ref data i))))))
+               (f64vector-set! output-buffer i (combiner (f64vector-ref data i)))))
       ((f32) (do ((i 0 (+ i 1))) ((= i size))
-               (f32vector-set! output-buffer i (exact->inexact (combiner (f32vector-ref data i))))))
+               (f32vector-set! output-buffer i (combiner (f32vector-ref data i)))))
       ((s32) (do ((i 0 (+ i 1))) ((= i size))
                (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (s32vector-ref data i)))))))
       ((s64) (do ((i 0 (+ i 1))) ((= i size))
@@ -961,40 +1194,167 @@
       (else (error "execute-flat-binary-compute: unsupported dtype" dtype))))
 
   (define (execute-flat-bias-broadcast-compute combiner data1 data2 output-buffer size N dtype)
-    (case dtype
-      ((f64) (do ((i 0 (+ i 1))) ((= i size))
-               (f64vector-set! output-buffer i (exact->inexact (combiner (f64vector-ref data1 i)
-                                                                          (f64vector-ref data2 (modulo i N)))))))
-      ((f32) (do ((i 0 (+ i 1))) ((= i size))
-               (f32vector-set! output-buffer i (exact->inexact (combiner (f32vector-ref data1 i)
-                                                                          (f32vector-ref data2 (modulo i N)))))))
-      ((s32) (do ((i 0 (+ i 1))) ((= i size))
-               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (s32vector-ref data1 i)
-                                                                                    (s32vector-ref data2 (modulo i N))))))))
-      ((s64) (do ((i 0 (+ i 1))) ((= i size))
-               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (s64vector-ref data1 i)
-                                                                                    (s64vector-ref data2 (modulo i N))))))))
-      (else (error "execute-flat-bias-broadcast-compute: unsupported dtype" dtype))))
+    ;; Use outer (row) + inner (col) loops to avoid (modulo i N) per element.
+    (let ((M (quotient size N)))
+      (case dtype
+        ((f64) (do ((row 0 (+ row 1))) ((= row M))
+                 (let ((base (* row N)))
+                   (do ((col 0 (+ col 1))) ((= col N))
+                     (let ((i (+ base col)))
+                       (f64vector-set! output-buffer i
+                         (combiner (f64vector-ref data1 i) (f64vector-ref data2 col))))))))
+        ((f32) (do ((row 0 (+ row 1))) ((= row M))
+                 (let ((base (* row N)))
+                   (do ((col 0 (+ col 1))) ((= col N))
+                     (let ((i (+ base col)))
+                       (f32vector-set! output-buffer i
+                         (combiner (f32vector-ref data1 i) (f32vector-ref data2 col))))))))
+        ((s32) (do ((row 0 (+ row 1))) ((= row M))
+                 (let ((base (* row N)))
+                   (do ((col 0 (+ col 1))) ((= col N))
+                     (let ((i (+ base col)))
+                       (s32vector-set! output-buffer i
+                         (inexact->exact (truncate (combiner (s32vector-ref data1 i) (s32vector-ref data2 col))))))))))
+        ((s64) (do ((row 0 (+ row 1))) ((= row M))
+                 (let ((base (* row N)))
+                   (do ((col 0 (+ col 1))) ((= col N))
+                     (let ((i (+ base col)))
+                       (s64vector-set! output-buffer i
+                         (inexact->exact (truncate (combiner (s64vector-ref data1 i) (s64vector-ref data2 col))))))))))
+        (else (error "execute-flat-bias-broadcast-compute: unsupported dtype" dtype)))))
 
   (define (execute-flat-unary-compute-inplace! combiner buf size dtype)
     (case dtype
       ((f64) (do ((i 0 (+ i 1))) ((= i size))
-               (f64vector-set! buf i (exact->inexact (combiner (f64vector-ref buf i))))))
+               (f64vector-set! buf i (combiner (f64vector-ref buf i)))))
       ((f32) (do ((i 0 (+ i 1))) ((= i size))
-               (f32vector-set! buf i (exact->inexact (combiner (f32vector-ref buf i))))))
+               (f32vector-set! buf i (combiner (f32vector-ref buf i)))))
       (else (error "execute-flat-unary-compute-inplace!: unsupported dtype" dtype))))
 
   (define (execute-flat-bias-broadcast-inplace! combiner buf bias-data size N dtype)
-    (case dtype
-      ((f64) (do ((i 0 (+ i 1))) ((= i size))
-               (f64vector-set! buf i
-                 (exact->inexact (combiner (f64vector-ref buf i)
-                                           (f64vector-ref bias-data (modulo i N)))))))
-      ((f32) (do ((i 0 (+ i 1))) ((= i size))
-               (f32vector-set! buf i
-                 (exact->inexact (combiner (f32vector-ref buf i)
-                                           (f32vector-ref bias-data (modulo i N)))))))
-      (else (error "execute-flat-bias-broadcast-inplace!: unsupported dtype" dtype))))
+    ;; Use outer (row) + inner (col) loops to avoid (modulo i N) per element.
+    (let ((M (quotient size N)))
+      (case dtype
+        ((f64) (do ((row 0 (+ row 1))) ((= row M))
+                 (let ((base (* row N)))
+                   (do ((col 0 (+ col 1))) ((= col N))
+                     (let ((i (+ base col)))
+                       (f64vector-set! buf i (combiner (f64vector-ref buf i) (f64vector-ref bias-data col))))))))
+        ((f32) (do ((row 0 (+ row 1))) ((= row M))
+                 (let ((base (* row N)))
+                   (do ((col 0 (+ col 1))) ((= col N))
+                     (let ((i (+ base col)))
+                       (f32vector-set! buf i (combiner (f32vector-ref buf i) (f32vector-ref bias-data col))))))))
+        (else (error "execute-flat-bias-broadcast-inplace!: unsupported dtype" dtype)))))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Fast im2col kernels (dtype-specialized, zero per-element allocation)
+  ;;; Called by SSA ri-im2col replay instruction.
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (execute-im2col-unbatched out-buf src-data C H W KH KW SH SW PH PW OH OW dtype)
+    "Fast im2col for [C,H,W] input -> [C*KH*KW, OH*OW] output.
+    Loops over (c,kh,kw,oh,ow) directly -- no quotient/modulo in inner body."
+    (let* ((col-cols (* OH OW))
+           (H*W      (* H W)))
+      (case dtype
+        ((f32)
+         (do ((c 0 (+ c 1))) ((= c C))
+           (do ((kh 0 (+ kh 1))) ((= kh KH))
+             (do ((kw 0 (+ kw 1))) ((= kw KW))
+               (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                      (row-base (* col-row col-cols))
+                      (c-base   (* c H*W)))
+                 (do ((oh 0 (+ oh 1))
+                      (ih (- kh PH) (+ ih SH)))
+                     ((= oh OH))
+                   (let* ((ih-ok?   (and (>= ih 0) (< ih H)))
+                          (ih-W     (if ih-ok? (* ih W) 0))
+                          (out-base (+ row-base (* oh OW))))
+                     (do ((ow 0 (+ ow 1))
+                          (iw (- kw PW) (+ iw SW)))
+                         ((= ow OW))
+                       (f32vector-set! out-buf (+ out-base ow)
+                         (if (and ih-ok? (>= iw 0) (< iw W))
+                             (f32vector-ref src-data (+ c-base ih-W iw))
+                             0.0))))))))))
+        ((f64)
+         (do ((c 0 (+ c 1))) ((= c C))
+           (do ((kh 0 (+ kh 1))) ((= kh KH))
+             (do ((kw 0 (+ kw 1))) ((= kw KW))
+               (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                      (row-base (* col-row col-cols))
+                      (c-base   (* c H*W)))
+                 (do ((oh 0 (+ oh 1))
+                      (ih (- kh PH) (+ ih SH)))
+                     ((= oh OH))
+                   (let* ((ih-ok?   (and (>= ih 0) (< ih H)))
+                          (ih-W     (if ih-ok? (* ih W) 0))
+                          (out-base (+ row-base (* oh OW))))
+                     (do ((ow 0 (+ ow 1))
+                          (iw (- kw PW) (+ iw SW)))
+                         ((= ow OW))
+                       (f64vector-set! out-buf (+ out-base ow)
+                         (if (and ih-ok? (>= iw 0) (< iw W))
+                             (f64vector-ref src-data (+ c-base ih-W iw))
+                             0.0))))))))))
+        (else (error "execute-im2col-unbatched: unsupported dtype" dtype)))))
+
+  (define (execute-im2col-batched out-buf src-data N C H W KH KW SH SW PH PW OH OW dtype)
+    "Fast batched im2col for [N,C,H,W] input -> [N, C*KH*KW, OH*OW] output.
+    Loops over (n,c,kh,kw,oh,ow) directly -- no quotient/modulo in inner body."
+    (let* ((col-rows (* C KH KW))
+           (col-cols (* OH OW))
+           (C*H*W    (* C H W))
+           (H*W      (* H W)))
+      (case dtype
+        ((f32)
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-src (* n C*H*W))
+                 (n-out (* n col-rows col-cols)))
+             (do ((c 0 (+ c 1))) ((= c C))
+               (do ((kh 0 (+ kh 1))) ((= kh KH))
+                 (do ((kw 0 (+ kw 1))) ((= kw KW))
+                   (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                          (row-base (+ n-out (* col-row col-cols)))
+                          (c-base   (+ n-src (* c H*W))))
+                     (do ((oh 0 (+ oh 1))
+                          (ih (- kh PH) (+ ih SH)))
+                         ((= oh OH))
+                       (let* ((ih-ok?   (and (>= ih 0) (< ih H)))
+                              (ih-W     (if ih-ok? (* ih W) 0))
+                              (out-base (+ row-base (* oh OW))))
+                         (do ((ow 0 (+ ow 1))
+                              (iw (- kw PW) (+ iw SW)))
+                             ((= ow OW))
+                           (f32vector-set! out-buf (+ out-base ow)
+                             (if (and ih-ok? (>= iw 0) (< iw W))
+                                 (f32vector-ref src-data (+ c-base ih-W iw))
+                                 0.0))))))))))))
+        ((f64)
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-src (* n C*H*W))
+                 (n-out (* n col-rows col-cols)))
+             (do ((c 0 (+ c 1))) ((= c C))
+               (do ((kh 0 (+ kh 1))) ((= kh KH))
+                 (do ((kw 0 (+ kw 1))) ((= kw KW))
+                   (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                          (row-base (+ n-out (* col-row col-cols)))
+                          (c-base   (+ n-src (* c H*W))))
+                     (do ((oh 0 (+ oh 1))
+                          (ih (- kh PH) (+ ih SH)))
+                         ((= oh OH))
+                       (let* ((ih-ok?   (and (>= ih 0) (< ih H)))
+                              (ih-W     (if ih-ok? (* ih W) 0))
+                              (out-base (+ row-base (* oh OW))))
+                         (do ((ow 0 (+ ow 1))
+                              (iw (- kw PW) (+ iw SW)))
+                             ((= ow OW))
+                           (f64vector-set! out-buf (+ out-base ow)
+                             (if (and ih-ok? (>= iw 0) (< iw W))
+                                 (f64vector-ref src-data (+ c-base ih-W iw))
+                                 0.0))))))))))))
+        (else (error "execute-im2col-batched: unsupported dtype" dtype)))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Window Morphism Execution (im2col, Padding)
@@ -1120,152 +1480,147 @@
              
              (else (error "col2im operand must be concrete array")))))
 
-(define (execute-col2im-unbatched output-buffer output-shape 
+(define (execute-col2im-unbatched output-buffer output-shape
                                   col-data col-shape
                                   KH KW SH SW PH PW dtype)
-  "Execute col2im for non-batched input
-  
-  Input col: (C*KH*KW, OH*OW)
-  Output: (C, H, W)"
-  
-  (let* ((C (vector-ref output-shape 0))
-         (H (vector-ref output-shape 1))
-         (W (vector-ref output-shape 2))
-         
-         (col-rows (vector-ref col-shape 0))  ; C*KH*KW
-         (col-cols (vector-ref col-shape 1))  ; OH*OW
-         
-         ;; Derive OH, OW from H, W, kernel, stride, padding
-         (OH (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
-         (OW (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
-         
+  "Fast col2im for non-batched input (dtype-specialized, zero per-element allocation).
+  Input col: (C*KH*KW, OH*OW)  Output: (C, H, W)
+  Loops over (c,kh,kw,oh,ow) directly -- no quotient/modulo in inner body."
+  (let* ((C         (vector-ref output-shape 0))
+         (H         (vector-ref output-shape 1))
+         (W         (vector-ref output-shape 2))
+         (OH        (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
+         (OW        (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
+         (col-cols  (* OH OW))
+         (H*W       (* H W))
          (output-size (shape-size output-shape)))
+    (case dtype
+      ((f32)
+       (do ((i 0 (+ i 1))) ((= i output-size)) (f32vector-set! output-buffer i 0.0))
+       (do ((c 0 (+ c 1))) ((= c C))
+         (do ((kh 0 (+ kh 1))) ((= kh KH))
+           (do ((kw 0 (+ kw 1))) ((= kw KW))
+             (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                    (cr-off   (* col-row col-cols))
+                    (c-base   (* c H*W)))
+               (do ((oh 0 (+ oh 1))
+                    (ih (- kh PH) (+ ih SH)))
+                   ((= oh OH))
+                 (when (and (>= ih 0) (< ih H))
+                   (let* ((ih-W     (* ih W))
+                          (col-base (+ cr-off (* oh OW))))
+                     (do ((ow 0 (+ ow 1))
+                          (iw (- kw PW) (+ iw SW)))
+                         ((= ow OW))
+                       (when (and (>= iw 0) (< iw W))
+                         (let ((out-i (+ c-base ih-W iw))
+                               (col-i (+ col-base ow)))
+                           (f32vector-set! output-buffer out-i
+                             (+ (f32vector-ref output-buffer out-i)
+                                (f32vector-ref col-data col-i))))))))))))))
+      ((f64)
+       (do ((i 0 (+ i 1))) ((= i output-size)) (f64vector-set! output-buffer i 0.0))
+       (do ((c 0 (+ c 1))) ((= c C))
+         (do ((kh 0 (+ kh 1))) ((= kh KH))
+           (do ((kw 0 (+ kw 1))) ((= kw KW))
+             (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                    (cr-off   (* col-row col-cols))
+                    (c-base   (* c H*W)))
+               (do ((oh 0 (+ oh 1))
+                    (ih (- kh PH) (+ ih SH)))
+                   ((= oh OH))
+                 (when (and (>= ih 0) (< ih H))
+                   (let* ((ih-W     (* ih W))
+                          (col-base (+ cr-off (* oh OW))))
+                     (do ((ow 0 (+ ow 1))
+                          (iw (- kw PW) (+ iw SW)))
+                         ((= ow OW))
+                       (when (and (>= iw 0) (< iw W))
+                         (let ((out-i (+ c-base ih-W iw))
+                               (col-i (+ col-base ow)))
+                           (f64vector-set! output-buffer out-i
+                             (+ (f64vector-ref output-buffer out-i)
+                                (f64vector-ref col-data col-i))))))))))))))
+      (else (error "execute-col2im-unbatched: unsupported dtype" dtype)))))
     
-    ;; Validate col shape
-    (unless (= col-rows (* C KH KW))
-      (error "col2im: col-rows mismatch" col-rows (* C KH KW)))
-    (unless (= col-cols (* OH OW))
-      (error "col2im: col-cols mismatch" col-cols (* OH OW)))
-    
-    ;; Step 1: Initialize output to zeros
-    (do ((i 0 (+ i 1)))
-        ((= i output-size))
-      (typed-vector-set! output-buffer dtype i 0.0))
-    
-    ;; Step 2: Accumulate from col
-    (do ((col-row 0 (+ col-row 1)))
-        ((= col-row col-rows))
-      
-      ;; Decompose col-row into (c, kh, kw)
-      (let* ((c (quotient col-row (* KH KW)))
-             (kh (modulo (quotient col-row KW) KH))
-             (kw (modulo col-row KW)))
-        
-        (do ((col-col 0 (+ col-col 1)))
-            ((= col-col col-cols))
-          
-          ;; Decompose col-col into (oh, ow)
-          (let* ((oh (quotient col-col OW))
-                 (ow (modulo col-col OW))
-                 
-                 ;; Compute input position: (c, h, w)
-                 (h (+ (* oh SH) kh (- PH)))
-                 (w (+ (* ow SW) kw (- PW))))
-            
-            ;; Bounds check: only accumulate if in valid range
-            (when (and (>= h 0) (< h H)
-                       (>= w 0) (< w W))
-              
-              ;; Get col value
-              (let* ((col-linear (+ (* col-row col-cols) col-col))
-                     (col-val (typed-vector-ref col-data dtype col-linear))
-                     
-                     ;; Compute output linear index
-                     (out-idx (list c h w))
-                     (out-linear (multi-to-linear-index
-                                  (list->vector out-idx)
-                                  (compute-strides output-shape)))
-                     
-                     ;; Get current value and accumulate
-                     (current-val (typed-vector-ref output-buffer dtype out-linear))
-                     (new-val (+ current-val col-val)))
-                
-                ;; Store accumulated value
-                (typed-vector-set! output-buffer dtype out-linear new-val)))))))))
 
   (define (execute-col2im-batched output-buffer output-shape
                                   col-data col-shape
                                   KH KW SH SW PH PW dtype)
-    "Execute col2im for batched input
-  
-     Input col: (N, C*KH*KW, OH*OW)
-     Output: (N, C, H, W)"
-  
-    (let* ((N (vector-ref output-shape 0))
-           (C (vector-ref output-shape 1))
-           (H (vector-ref output-shape 2))
-           (W (vector-ref output-shape 3))
-           
-           (col-batches (vector-ref col-shape 0))
-           (col-rows (vector-ref col-shape 1))
-           (col-cols (vector-ref col-shape 2))
-           
-           (OH (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
-           (OW (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
-           
+    "Fast col2im for batched input (dtype-specialized, zero per-element allocation).
+    Input col: (N, C*KH*KW, OH*OW)  Output: (N, C, H, W)
+    Loops over (n,c,kh,kw,oh,ow) directly -- no quotient/modulo in inner body."
+    (let* ((N         (vector-ref output-shape 0))
+           (C         (vector-ref output-shape 1))
+           (H         (vector-ref output-shape 2))
+           (W         (vector-ref output-shape 3))
+           (OH        (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
+           (OW        (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
+           (col-rows  (* C KH KW))
+           (col-cols  (* OH OW))
+           (H*W       (* H W))
+           (C*H*W     (* C H W))
            (output-size (shape-size output-shape)))
+      (case dtype
+        ((f32)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i output-size)) (f32vector-set! output-buffer i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-out (* n C*H*W))
+                   (n-col (* n col-rows col-cols)))
+               (do ((c 0 (+ c 1))) ((= c C))
+                 (do ((kh 0 (+ kh 1))) ((= kh KH))
+                   (do ((kw 0 (+ kw 1))) ((= kw KW))
+                     (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                            (cr-off   (+ n-col (* col-row col-cols)))
+                            (c-base   (+ n-out (* c H*W))))
+                       (do ((oh 0 (+ oh 1))
+                            (ih (- kh PH) (+ ih SH)))
+                           ((= oh OH))
+                         (when (and (>= ih 0) (< ih H))
+                           (let* ((ih-W     (* ih W))
+                                (col-base (+ cr-off (* oh OW))))
+                             (do ((ow 0 (+ ow 1))
+                                  (iw (- kw PW) (+ iw SW)))
+                                 ((= ow OW))
+                               (when (and (>= iw 0) (< iw W))
+                                 (let ((out-i (+ c-base ih-W iw))
+                                       (col-i (+ col-base ow)))
+                                   (f32vector-set! output-buffer out-i
+                                                   (+ (f32vector-ref output-buffer out-i)
+                                                      (f32vector-ref col-data col-i))))))))))))))
+             )))
+        ((f64)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i output-size)) (f64vector-set! output-buffer i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-out (* n C*H*W))
+                   (n-col (* n col-rows col-cols)))
+               (do ((c 0 (+ c 1))) ((= c C))
+                 (do ((kh 0 (+ kh 1))) ((= kh KH))
+                   (do ((kw 0 (+ kw 1))) ((= kw KW))
+                     (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                            (cr-off   (+ n-col (* col-row col-cols)))
+                            (c-base   (+ n-out (* c H*W))))
+                       (do ((oh 0 (+ oh 1))
+                            (ih (- kh PH) (+ ih SH)))
+                           ((= oh OH))
+                         (when (and (>= ih 0) (< ih H))
+                           (let* ((ih-W     (* ih W))
+                                  (col-base (+ cr-off (* oh OW))))
+                             (do ((ow 0 (+ ow 1))
+                                  (iw (- kw PW) (+ iw SW)))
+                                 ((= ow OW))
+                               (when (and (>= iw 0) (< iw W))
+                                 (let ((out-i (+ c-base ih-W iw))
+                                       (col-i (+ col-base ow)))
+                                   (f64vector-set! output-buffer out-i
+                                                   (+ (f64vector-ref output-buffer out-i)
+                                                      (f64vector-ref col-data col-i))))))))))))))
+             ))
+         )
+        (else (error "execute-col2im-batched: unsupported dtype" dtype)))))
       
-      ;; Validate shapes
-      (unless (= col-batches N)
-        (error "col2im: batch size mismatch" col-batches N))
-      (unless (= col-rows (* C KH KW))
-        (error "col2im: col-rows mismatch" col-rows (* C KH KW)))
-      (unless (= col-cols (* OH OW))
-        (error "col2im: col-cols mismatch" col-cols (* OH OW)))
-      
-      ;; Initialize output to zeros
-      (do ((i 0 (+ i 1)))
-          ((= i output-size))
-        (typed-vector-set! output-buffer dtype i 0.0))
-      
-      ;; Process each batch
-      (do ((n 0 (+ n 1)))
-          ((= n N))
-        
-        (do ((col-row 0 (+ col-row 1)))
-            ((= col-row col-rows))
-          
-          (let* ((c (quotient col-row (* KH KW)))
-                 (kh (modulo (quotient col-row KW) KH))
-                 (kw (modulo col-row KW)))
-            
-            (do ((col-col 0 (+ col-col 1)))
-                ((= col-col col-cols))
-              
-              (let* ((oh (quotient col-col OW))
-                     (ow (modulo col-col OW))
-                     (h (+ (* oh SH) kh (- PH)))
-                     (w (+ (* ow SW) kw (- PW))))
-                
-                (when (and (>= h 0) (< h H)
-                           (>= w 0) (< w W))
-                  
-                  ;; Col linear index: n * (col-rows * col-cols) + col-row * col-cols + col-col
-                  (let* ((col-linear (+ (* n col-rows col-cols)
-                                        (* col-row col-cols)
-                                        col-col))
-                         (col-val (typed-vector-ref col-data dtype col-linear))
-                         
-                         ;; Output index: (n, c, h, w)
-                         (out-idx (list n c h w))
-                         (out-linear (multi-to-linear-index
-                                      (list->vector out-idx)
-                                      (compute-strides output-shape)))
-                         
-                         (current-val (typed-vector-ref output-buffer dtype out-linear))
-                         (new-val (+ current-val col-val)))
-                    
-                    (typed-vector-set! output-buffer dtype out-linear new-val))))))))))
   
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Reduction Morphism Execution
@@ -1330,65 +1685,206 @@
     (let* ((out-size (shape-size out-shape))
            (src-size (shape-size src-shape))
            (src-rank (vector-length src-shape)))
-      
-      ;; Initialise output to the neutral element for the reduction.
-      (let ((init-val (case op
-                        ((sum mean) 0.0)
-                        ((prod)     1.0)
-                        ((max)      -inf.0)
-                        ((min)      +inf.0)
-                        (else       0.0))))
-        (do ((i 0 (+ i 1)))
-            ((= i out-size))
-          (typed-vector-set! output-buffer out-dtype i init-val)))
-      
-      ;; Accumulate: iterate over every logical source position.
-      (do ((src-i 0 (+ src-i 1)))
-          ((= src-i src-size))
-        
-        (let* (;; Logical multi-index from the source's shape.
-               (src-multi (vector->list (linear-to-multi-index src-i src-shape)))
-               
-               ;; Physical index into the backing buffer, honouring strides/offset.
-               (physical  (multi-to-linear-index (list->vector src-multi)
-                                                 src-strides
-                                                 src-offset))
-               
-               ;; Map logical source index to output index.
-               (out-idx
-                (if keepdims?
-                    (map (lambda (i val)
-                           (if (member i reduce-axes) 0 val))
-                         (iota src-rank) src-multi)
-                    (fold-right
-                     (lambda (i val acc)
-                       (if (member i reduce-axes) acc (cons val acc)))
-                     '()
-                     (iota src-rank) src-multi)))
-               
-               (out-linear (multi-to-linear-index
-                            (list->vector out-idx)
-                            (compute-strides out-shape)))
-               
-               (src-val    (typed-vector-ref src-data    src-dtype physical))
-               (out-val    (typed-vector-ref output-buffer out-dtype out-linear))
-               (new-val    (reducer out-val src-val)))
-          
-          (typed-vector-set! output-buffer out-dtype out-linear new-val)))
-      
-      ;; Post-processing: divide accumulated sum by element count for mean.
-      (when (eq? op 'mean)
-        (let ((reduce-size
-               (fold * 1 (map (lambda (ax) (vector-ref src-shape ax))
-                              reduce-axes))))
-          (do ((i 0 (+ i 1)))
-              ((= i out-size))
-            (let ((val (typed-vector-ref output-buffer out-dtype i)))
-              (typed-vector-set! output-buffer out-dtype i
-                                 (/ val reduce-size))))))))
 
-  
-  
+      ;; Fast path: 2D row-major source with a single axis reduced.
+      ;; Avoids per-element linear-to-multi-index and multi-to-linear-index calls.
+      (define (row-major-2d?)
+        (and (= src-rank 2)
+             (= src-offset 0)
+             (= (vector-ref src-strides 1) 1)
+             (= (vector-ref src-strides 0) (vector-ref src-shape 1))))
+
+      (define (fast-reduce-2d-axis0!)
+        ;; Reduce [M, N] over axis 0 -> [N]; op must be sum/mean/max/min.
+        (let* ((M (vector-ref src-shape 0))
+               (N (vector-ref src-shape 1))
+               (init (case op ((sum mean) 0.0) ((max) -inf.0) ((min) +inf.0) (else 0.0))))
+          (case src-dtype
+            ((f32)
+             (begin
+               (do ((n 0 (+ n 1))) ((= n N)) (f32vector-set! output-buffer n init))
+               (case op
+                 ((sum mean)
+                  (do ((m 0 (+ m 1))) ((= m M))
+                    (let ((base (* m N)))
+                      (do ((n 0 (+ n 1))) ((= n N))
+                        (f32vector-set! output-buffer n
+                                        (+ (f32vector-ref output-buffer n)
+                                           (f32vector-ref src-data (+ base n))))))))
+                 ((max)
+                  (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m N)))
+                    (do ((n 0 (+ n 1))) ((= n N))
+                      (let ((v (f32vector-ref src-data (+ base n))))
+                        (when (> v (f32vector-ref output-buffer n))
+                          (f32vector-set! output-buffer n v)))))))
+                 ((min)
+                  (do ((m 0 (+ m 1))) ((= m M))
+                    (let ((base (* m N)))
+                      (do ((n 0 (+ n 1))) ((= n N))
+                        (let ((v (f32vector-ref src-data (+ base n))))
+                          (when (< v (f32vector-ref output-buffer n))
+                            (f32vector-set! output-buffer n v))))))))
+               (when (eq? op 'mean)
+                 (do ((n 0 (+ n 1))) ((= n N))
+                   (f32vector-set! output-buffer n (/ (f32vector-ref output-buffer n) M))))
+             ))
+            ((f64)
+             (begin
+               (do ((n 0 (+ n 1))) ((= n N)) (f64vector-set! output-buffer n init))
+               (case op
+                 ((sum mean)
+                  (do ((m 0 (+ m 1))) ((= m M))
+                    (let ((base (* m N)))
+                      (do ((n 0 (+ n 1))) ((= n N))
+                        (f64vector-set! output-buffer n
+                                        (+ (f64vector-ref output-buffer n)
+                                           (f64vector-ref src-data (+ base n))))))))
+                 ((max)
+                  (do ((m 0 (+ m 1))) ((= m M))
+                    (let ((base (* m N)))
+                      (do ((n 0 (+ n 1))) ((= n N))
+                        (let ((v (f64vector-ref src-data (+ base n))))
+                          (when (> v (f64vector-ref output-buffer n))
+                            (f64vector-set! output-buffer n v)))))))
+                 ((min)
+                  (do ((m 0 (+ m 1))) ((= m M))
+                    (let ((base (* m N)))
+                      (do ((n 0 (+ n 1))) ((= n N))
+                        (let ((v (f64vector-ref src-data (+ base n))))
+                          (when (< v (f64vector-ref output-buffer n))
+                            (f64vector-set! output-buffer n v))))))))
+               (when (eq? op 'mean)
+                 (do ((n 0 (+ n 1))) ((= n N))
+                   (f64vector-set! output-buffer n (/ (f64vector-ref output-buffer n) M))))
+               ))
+            ))
+        )
+      
+      (define (fast-reduce-2d-axis1!)
+        ;; Reduce [M, N] over axis 1 -> scalar per row; op sum/mean/max/min.
+        ;; Output: [M] if keepdims?=#f, [M,1] if keepdims?=#t (same flat layout).
+        (let* ((M (vector-ref src-shape 0))
+               (N (vector-ref src-shape 1)))
+          (case src-dtype
+            ((f32)
+             (case op
+               ((sum mean)
+                (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m N))
+                        (acc 0.0))
+                    (do ((n 0 (+ n 1))) ((= n N))
+                      (set! acc (+ acc (f32vector-ref src-data (+ base n)))))
+                    (f32vector-set! output-buffer m
+                      (if (eq? op 'mean) (/ acc N) acc)))))
+               ((max)
+                (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m N))
+                        (acc -inf.0))
+                    (do ((n 0 (+ n 1))) ((= n N))
+                      (let ((v (f32vector-ref src-data (+ base n))))
+                        (when (> v acc) (set! acc v))))
+                    (f32vector-set! output-buffer m acc))))
+               ((min)
+                (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m N))
+                        (acc +inf.0))
+                    (do ((n 0 (+ n 1))) ((= n N))
+                      (let ((v (f32vector-ref src-data (+ base n))))
+                        (when (< v acc) (set! acc v))))
+                    (f32vector-set! output-buffer m acc))))))
+            ((f64)
+             (case op
+               ((sum mean)
+                (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m N))
+                        (acc 0.0))
+                    (do ((n 0 (+ n 1))) ((= n N))
+                      (set! acc (+ acc (f64vector-ref src-data (+ base n)))))
+                    (f64vector-set! output-buffer m
+                      (if (eq? op 'mean) (/ acc N) acc)))))
+               ((max)
+                (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m N))
+                        (acc -inf.0))
+                    (do ((n 0 (+ n 1))) ((= n N))
+                      (let ((v (f64vector-ref src-data (+ base n))))
+                        (when (> v acc) (set! acc v))))
+                    (f64vector-set! output-buffer m acc))))
+               ((min)
+                (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m N))
+                        (acc +inf.0))
+                    (do ((n 0 (+ n 1))) ((= n N))
+                      (let ((v (f64vector-ref src-data (+ base n))))
+                        (when (< v acc) (set! acc v))))
+                    (f64vector-set! output-buffer m acc))))
+               ))
+            ))
+        )
+
+      (cond
+        ;; Fast path: 2D row-major, reduce axis 0
+        ((and (row-major-2d?)
+              (equal? reduce-axes '(0))
+              (memq op '(sum mean max min)))
+         (fast-reduce-2d-axis0!))
+
+        ;; Fast path: 2D row-major, reduce axis 1
+        ((and (row-major-2d?)
+              (equal? reduce-axes '(1))
+              (memq op '(sum mean max min)))
+         (fast-reduce-2d-axis1!))
+
+        (else
+         ;; General path: initialise output then accumulate over all source positions.
+         (let ((init-val (case op
+                           ((sum mean) 0.0)
+                           ((prod)     1.0)
+                           ((max)      -inf.0)
+                           ((min)      +inf.0)
+                           (else       0.0))))
+           (do ((i 0 (+ i 1)))
+               ((= i out-size))
+             (typed-vector-set! output-buffer out-dtype i init-val)))
+         ;; Accumulate: iterate over every logical source position.
+         (do ((src-i 0 (+ src-i 1)))
+             ((= src-i src-size))
+           (let* ((src-multi (vector->list (linear-to-multi-index src-i src-shape)))
+                  (physical  (multi-to-linear-index (list->vector src-multi)
+                                                    src-strides
+                                                    src-offset))
+                  (out-idx
+                   (if keepdims?
+                       (map (lambda (i val)
+                              (if (member i reduce-axes) 0 val))
+                            (iota src-rank) src-multi)
+                       (fold-right
+                        (lambda (i val acc)
+                          (if (member i reduce-axes) acc (cons val acc)))
+                        '()
+                        (iota src-rank) src-multi)))
+                  (out-linear (multi-to-linear-index
+                               (list->vector out-idx)
+                               (compute-strides out-shape)))
+                  (src-val    (typed-vector-ref src-data    src-dtype physical))
+                  (out-val    (typed-vector-ref output-buffer out-dtype out-linear))
+                  (new-val    (reducer out-val src-val)))
+             (typed-vector-set! output-buffer out-dtype out-linear new-val)))
+         ;; Post-processing: divide accumulated sum by element count for mean.
+         (when (eq? op 'mean)
+           (let ((reduce-size
+                  (fold * 1 (map (lambda (ax) (vector-ref src-shape ax))
+                                 reduce-axes))))
+             (do ((i 0 (+ i 1)))
+                 ((= i out-size))
+               (let ((val (typed-vector-ref output-buffer out-dtype i)))
+                 (typed-vector-set! output-buffer out-dtype i
+                                    (/ val reduce-size))))))
+         ))
+      ))
+
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Composed Index Function Execution
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
