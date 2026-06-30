@@ -95,7 +95,7 @@
    col2im-index-fn-stride-w
    col2im-index-fn-pad-h
    col2im-index-fn-pad-w
-   col2im-index-fn-batched?
+   col2im-index-fn-col-layout
 
    ;; Routing index functions (multi-source: stack, concat)
    stack-index-fn
@@ -351,7 +351,7 @@
   keepdims?)    ; Keep batch dimension?
 
 (define-record-type col2im-index-fn
-  (make-col2im-index-fn-record kernel-h kernel-w stride-h stride-w pad-h pad-w batched?)
+  (make-col2im-index-fn-record kernel-h kernel-w stride-h stride-w pad-h pad-w col-layout)
   col2im-index-fn?
   (kernel-h col2im-index-fn-kernel-h)
   (kernel-w col2im-index-fn-kernel-w)
@@ -359,7 +359,7 @@
   (stride-w col2im-index-fn-stride-w)
   (pad-h col2im-index-fn-pad-h)
   (pad-w col2im-index-fn-pad-w)
-  (batched? col2im-index-fn-batched?))
+  (col-layout col2im-index-fn-col-layout))
 
 ;; Stack: inserts a new axis at position `axis`.
 ;; apply-stack-index-fn returns (source-id . source-idx).

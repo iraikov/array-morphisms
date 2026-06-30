@@ -418,9 +418,7 @@
       value: Constant value for constant mode
     
     Returns:
-      Morphism with padding applied
-    
-    Note: This creates a morphism-expr, actual implementation deferred to Phase 5"
+      Morphism with padding applied"
     
     (let* ((shape (get-morphism-shape m))
            (rank (vector-length shape))
@@ -510,155 +508,166 @@
   ;;; im2col and col2im Morphisms
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   
-  (define (im2col-morph input kernel-size #!optional (stride 1) (padding 0))
-    "Image-to-column morphism for convolution
-    
-    Transforms image into column matrix where each column is a flattened
-    receptive field (kernel window).
-    
+  (define (im2col-morph input kernel-size #!optional (stride 1) (padding 0) #!key (layout 'nchw))
+    "Image-to-column morphism for convolution.
+
     Args:
-      input: Input morphism with shape (C,H,W) or (N,C,H,W)
+      input: Input morphism with shape (C,H,W), (N,C,H,W) [NCHW], or (N,H,W,C) [NHWC]
       kernel-size: (KH, KW) tuple
       stride: Stride value(s) - integer or (SH, SW) tuple
       padding: Padding value(s) - integer or (PH, PW) tuple
-    
+      layout: 'nchw (default) or 'nhwc
+
     Returns:
-      Morphism with shape (C*KH*KW, OH*OW) or (N, C*KH*KW, OH*OW)
-      where OH, OW are output spatial dimensions
-    
-    Zero-padded positions return special 'pad-zero marker."
-    
+      Unbatched: [fan_in, OH_OW]
+      Batched:   [N*OH_OW, fan_in]  (matmul-ready layout)"
+
     (let* ((shape (get-morphism-shape input))
            (rank (vector-length shape))
            (batched? (= rank 4))
-           
-           ;; Parse input shape
+           (nhwc?    (eq? layout 'nhwc))
+
+           ;; Parse input shape depending on layout
            (N (if batched? (vector-ref shape 0) 1))
-           (C (vector-ref shape (if batched? 1 0)))
-           (H (vector-ref shape (if batched? 2 1)))
-           (W (vector-ref shape (if batched? 3 2)))
-           
+           (C (cond (nhwc?             (vector-ref shape 3))
+                    (batched?          (vector-ref shape 1))
+                    (else              (vector-ref shape 0))))
+           (H (cond (nhwc?             (vector-ref shape 1))
+                    (batched?          (vector-ref shape 2))
+                    (else              (vector-ref shape 1))))
+           (W (cond (nhwc?             (vector-ref shape 2))
+                    (batched?          (vector-ref shape 3))
+                    (else              (vector-ref shape 2))))
+
            ;; Parse kernel size
            (KH (if (pair? kernel-size) (car kernel-size) kernel-size))
-           (KW (if (pair? kernel-size) 
+           (KW (if (pair? kernel-size)
                    (if (null? (cdr kernel-size)) (car kernel-size) (cadr kernel-size))
                    kernel-size))
-           
+
            ;; Parse stride
            (SH (if (pair? stride) (car stride) stride))
            (SW (if (pair? stride)
                    (if (null? (cdr stride)) (car stride) (cadr stride))
                    stride))
-           
+
            ;; Parse padding
            (PH (if (pair? padding) (car padding) padding))
            (PW (if (pair? padding)
                    (if (null? (cdr padding)) (car padding) (cadr padding))
                    padding))
-           
+
            ;; Compute output spatial dimensions
            (OH (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
            (OW (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
-           
-           ;; Output shape
+
+           ;; Output shape: batched -> [N*OH_OW, fan_in] (matmul-ready); unbatched -> [fan_in, OH_OW]
            (output-shape (if batched?
-                            (vector N (* C KH KW) (* OH OW))
-                            (vector (* C KH KW) (* OH OW)))))
-      
+                            (vector (* N OH OW) (* C KH KW))
+                            (vector (* C KH KW) (* OH OW))))
+
+           (meta `((kernel-size . (,KH ,KW))
+                   (stride . (,SH ,SW))
+                   (padding . (,PH ,PW))
+                   (spatial-output . (,OH ,OW))
+                   ,@(if nhwc? '((layout . nhwc)) '()))))
+
       (morphism-expr
        (gensym 'morph-)
        'im2col
        (list input)
-       (make-im2col-index-fn C H W KH KW SH SW PH PW OH OW batched?)
+       (make-im2col-index-fn C H W KH KW SH SW PH PW OH OW batched? nhwc?)
        output-shape
        (get-morphism-dtype input)
-       `((kernel-size . (,KH ,KW))
-         (stride . (,SH ,SW))
-         (padding . (,PH ,PW))
-         (spatial-output . (,OH ,OW)))
+       meta
        (if batched? 0 -1))))
   
-  (define (make-im2col-index-fn C H W KH KW SH SW PH PW OH OW batched?)
-    "Create im2col index function
-    
-    Maps column indices to image indices with padding handling"
-    
+  (define (make-im2col-index-fn C H W KH KW SH SW PH PW OH OW batched? nhwc?)
+    "Create im2col index function.
+    Maps output (flat_row, col_idx) to source multi-index or 'pad-zero."
     (if batched?
-        ;; Batched: (n, col_row, col_col) -> (n, c, h, w) or 'pad-zero
-        (lambda (indices)
-          (let* ((n (car indices))
-                 (col-row (cadr indices))
-                 (col-col (caddr indices))
-                 
-                 ;; Decompose column indices
-                 (c (quotient col-row (* KH KW)))
-                 (kh (modulo (quotient col-row KW) KH))
-                 (kw (modulo col-row KW))
-                 (oh (quotient col-col OW))
-                 (ow (modulo col-col OW))
-                 
-                 ;; Map to input coordinates
-                 (in-h (+ (* oh SH) kh (- PH)))
-                 (in-w (+ (* ow SW) kw (- PW))))
-            
-            ;; Bounds check (padding)
-            (if (and (>= in-h 0) (< in-h H)
-                     (>= in-w 0) (< in-w W))
-                (list n c in-h in-w)
-                'pad-zero)))
-        
-        ;; Non-batched: (col_row, col_col) -> (c, h, w) or 'pad-zero
+        ;; Batched matmul-ready: (flat_row, col_idx) -> source multi-index or 'pad-zero
+        ;; flat_row = n*OH_OW + oh*OW + ow;  col_idx = c*KH*KW + kh*KW + kw
+        (let ((OH_OW (* OH OW)))
+          (lambda (indices)
+            (let* ((flat-row (car indices))
+                   (col-idx  (cadr indices))
+
+                   ;; Decode spatial position from flat row
+                   (n   (quotient flat-row OH_OW))
+                   (ohw (modulo   flat-row OH_OW))
+                   (oh  (quotient ohw OW))
+                   (ow  (modulo   ohw OW))
+
+                   ;; Decode kernel position from column index
+                   (c   (quotient col-idx (* KH KW)))
+                   (khw (modulo   col-idx (* KH KW)))
+                   (kh  (quotient khw KW))
+                   (kw  (modulo   khw KW))
+
+                   ;; Map to input coordinates
+                   (in-h (+ (* oh SH) kh (- PH)))
+                   (in-w (+ (* ow SW) kw (- PW))))
+
+              (if (and (>= in-h 0) (< in-h H)
+                       (>= in-w 0) (< in-w W))
+                  ;; NHWC source: (n, h, w, c);  NCHW source: (n, c, h, w)
+                  (if nhwc?
+                      (list n in-h in-w c)
+                      (list n c in-h in-w))
+                  'pad-zero))))
+
+        ;; Non-batched: (col_row, col_col) -> (c, h, w) or 'pad-zero (NCHW only)
         (lambda (indices)
           (let* ((col-row (car indices))
                  (col-col (cadr indices))
-                 
+
                  (c (quotient col-row (* KH KW)))
                  (kh (modulo (quotient col-row KW) KH))
                  (kw (modulo col-row KW))
                  (oh (quotient col-col OW))
                  (ow (modulo col-col OW))
-                 
+
                  (in-h (+ (* oh SH) kh (- PH)))
                  (in-w (+ (* ow SW) kw (- PW))))
-            
+
             (if (and (>= in-h 0) (< in-h H)
                      (>= in-w 0) (< in-w W))
                 (list c in-h in-w)
                 'pad-zero)))))
   
-  (define (col2im-morph col output-shape kernel-size #!optional (stride 1) (padding 0))
+  (define (col2im-morph col output-shape kernel-size #!optional (stride 1) (padding 0) #!key (layout 'nchw))
     "Column-to-image morphism (adjoint of im2col)
-    
+
     Inverse operation of im2col - scatter columns back to image.
     For overlapping windows, values are accumulated (summed).
-    
+
     Args:
-      col: Column morphism with shape (C*KH*KW, OH*OW) or (N, C*KH*KW, OH*OW)
-      output-shape: Target image shape (C,H,W) or (N,C,H,W)
+      col: Column morphism with shape (C*KH*KW, OH*OW) [unbatched] or (N*OH*OW, C*KH*KW) [batched MR]
+      output-shape: Target image shape (C,H,W) or (N,C,H,W) [NCHW] or (N,H,W,C) [NHWC]
       kernel-size: (KH, KW) tuple
       stride: Stride value(s)
       padding: Padding value(s)
-    
+      layout: 'nchw (default) or 'nhwc
+
     Returns:
-      Morphism with specified output shape
-    
-    Note: Actual accumulation deferred to Phase 5 realization"
+      Morphism with specified output shape"
     
     (let* ((col-shape (get-morphism-shape col))
            (col-rank (vector-length col-shape))
-           (col-batched? (= col-rank 3))
+           (nhwc? (eq? layout 'nhwc))
 
-           (target-shape (if (vector? output-shape) output-shape 
+           (target-shape (if (vector? output-shape) output-shape
                             (list->vector output-shape)))
            (target-rank (vector-length target-shape))
+           ;; Batched when target is rank-4; col is rank-2 for both batched and unbatched
            (target-batched? (= target-rank 4))
-           
-           (valid-dims? (or (and (= col-rank 2) (= target-rank 3))
-                            (and (= col-rank 3) (= target-rank 4))))
+
+           (valid-dims? (or (= target-rank 3) (= target-rank 4)))
            (_ (unless valid-dims?
-                (error "Batch mismatch between col and output shape"
-                       col-shape target-shape)))
-           
+                (error "col2im: target shape must be rank-3 or rank-4"
+                       target-shape)))
+
            ;; Parse parameters
            (KH (if (pair? kernel-size) (car kernel-size) kernel-size))
            (KW (if (pair? kernel-size)
@@ -671,56 +680,65 @@
            (PH (if (pair? padding) (car padding) padding))
            (PW (if (pair? padding)
                    (if (null? (cdr padding)) (car padding) (cadr padding))
-                   padding)))
-      
+                   padding))
+           ;; Validate col shape matches target+kernel dimensions
+           (N  (if target-batched? (vector-ref target-shape 0) 1))
+           ;; NHWC rank-4: #(N H W C); NCHW rank-4: #(N C H W); rank-3: #(C H W)
+           (C  (cond (nhwc?            (vector-ref target-shape (- target-rank 1)))
+                     (target-batched? (vector-ref target-shape 1))
+                     (else            (vector-ref target-shape 0))))
+           (H  (if target-batched?
+                   (vector-ref target-shape (if nhwc? 1 2))
+                   (vector-ref target-shape 1)))
+           (W  (if target-batched?
+                   (vector-ref target-shape (if nhwc? 2 3))
+                   (vector-ref target-shape 2)))
+           (OH (+ (quotient (+ H (* 2 PH) (- KH)) SH) 1))
+           (OW (+ (quotient (+ W (* 2 PW) (- KW)) SW) 1))
+           ;; batched MR: col is [N*OH*OW, C*KH*KW]; unbatched: col is [C*KH*KW, OH*OW]
+           (expected-col-rows (if target-batched? (* N OH OW) (* C KH KW)))
+           (expected-col-cols (if target-batched? (* C KH KW) (* OH OW)))
+           (_ (unless (and (= col-rank 2)
+                           (= (vector-ref col-shape 0) expected-col-rows)
+                           (= (vector-ref col-shape 1) expected-col-cols))
+                (error "col2im: col shape does not match target/kernel dimensions"
+                       col-shape (vector expected-col-rows expected-col-cols))))
+           ;; col-layout symbol for the realization executor
+           (col-layout (cond (nhwc?          'nhwc-mr)
+                             (target-batched? 'nchw-mr)
+                             (else            'nchw-standard))))
+
       (morphism-expr
        (gensym 'morph-)
        'col2im
        (list col)
-       (make-col2im-index-fn kernel-size stride padding col-batched?)
+       (make-col2im-index-fn kernel-size stride padding col-layout)
        target-shape
        (get-morphism-dtype col)
        `((kernel-size . (,KH ,KW))
          (stride . (,SH ,SW))
-         (padding . (,PH ,PW)))
+         (padding . (,PH ,PW))
+         ,@(if nhwc? '((layout . nhwc)) '()))
        (if target-batched? 0 -1))))
   
 
-  (define (make-col2im-index-fn kernel-size stride padding batched?)
-    "Create col2im index function with accumulation metadata
-  
-    Returns a special record type that the realization engine
-    can detect and route to specialized accumulation kernel
-  
-    Args:
-      kernel-size: (KH, KW) or integer
-      stride: (SH, SW) or integer  
-      padding: (PH, PW) or integer
-      batched?: Boolean indicating if input is batched
-    
-    Returns:
-      col2im-index-fn record with all parameters"
-  
-    ;; Parse kernel size
+  (define (make-col2im-index-fn kernel-size stride padding col-layout)
+    "Create col2im index function record for the realization engine.
+
+    col-layout: 'nchw-standard (unbatched), 'nchw-mr (batched NCHW), 'nhwc-mr (batched NHWC)"
     (let ((KH (if (pair? kernel-size) (car kernel-size) kernel-size))
           (KW (if (pair? kernel-size)
                   (if (null? (cdr kernel-size)) (car kernel-size) (cadr kernel-size))
                   kernel-size))
-          
-          ;; Parse stride
           (SH (if (pair? stride) (car stride) stride))
           (SW (if (pair? stride)
                   (if (null? (cdr stride)) (car stride) (cadr stride))
                   stride))
-          
-          ;; Parse padding
           (PH (if (pair? padding) (car padding) padding))
           (PW (if (pair? padding)
                   (if (null? (cdr padding)) (car padding) (cadr padding))
                   padding)))
-      
-      ;; Return col2im index function record
-      (make-col2im-index-fn-record KH KW SH SW PH PW batched?)))
+      (make-col2im-index-fn-record KH KW SH SW PH PW col-layout)))
   
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Batch Stack/Split Operations
@@ -867,9 +885,7 @@
       axis: Axis to concatenate along
     
     Returns:
-      Morphism with concatenated shape
-    
-    Note: Actual implementation deferred to Phase 5"
+      Morphism with concatenated shape"
     
     (when (null? morphisms)
       (error "morph-concat requires at least one morphism"))

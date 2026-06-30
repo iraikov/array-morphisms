@@ -60,8 +60,12 @@
    ;; Fast im2col / col2im kernels (dtype-specialized tight loops; called by SSA ri-im2col/ri-col2im)
    execute-im2col-unbatched
    execute-im2col-batched
+   execute-im2col-batched-mr
+   execute-im2col-nhwc-mr
    execute-col2im-unbatched
    execute-col2im-batched
+   execute-col2im-batched-mr
+   execute-col2im-nhwc-mr
    )
 
   (import scheme chicken.base chicken.module)
@@ -1356,10 +1360,133 @@
                                  0.0))))))))))))
         (else (error "execute-im2col-batched: unsupported dtype" dtype)))))
 
+  (define (execute-im2col-batched-mr out-buf src-data N C H W KH KW SH SW PH PW OH OW dtype)
+    "Matmul-ready batched im2col: [N,C,H,W] -> [N*OH_OW, C*KH*KW].
+    Loop order n,oh,ow,c,kh,kw -- output writes are sequential per row."
+    (let* ((fan-in (* C KH KW))
+           (H*W    (* H W))
+           (C*H*W  (* C H W)))
+      (case dtype
+        ((f32)
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-src (* n C*H*W))
+                 (n-row (* n OH OW)))
+             (do ((oh 0 (+ oh 1))
+                  (ih0 (- 0 PH) (+ ih0 SH)))
+                 ((= oh OH))
+               (do ((ow 0 (+ ow 1))
+                    (iw0 (- 0 PW) (+ iw0 SW)))
+                   ((= ow OW))
+                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in))
+                       (col-idx  0))
+                   (do ((c 0 (+ c 1))) ((= c C))
+                     (let ((c-base (+ n-src (* c H*W))))
+                       (do ((kh 0 (+ kh 1))
+                            (ih ih0 (+ ih 1)))
+                           ((= kh KH))
+                         (let* ((ih-ok? (and (>= ih 0) (< ih H)))
+                                (ih-W   (if ih-ok? (* ih W) 0)))
+                           (do ((kw 0 (+ kw 1))
+                                (iw iw0 (+ iw 1)))
+                               ((= kw KW))
+                             (f32vector-set! out-buf (+ row-base col-idx)
+                               (if (and ih-ok? (>= iw 0) (< iw W))
+                                   (f32vector-ref src-data (+ c-base ih-W iw))
+                                   0.0))
+                             (set! col-idx (+ col-idx 1))))))))))))
+         )
+        ((f64)
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-src (* n C*H*W))
+                 (n-row (* n OH OW)))
+             (do ((oh 0 (+ oh 1))
+                  (ih0 (- 0 PH) (+ ih0 SH)))
+                 ((= oh OH))
+               (do ((ow 0 (+ ow 1))
+                    (iw0 (- 0 PW) (+ iw0 SW)))
+                   ((= ow OW))
+                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in))
+                       (col-idx  0))
+                   (do ((c 0 (+ c 1))) ((= c C))
+                     (let ((c-base (+ n-src (* c H*W))))
+                       (do ((kh 0 (+ kh 1))
+                            (ih ih0 (+ ih 1)))
+                           ((= kh KH))
+                         (let* ((ih-ok? (and (>= ih 0) (< ih H)))
+                                (ih-W   (if ih-ok? (* ih W) 0)))
+                           (do ((kw 0 (+ kw 1))
+                                (iw iw0 (+ iw 1)))
+                               ((= kw KW))
+                             (f64vector-set! out-buf (+ row-base col-idx)
+                               (if (and ih-ok? (>= iw 0) (< iw W))
+                                   (f64vector-ref src-data (+ c-base ih-W iw))
+                                   0.0))
+                             (set! col-idx (+ col-idx 1))))))))))))
+         )
+        (else (error "execute-im2col-batched-mr: unsupported dtype" dtype)))))
+
+  (define (execute-im2col-nhwc-mr out-buf src-data N C H W KH KW SH SW PH PW OH OW dtype)
+    "Matmul-ready NHWC im2col: [N,H,W,C] -> [N*OH_OW, C*KH*KW].
+    Reads are sequential in C for fixed (n,oh,ow,kh,kw) -- better cache behavior."
+    (let* ((fan-in (* C KH KW))
+           (H*W    (* H W))
+           (H*W*C  (* H W C)))
+      (case dtype
+        ((f32)
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-src (* n H*W*C))
+                 (n-row (* n OH OW)))
+             (do ((oh 0 (+ oh 1))
+                  (ih0 (- 0 PH) (+ ih0 SH)))
+                 ((= oh OH))
+               (do ((ow 0 (+ ow 1))
+                    (iw0 (- 0 PW) (+ iw0 SW)))
+                   ((= ow OW))
+                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (do ((c 0 (+ c 1))) ((= c C))
+                     (do ((kh 0 (+ kh 1))
+                          (ih ih0 (+ ih 1)))
+                         ((= kh KH))
+                       (let* ((ih-ok? (and (>= ih 0) (< ih H))))
+                         (do ((kw 0 (+ kw 1))
+                              (iw iw0 (+ iw 1)))
+                             ((= kw KW))
+                           (f32vector-set! out-buf (+ row-base (* c KH KW) (* kh KW) kw)
+                             (if (and ih-ok? (>= iw 0) (< iw W))
+                                 (f32vector-ref src-data
+                                   (+ n-src (* (+ (* ih W) iw) C) c))
+                                 0.0))))))))))))
+        ((f64)
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-src (* n H*W*C))
+                 (n-row (* n OH OW)))
+             (do ((oh 0 (+ oh 1))
+                  (ih0 (- 0 PH) (+ ih0 SH)))
+                 ((= oh OH))
+               (do ((ow 0 (+ ow 1))
+                    (iw0 (- 0 PW) (+ iw0 SW)))
+                   ((= ow OW))
+                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (do ((c 0 (+ c 1))) ((= c C))
+                     (do ((kh 0 (+ kh 1))
+                          (ih ih0 (+ ih 1)))
+                         ((= kh KH))
+                       (let* ((ih-ok? (and (>= ih 0) (< ih H))))
+                         (do ((kw 0 (+ kw 1))
+                              (iw iw0 (+ iw 1)))
+                             ((= kw KW))
+                           (f64vector-set! out-buf (+ row-base (* c KH KW) (* kh KW) kw)
+                             (if (and ih-ok? (>= iw 0) (< iw W))
+                                 (f64vector-ref src-data
+                                   (+ n-src (* (+ (* ih W) iw) C) c))
+                                 0.0)))))))))))
+         )
+        (else (error "execute-im2col-nhwc-mr: unsupported dtype" dtype)))))
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Window Morphism Execution (im2col, Padding)
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  
+
   (define (execute-window-morphism fn output-buffer shape operands dtype)
     "Execute window index function (im2col, padding)
     
@@ -1463,21 +1590,26 @@
            (SW (col2im-index-fn-stride-w fn))
            (PH (col2im-index-fn-pad-h fn))
            (PW (col2im-index-fn-pad-w fn))
-           (batched? (col2im-index-fn-batched? fn)))
-      
+           (col-layout (col2im-index-fn-col-layout fn)))
+
       (unless (concrete-array? col-morphism)
         (error "col2im source must be concrete" col-morphism))
-      
+
       (cases array-morphism col-morphism
              (concrete-array
               (col-data col-shape col-strides col-offset col-dtype _ _)
-                             
-              (if batched?
-                  (execute-col2im-batched output-buffer shape col-data col-shape
-                                          KH KW SH SW PH PW dtype)
-                  (execute-col2im-unbatched output-buffer shape col-data col-shape
-                                            KH KW SH SW PH PW dtype)))
-             
+              (case col-layout
+                ((nchw-standard)
+                 (execute-col2im-unbatched output-buffer shape col-data col-shape
+                                           KH KW SH SW PH PW dtype))
+                ((nchw-mr)
+                 (execute-col2im-batched-mr output-buffer shape col-data col-shape
+                                            KH KW SH SW PH PW dtype))
+                ((nhwc-mr)
+                 (execute-col2im-nhwc-mr output-buffer shape col-data col-shape
+                                         KH KW SH SW PH PW dtype))
+                (else (error "col2im: unknown col-layout" col-layout))))
+
              (else (error "col2im operand must be concrete array")))))
 
 (define (execute-col2im-unbatched output-buffer output-shape
@@ -1620,8 +1752,151 @@
              ))
          )
         (else (error "execute-col2im-batched: unsupported dtype" dtype)))))
-      
-  
+
+  (define (execute-col2im-batched-mr output-buffer output-shape
+                                     col-data col-shape
+                                     KH KW SH SW PH PW dtype)
+    "Fast col2im for matmul-ready col [N*OH_OW, fan_in] -> NCHW [N,C,H,W].
+    Scatter-accumulates: for each (n,oh,ow) row, iterates (c,kh,kw) columns."
+    (let* ((N         (vector-ref output-shape 0))
+           (C         (vector-ref output-shape 1))
+           (H         (vector-ref output-shape 2))
+           (W         (vector-ref output-shape 3))
+           (OH        (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
+           (OW        (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
+           (fan-in    (* C KH KW))
+           (H*W       (* H W))
+           (C*H*W     (* C H W))
+           (output-size (shape-size output-shape)))
+      (case dtype
+        ((f32)
+         (do ((i 0 (+ i 1))) ((= i output-size)) (f32vector-set! output-buffer i 0.0))
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-out (* n C*H*W))
+                 (n-row (* n OH OW)))
+             (do ((oh 0 (+ oh 1))
+                  (ih0 (- 0 PH) (+ ih0 SH)))
+                 ((= oh OH))
+               (do ((ow 0 (+ ow 1))
+                    (iw0 (- 0 PW) (+ iw0 SW)))
+                   ((= ow OW))
+                 (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (do ((c 0 (+ c 1))) ((= c C))
+                     (let ((c-base (+ n-out (* c H*W))))
+                       (do ((kh 0 (+ kh 1))
+                            (ih ih0 (+ ih 1)))
+                           ((= kh KH))
+                         (when (and (>= ih 0) (< ih H))
+                           (let ((ih-W (* ih W)))
+                             (do ((kw 0 (+ kw 1))
+                                  (iw iw0 (+ iw 1)))
+                                 ((= kw KW))
+                               (when (and (>= iw 0) (< iw W))
+                                 (let ((out-i (+ c-base ih-W iw))
+                                       (col-i (+ col-base (* c KH KW) (* kh KW) kw)))
+                                   (f32vector-set! output-buffer out-i
+                                     (+ (f32vector-ref output-buffer out-i)
+                                        (f32vector-ref col-data col-i)))))))))))))))))
+        ((f64)
+         (do ((i 0 (+ i 1))) ((= i output-size)) (f64vector-set! output-buffer i 0.0))
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-out (* n C*H*W))
+                 (n-row (* n OH OW)))
+             (do ((oh 0 (+ oh 1))
+                  (ih0 (- 0 PH) (+ ih0 SH)))
+                 ((= oh OH))
+               (do ((ow 0 (+ ow 1))
+                    (iw0 (- 0 PW) (+ iw0 SW)))
+                   ((= ow OW))
+                 (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (do ((c 0 (+ c 1))) ((= c C))
+                     (let ((c-base (+ n-out (* c H*W))))
+                       (do ((kh 0 (+ kh 1))
+                            (ih ih0 (+ ih 1)))
+                           ((= kh KH))
+                         (when (and (>= ih 0) (< ih H))
+                           (let ((ih-W (* ih W)))
+                             (do ((kw 0 (+ kw 1))
+                                  (iw iw0 (+ iw 1)))
+                                 ((= kw KW))
+                               (when (and (>= iw 0) (< iw W))
+                                 (let ((out-i (+ c-base ih-W iw))
+                                       (col-i (+ col-base (* c KH KW) (* kh KW) kw)))
+                                   (f64vector-set! output-buffer out-i
+                                     (+ (f64vector-ref output-buffer out-i)
+                                        (f64vector-ref col-data col-i)))))))))))))))))
+        (else (error "execute-col2im-batched-mr: unsupported dtype" dtype)))))
+
+  (define (execute-col2im-nhwc-mr output-buffer output-shape
+                                  col-data col-shape
+                                  KH KW SH SW PH PW dtype)
+    "Fast col2im for [N*OH_OW, fan_in] col -> NHWC [N,H,W,C].
+    Scatter-accumulates into channels-last layout."
+    (let* ((N         (vector-ref output-shape 0))
+           (H         (vector-ref output-shape 1))
+           (W         (vector-ref output-shape 2))
+           (C         (vector-ref output-shape 3))
+           (OH        (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
+           (OW        (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
+           (fan-in    (* C KH KW))
+           (H*W*C     (* H W C))
+           (output-size (shape-size output-shape)))
+      (case dtype
+        ((f32)
+         (do ((i 0 (+ i 1))) ((= i output-size)) (f32vector-set! output-buffer i 0.0))
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-out (* n H*W*C))
+                 (n-row (* n OH OW)))
+             (do ((oh 0 (+ oh 1))
+                  (ih0 (- 0 PH) (+ ih0 SH)))
+                 ((= oh OH))
+               (do ((ow 0 (+ ow 1))
+                    (iw0 (- 0 PW) (+ iw0 SW)))
+                   ((= ow OW))
+                 (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (do ((c 0 (+ c 1))) ((= c C))
+                     (do ((kh 0 (+ kh 1))
+                          (ih ih0 (+ ih 1)))
+                         ((= kh KH))
+                       (when (and (>= ih 0) (< ih H))
+                         (do ((kw 0 (+ kw 1))
+                              (iw iw0 (+ iw 1)))
+                             ((= kw KW))
+                           (when (and (>= iw 0) (< iw W))
+                             (let ((out-i (+ n-out (* (+ (* ih W) iw) C) c))
+                                   (col-i (+ col-base (* c KH KW) (* kh KW) kw)))
+                               (f32vector-set! output-buffer out-i
+                                 (+ (f32vector-ref output-buffer out-i)
+                                    (f32vector-ref col-data col-i)))))))))))))))
+        ((f64)
+         (do ((i 0 (+ i 1))) ((= i output-size)) (f64vector-set! output-buffer i 0.0))
+         (do ((n 0 (+ n 1))) ((= n N))
+           (let ((n-out (* n H*W*C))
+                 (n-row (* n OH OW)))
+             (do ((oh 0 (+ oh 1))
+                  (ih0 (- 0 PH) (+ ih0 SH)))
+                 ((= oh OH))
+               (do ((ow 0 (+ ow 1))
+                    (iw0 (- 0 PW) (+ iw0 SW)))
+                   ((= ow OW))
+                 (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (do ((c 0 (+ c 1))) ((= c C))
+                     (do ((kh 0 (+ kh 1))
+                          (ih ih0 (+ ih 1)))
+                         ((= kh KH))
+                       (when (and (>= ih 0) (< ih H))
+                         (do ((kw 0 (+ kw 1))
+                              (iw iw0 (+ iw 1)))
+                             ((= kw KW))
+                           (when (and (>= iw 0) (< iw W))
+                             (let ((out-i (+ n-out (* (+ (* ih W) iw) C) c))
+                                   (col-i (+ col-base (* c KH KW) (* kh KW) kw)))
+                               (f64vector-set! output-buffer out-i
+                                 (+ (f64vector-ref output-buffer out-i)
+                                    (f64vector-ref col-data col-i)))))))))))))))
+        (else (error "execute-col2im-nhwc-mr: unsupported dtype" dtype)))))
+
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Reduction Morphism Execution
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

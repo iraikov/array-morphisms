@@ -279,7 +279,7 @@
     (in-ref    replay-ref?))
 
   ;; Fast im2col: all index parameters baked in at compile time from morph meta.
-  ;; Calls execute-im2col-batched or execute-im2col-unbatched (no per-element alloc).
+  ;; col-layout: 'nchw-standard (unbatched), 'nchw-mr (batched NCHW), 'nhwc-mr (batched NHWC).
   (ri-im2col
     (out-pool-idx integer?)
     (out-shape    vector?)
@@ -298,10 +298,10 @@
     (PW           integer?)
     (OH           integer?)
     (OW           integer?)
-    (batched?     boolean?))
+    (col-layout   symbol?))
 
   ;; Fast col2im: all index parameters baked in at compile time from VJP meta.
-  ;; Calls execute-col2im-batched or execute-col2im-unbatched (no per-element alloc).
+  ;; col-layout: 'nchw-standard (unbatched), 'nchw-mr (batched NCHW), 'nhwc-mr (batched NHWC).
   (ri-col2im
     (out-pool-idx integer?)
     (out-shape    vector?)
@@ -318,7 +318,7 @@
     (SW           integer?)
     (PH           integer?)
     (PW           integer?)
-    (batched?     boolean?)))
+    (col-layout   symbol?)))
 
 
 ;;; ============================================================
@@ -1007,12 +1007,15 @@
                         (kernel-size (cdr (assq 'kernel-size meta)))
                         (stride      (cdr (assq 'stride meta)))
                         (padding     (cdr (assq 'padding meta)))
-                        (dx          (emit! 'col2im (list g-val)
-                                            x-shape dtype
-                                            (list (cons 'output-shape x-shape)
-                                                  (cons 'kernel-size kernel-size)
-                                                  (cons 'stride stride)
-                                                  (cons 'padding padding)))))
+                        ;; Propagate layout (nhwc) so col2im backward uses correct kernel
+                        (layout-entry (assq 'layout meta))
+                        (vjp-meta    (append
+                                       (list (cons 'output-shape x-shape)
+                                             (cons 'kernel-size kernel-size)
+                                             (cons 'stride stride)
+                                             (cons 'padding padding))
+                                       (if layout-entry (list layout-entry) '())))
+                        (dx          (emit! 'col2im (list g-val) x-shape dtype vjp-meta)))
                    (accumulate-input-adjoint! x-val dx)))
 
                 ;; (reduce mean) -- dx = broadcast(g / n, src-shape)
@@ -1185,18 +1188,22 @@
 
        ;; im2col: forward image-to-column
        ((eq? op 'im2col)
-        (let* ((kernel-size (cdr (assq 'kernel-size meta)))
-               (stride      (cdr (assq 'stride meta)))
-               (padding     (cdr (assq 'padding meta))))
-          (im2col-morph (car inputs) kernel-size stride padding)))
+        (let* ((kernel-size  (cdr (assq 'kernel-size meta)))
+               (stride       (cdr (assq 'stride meta)))
+               (padding      (cdr (assq 'padding meta)))
+               (layout-entry (assq 'layout meta))
+               (layout       (if layout-entry (cdr layout-entry) 'nchw)))
+          (im2col-morph (car inputs) kernel-size stride padding layout: layout)))
 
        ;; col2im: column-to-image (backward of im2col)
        ((eq? op 'col2im)
-        (let* ((output-shape (cdr (assq 'output-shape meta)))
-               (kernel-size  (cdr (assq 'kernel-size meta)))
-               (stride       (cdr (assq 'stride meta)))
-               (padding      (cdr (assq 'padding meta))))
-          (col2im-morph (car inputs) output-shape kernel-size stride padding)))
+        (let* ((output-shape  (cdr (assq 'output-shape meta)))
+               (kernel-size   (cdr (assq 'kernel-size meta)))
+               (stride        (cdr (assq 'stride meta)))
+               (padding       (cdr (assq 'padding meta)))
+               (layout-entry  (assq 'layout meta))
+               (layout        (if layout-entry (cdr layout-entry) 'nchw)))
+          (col2im-morph (car inputs) output-shape kernel-size stride padding layout: layout)))
 
        (else
         (error "rebuild-morphism: unknown op" op)))))
@@ -1439,6 +1446,7 @@
               (KH       (car  meta-ks)) (KW (cadr meta-ks))
               (SH       (car  meta-st)) (SW (cadr meta-st))
               (PH       (car  meta-pd)) (PW (cadr meta-pd))
+              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
               (src-arr  (trace-arr-of (car (ssa-binding-inputs b))))
               (src-shape (cases array-morphism src-arr
                            (concrete-array (_ s _ _ _ _ _) s)
@@ -1446,16 +1454,26 @@
                                         (ssa-binding-name b)))))
               (rank     (vector-length src-shape))
               (batched? (= rank 4))
+              (col-layout (cond (nhwc?    'nhwc-mr)
+                                (batched? 'nchw-mr)
+                                (else     'nchw-standard)))
               (N        (if batched? (vector-ref src-shape 0) 1))
-              (C        (vector-ref src-shape (if batched? 1 0)))
-              (H        (vector-ref src-shape (if batched? 2 1)))
-              (W        (vector-ref src-shape (if batched? 3 2)))
+              ;; For NHWC input [N,H,W,C]: C is at index 3, H at 1, W at 2
+              (C        (cond (nhwc?    (vector-ref src-shape 3))
+                              (batched? (vector-ref src-shape 1))
+                              (else     (vector-ref src-shape 0))))
+              (H        (cond (nhwc?    (vector-ref src-shape 1))
+                              (batched? (vector-ref src-shape 2))
+                              (else     (vector-ref src-shape 1))))
+              (W        (cond (nhwc?    (vector-ref src-shape 2))
+                              (batched? (vector-ref src-shape 3))
+                              (else     (vector-ref src-shape 2))))
               (OH       (if meta-so (car  meta-so)
                            (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
               (OW       (if meta-so (cadr meta-so)
                            (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))))
          (ri-im2col pool-idx shape strides dtype
-                    (car in-refs) N C H W KH KW SH SW PH PW OH OW batched?)))
+                    (car in-refs) N C H W KH KW SH SW PH PW OH OW col-layout)))
 
       ;; Fast col2im: VJP-emitted backward of im2col.
       ;; Meta carries output-shape (= grad target shape), kernel-size, stride, padding.
@@ -1467,14 +1485,25 @@
               (KH       (car  meta-ks)) (KW (cadr meta-ks))
               (SH       (car  meta-st)) (SW (cadr meta-st))
               (PH       (car  meta-pd)) (PW (cadr meta-pd))
+              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
               (rank     (vector-length shape))
               (batched? (= rank 4))
+              (col-layout (cond (nhwc?    'nhwc-mr)
+                                (batched? 'nchw-mr)
+                                (else     'nchw-standard)))
               (N        (if batched? (vector-ref shape 0) 1))
-              (C        (vector-ref shape (if batched? 1 0)))
-              (H        (vector-ref shape (if batched? 2 1)))
-              (W        (vector-ref shape (if batched? 3 2))))
+              ;; For NHWC output [N,H,W,C]: C is at index 3, H at 1, W at 2
+              (C        (cond (nhwc?    (vector-ref shape 3))
+                              (batched? (vector-ref shape 1))
+                              (else     (vector-ref shape 0))))
+              (H        (cond (nhwc?    (vector-ref shape 1))
+                              (batched? (vector-ref shape 2))
+                              (else     (vector-ref shape 1))))
+              (W        (cond (nhwc?    (vector-ref shape 2))
+                              (batched? (vector-ref shape 3))
+                              (else     (vector-ref shape 2)))))
          (ri-col2im pool-idx shape strides dtype
-                    (car in-refs) N C H W KH KW SH SW PH PW batched?)))
+                    (car in-refs) N C H W KH KW SH SW PH PW col-layout)))
 
       ;; Element-wise and all other pool-backed ops.
       ;; VJP-emitted bindings have empty meta; get-index-fn rebuilds via trace inputs.
@@ -1666,12 +1695,12 @@
   (syntax-rules ()
     ((_ tag body ...)
      (if *timing-enabled?*
-         (let ((t0 (cpu-time)))
-           (let ((result (begin body ...)))
-             (let ((elapsed (- (cpu-time) t0)))
-               (hash-table-set! *timing-table* tag
-                 (+ elapsed (hash-table-ref/default *timing-table* tag 0)))
-               result)))
+         (let* ((t0 (current-process-milliseconds))
+                (result (begin body ...))
+                (elapsed (- (current-process-milliseconds) t0)))
+           (hash-table-set! *timing-table* tag
+                            (+ elapsed (hash-table-ref/default *timing-table* tag 0)))
+           result)
          (begin body ...)))))
 
 
@@ -1826,28 +1855,38 @@
                       (else (error "ri-alias: source not concrete" src)))))
 
                 (ri-im2col (pool-idx shape strides dtype src-ref
-                             N C H W KH KW SH SW PH PW OH OW batched?)
+                             N C H W KH KW SH SW PH PW OH OW col-layout)
                   (time-instr 'ri-im2col
                     (let* ((src (deref src-ref))
                            (buf (vector-ref pool-bufs pool-idx)))
                       (cases array-morphism src
                         (concrete-array (src-data _ _ _ _ _ _)
-                          (if batched?
-                              (execute-im2col-batched   buf src-data N C H W KH KW SH SW PH PW OH OW dtype)
-                              (execute-im2col-unbatched buf src-data   C H W KH KW SH SW PH PW OH OW dtype))
+                          (case col-layout
+                            ((nchw-standard)
+                             (execute-im2col-unbatched buf src-data C H W KH KW SH SW PH PW OH OW dtype))
+                            ((nchw-mr)
+                             (execute-im2col-batched-mr buf src-data N C H W KH KW SH SW PH PW OH OW dtype))
+                            ((nhwc-mr)
+                             (execute-im2col-nhwc-mr buf src-data N C H W KH KW SH SW PH PW OH OW dtype))
+                            (else (error "ri-im2col: unknown col-layout" col-layout)))
                           (make-pool-arr pool-idx shape strides dtype))
                         (else (error "ri-im2col: source not concrete" src))))))
 
                 (ri-col2im (pool-idx shape strides dtype col-ref
-                             N C H W KH KW SH SW PH PW batched?)
+                             N C H W KH KW SH SW PH PW col-layout)
                   (time-instr 'ri-col2im
                     (let* ((col (deref col-ref))
                            (buf (vector-ref pool-bufs pool-idx)))
                       (cases array-morphism col
                         (concrete-array (col-data col-shape _ _ _ _ _)
-                          (if batched?
-                              (execute-col2im-batched   buf shape col-data col-shape KH KW SH SW PH PW dtype)
-                              (execute-col2im-unbatched buf shape col-data col-shape KH KW SH SW PH PW dtype))
+                          (case col-layout
+                            ((nchw-standard)
+                             (execute-col2im-unbatched buf shape col-data col-shape KH KW SH SW PH PW dtype))
+                            ((nchw-mr)
+                             (execute-col2im-batched-mr buf shape col-data col-shape KH KW SH SW PH PW dtype))
+                            ((nhwc-mr)
+                             (execute-col2im-nhwc-mr buf shape col-data col-shape KH KW SH SW PH PW dtype))
+                            (else (error "ri-col2im: unknown col-layout" col-layout)))
                           (make-pool-arr pool-idx shape strides dtype))
                         (else (error "ri-col2im: col not concrete" col))))))
                 ))
