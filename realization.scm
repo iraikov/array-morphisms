@@ -762,8 +762,8 @@
           ((and (= nops 1)
                 (flat-operand? (car operands) shape))
            (cases array-morphism (car operands)
-             (concrete-array (data _ _ _ _ _ _)
-               (execute-flat-unary-compute combiner data output-buffer size dtype))
+             (concrete-array (data _ _ _ src-dtype _ _)
+               (execute-flat-unary-compute combiner data src-dtype output-buffer size dtype))
              (else
               (execute-compute-morphism index-fn output-buffer shape operands dtype))))
           ;; Fast path 2: binary, both row-major, same shape
@@ -771,10 +771,10 @@
                 (flat-operand? (car operands)  shape)
                 (flat-operand? (cadr operands) shape))
            (cases array-morphism (car operands)
-             (concrete-array (data1 _ _ _ _ _ _)
+             (concrete-array (data1 _ _ _ src-dtype1 _ _)
                (cases array-morphism (cadr operands)
-                 (concrete-array (data2 _ _ _ _ _ _)
-                   (execute-flat-binary-compute combiner data1 data2 output-buffer size dtype))
+                 (concrete-array (data2 _ _ _ src-dtype2 _ _)
+                   (execute-flat-binary-compute combiner data1 src-dtype1 data2 src-dtype2 output-buffer size dtype))
                  (else
                   (execute-compute-morphism index-fn output-buffer shape operands dtype))))
              (else
@@ -1169,32 +1169,35 @@
         (else
          (error "Unsupported dtype for compute morphism" dtype)))))
 
-  (define (execute-flat-unary-compute combiner data output-buffer size dtype)
+  ;; src-dtype is the dtype of the input data vector; dtype is the output dtype.
+  ;; These may differ when type promotion occurs (e.g. s32 -> f64 for sqrt).
+  (define (execute-flat-unary-compute combiner data src-dtype output-buffer size dtype)
     (case dtype
       ((f64) (do ((i 0 (+ i 1))) ((= i size))
-               (f64vector-set! output-buffer i (combiner (f64vector-ref data i)))))
+               (f64vector-set! output-buffer i (combiner (typed-vector-ref data src-dtype i)))))
       ((f32) (do ((i 0 (+ i 1))) ((= i size))
-               (f32vector-set! output-buffer i (combiner (f32vector-ref data i)))))
+               (f32vector-set! output-buffer i (combiner (typed-vector-ref data src-dtype i)))))
       ((s32) (do ((i 0 (+ i 1))) ((= i size))
-               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (s32vector-ref data i)))))))
+               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data src-dtype i)))))))
       ((s64) (do ((i 0 (+ i 1))) ((= i size))
-               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (s64vector-ref data i)))))))
+               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data src-dtype i)))))))
       (else (error "execute-flat-unary-compute: unsupported dtype" dtype))))
 
-  (define (execute-flat-binary-compute combiner data1 data2 output-buffer size dtype)
+  ;; src-dtype1/src-dtype2 are the input dtypes; dtype is the output dtype.
+  (define (execute-flat-binary-compute combiner data1 src-dtype1 data2 src-dtype2 output-buffer size dtype)
     (case dtype
       ((f64) (do ((i 0 (+ i 1))) ((= i size))
-               (f64vector-set! output-buffer i (exact->inexact (combiner (f64vector-ref data1 i)
-                                                                          (f64vector-ref data2 i))))))
+               (f64vector-set! output-buffer i (exact->inexact (combiner (typed-vector-ref data1 src-dtype1 i)
+                                                                          (typed-vector-ref data2 src-dtype2 i))))))
       ((f32) (do ((i 0 (+ i 1))) ((= i size))
-               (f32vector-set! output-buffer i (exact->inexact (combiner (f32vector-ref data1 i)
-                                                                          (f32vector-ref data2 i))))))
+               (f32vector-set! output-buffer i (exact->inexact (combiner (typed-vector-ref data1 src-dtype1 i)
+                                                                          (typed-vector-ref data2 src-dtype2 i))))))
       ((s32) (do ((i 0 (+ i 1))) ((= i size))
-               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (s32vector-ref data1 i)
-                                                                                    (s32vector-ref data2 i)))))))
+               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data1 src-dtype1 i)
+                                                                                    (typed-vector-ref data2 src-dtype2 i)))))))
       ((s64) (do ((i 0 (+ i 1))) ((= i size))
-               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (s64vector-ref data1 i)
-                                                                                    (s64vector-ref data2 i)))))))
+               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data1 src-dtype1 i)
+                                                                                    (typed-vector-ref data2 src-dtype2 i)))))))
       (else (error "execute-flat-binary-compute: unsupported dtype" dtype))))
 
   (define (execute-flat-bias-broadcast-compute combiner data1 data2 output-buffer size N dtype)

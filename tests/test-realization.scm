@@ -389,13 +389,15 @@
            (equal? (get-morphism-shape realized) #(9 4)))))
   
   (test-assert "realize im2col batched"
-    (let* ((m (morph-from-list 
+    (let* ((m (morph-from-list
                 (make-list 72 1.0)  ; (2,2,6,3)
                 #(2 2 6 3) 'f64 batch-axis: 0))
            (col (im2col-morph m '(2 2) 1 0))
            (realized (realize col)))
+      ; N=2, C=2, H=6, W=3, KH=KW=2 -> OH=5, OW=2, fan_in=8
+      ; MR output: [N*OH_OW, fan_in] = [20, 8]
       (and (concrete-array? realized)
-           (equal? (get-morphism-shape realized) #(2 8 10))))))
+           (equal? (get-morphism-shape realized) #(20 8))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Helper Operations Realization Tests
@@ -503,8 +505,10 @@
            (batched (realize (morph-stack (list img1 img2) 0)))
            (col (realize (im2col-morph batched '(2 2) 1 0))))
       
+      ; N=2, C=1, H=3, W=3, KH=KW=2 -> OH=2, OW=2, fan_in=4
+      ; MR output: [N*OH_OW, fan_in] = [8, 4]
       (and (concrete-array? col)
-           (equal? (get-morphism-shape col) #(2 4 4)))))
+           (equal? (get-morphism-shape col) #(8 4)))))
   
   (test-assert "col2im on stacked then im2col'd arrays"
     (let* ((img1 (morph-from-list '(((1 2 3) (4 5 6) (7 8 9))) #(1 3 3) 'f64))

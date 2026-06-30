@@ -231,7 +231,7 @@
                (valid-dtype? 's32))
   
   (test-assert "valid-dtype? invalid"
-    (valid-dtype? 'invalid))
+    (not (valid-dtype? 'invalid)))
   
   (test "dtype-size f32"
     4

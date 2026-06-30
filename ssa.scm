@@ -1788,8 +1788,8 @@
                            (buf  (vector-ref pool-bufs pool-idx))
                            (size (shape-size shape)))
                       (cases array-morphism src
-                        (concrete-array (data _ _ _ _ _ _)
-                          (execute-flat-unary-compute combiner data buf size dtype)
+                        (concrete-array (data _ _ _ src-dtype _ _)
+                          (execute-flat-unary-compute combiner data src-dtype buf size dtype)
                           (make-pool-arr pool-idx shape strides dtype))
                         (else (error "ri-flat-unary: source not concrete" src))))))
 
@@ -1800,10 +1800,10 @@
                            (buf  (vector-ref pool-bufs pool-idx))
                            (size (shape-size shape)))
                       (cases array-morphism A
-                        (concrete-array (data1 _ _ _ _ _ _)
+                        (concrete-array (data1 _ _ _ src-dtype1 _ _)
                           (cases array-morphism B
-                            (concrete-array (data2 _ _ _ _ _ _)
-                              (execute-flat-binary-compute combiner data1 data2 buf size dtype)
+                            (concrete-array (data2 _ _ _ src-dtype2 _ _)
+                              (execute-flat-binary-compute combiner data1 src-dtype1 data2 src-dtype2 buf size dtype)
                               (make-pool-arr pool-idx shape strides dtype))
                             (else (error "ri-flat-binary: B not concrete" B))))
                         (else (error "ri-flat-binary: A not concrete" A))))))
