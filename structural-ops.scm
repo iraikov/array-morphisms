@@ -520,7 +520,7 @@
 
     Returns:
       Unbatched: [fan_in, OH_OW]
-      Batched:   [N*OH_OW, fan_in]  (matmul-ready layout)"
+      Batched:   [N, fan_in, OH_OW]  (classic layout)"
 
     (let* ((shape (get-morphism-shape input))
            (rank (vector-length shape))
@@ -561,9 +561,9 @@
            (OH (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
            (OW (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
 
-           ;; Output shape: batched -> [N*OH_OW, fan_in] (matmul-ready); unbatched -> [fan_in, OH_OW]
+           ;; Output shape: batched -> [N, fan_in, OH_OW] (classic); unbatched -> [fan_in, OH_OW]
            (output-shape (if batched?
-                            (vector (* N OH OW) (* C KH KW))
+                            (vector N (* C KH KW) (* OH OW))
                             (vector (* C KH KW) (* OH OW))))
 
            (meta `((kernel-size . (,KH ,KW))
@@ -584,38 +584,36 @@
   
   (define (make-im2col-index-fn C H W KH KW SH SW PH PW OH OW batched? nhwc?)
     "Create im2col index function.
-    Maps output (flat_row, col_idx) to source multi-index or 'pad-zero."
+    Maps output indices to source multi-index or 'pad-zero.
+    Batched classic: (n, col_idx, ohow) where col_idx = c*KH*KW + kh*KW + kw, ohow = oh*OW + ow."
     (if batched?
-        ;; Batched matmul-ready: (flat_row, col_idx) -> source multi-index or 'pad-zero
-        ;; flat_row = n*OH_OW + oh*OW + ow;  col_idx = c*KH*KW + kh*KW + kw
-        (let ((OH_OW (* OH OW)))
-          (lambda (indices)
-            (let* ((flat-row (car indices))
-                   (col-idx  (cadr indices))
+        ;; Batched classic: (n, col_idx, ohow) -> source multi-index or 'pad-zero
+        (lambda (indices)
+          (let* ((n       (car indices))
+                 (col-idx (cadr indices))
+                 (ohow    (caddr indices))
 
-                   ;; Decode spatial position from flat row
-                   (n   (quotient flat-row OH_OW))
-                   (ohw (modulo   flat-row OH_OW))
-                   (oh  (quotient ohw OW))
-                   (ow  (modulo   ohw OW))
+                 ;; Decode kernel position from column index
+                 (c   (quotient col-idx (* KH KW)))
+                 (khw (modulo   col-idx (* KH KW)))
+                 (kh  (quotient khw KW))
+                 (kw  (modulo   khw KW))
 
-                   ;; Decode kernel position from column index
-                   (c   (quotient col-idx (* KH KW)))
-                   (khw (modulo   col-idx (* KH KW)))
-                   (kh  (quotient khw KW))
-                   (kw  (modulo   khw KW))
+                 ;; Decode spatial position from ohow
+                 (oh  (quotient ohow OW))
+                 (ow  (modulo   ohow OW))
 
-                   ;; Map to input coordinates
-                   (in-h (+ (* oh SH) kh (- PH)))
-                   (in-w (+ (* ow SW) kw (- PW))))
+                 ;; Map to input coordinates
+                 (in-h (+ (* oh SH) kh (- PH)))
+                 (in-w (+ (* ow SW) kw (- PW))))
 
-              (if (and (>= in-h 0) (< in-h H)
-                       (>= in-w 0) (< in-w W))
-                  ;; NHWC source: (n, h, w, c);  NCHW source: (n, c, h, w)
-                  (if nhwc?
-                      (list n in-h in-w c)
-                      (list n c in-h in-w))
-                  'pad-zero))))
+            (if (and (>= in-h 0) (< in-h H)
+                     (>= in-w 0) (< in-w W))
+                ;; NHWC source: (n, h, w, c);  NCHW source: (n, c, h, w)
+                (if nhwc?
+                    (list n in-h in-w c)
+                    (list n c in-h in-w))
+                'pad-zero)))
 
         ;; Non-batched: (col_row, col_col) -> (c, h, w) or 'pad-zero (NCHW only)
         (lambda (indices)
@@ -695,17 +693,25 @@
                    (vector-ref target-shape 2)))
            (OH (+ (quotient (+ H (* 2 PH) (- KH)) SH) 1))
            (OW (+ (quotient (+ W (* 2 PW) (- KW)) SW) 1))
-           ;; batched MR: col is [N*OH*OW, C*KH*KW]; unbatched: col is [C*KH*KW, OH*OW]
-           (expected-col-rows (if target-batched? (* N OH OW) (* C KH KW)))
-           (expected-col-cols (if target-batched? (* C KH KW) (* OH OW)))
-           (_ (unless (and (= col-rank 2)
-                           (= (vector-ref col-shape 0) expected-col-rows)
-                           (= (vector-ref col-shape 1) expected-col-cols))
+           ;; batched classic: col is [N, C*KH*KW, OH*OW]; unbatched: col is [C*KH*KW, OH*OW]
+           (expected-col-valid?
+             (if target-batched?
+                 (and (= col-rank 3)
+                      (= (vector-ref col-shape 0) N)
+                      (= (vector-ref col-shape 1) (* C KH KW))
+                      (= (vector-ref col-shape 2) (* OH OW)))
+                 (and (= col-rank 2)
+                      (= (vector-ref col-shape 0) (* C KH KW))
+                      (= (vector-ref col-shape 1) (* OH OW)))))
+           (_ (unless expected-col-valid?
                 (error "col2im: col shape does not match target/kernel dimensions"
-                       col-shape (vector expected-col-rows expected-col-cols))))
+                       col-shape
+                       (if target-batched?
+                           (vector N (* C KH KW) (* OH OW))
+                           (vector (* C KH KW) (* OH OW))))))
            ;; col-layout symbol for the realization executor
-           (col-layout (cond (nhwc?          'nhwc-mr)
-                             (target-batched? 'nchw-mr)
+           (col-layout (cond (nhwc?           'nhwc-classic)
+                             (target-batched? 'nchw-classic)
                              (else            'nchw-standard))))
 
       (morphism-expr
@@ -725,7 +731,7 @@
   (define (make-col2im-index-fn kernel-size stride padding col-layout)
     "Create col2im index function record for the realization engine.
 
-    col-layout: 'nchw-standard (unbatched), 'nchw-mr (batched NCHW), 'nhwc-mr (batched NHWC)"
+    col-layout: 'nchw-standard (unbatched), 'nchw-classic (batched NCHW), 'nhwc-classic (batched NHWC)"
     (let ((KH (if (pair? kernel-size) (car kernel-size) kernel-size))
           (KW (if (pair? kernel-size)
                   (if (null? (cdr kernel-size)) (car kernel-size) (cadr kernel-size))

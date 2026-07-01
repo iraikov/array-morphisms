@@ -10,7 +10,7 @@
    realize!
    force-morphism
 
-   ;; Memory reuse context (Phase 6)
+   ;; Memory reuse context
    current-morphism-context
 
    ;; Specialized execution
@@ -29,7 +29,7 @@
    can-use-zero-copy?
    create-view
 
-   ;; BLAS configuration (re-exported from array-morphisms-blas-exec, Phase 3)
+   ;; BLAS configuration (re-exported from array-morphisms-blas-exec)
    blas-enabled?
    enable-blas!
    disable-blas!
@@ -39,7 +39,7 @@
    *active-backend*
    *blas-size-threshold*
 
-   ;; Conv2D via im2col+BLAS (Phase 4)
+   ;; Conv2D via im2col+BLAS
    detect-conv2d-pattern
    execute-conv2d-blas
 
@@ -62,10 +62,26 @@
    execute-im2col-batched
    execute-im2col-batched-mr
    execute-im2col-nhwc-mr
+   execute-im2col-nhwc-classic
    execute-col2im-unbatched
    execute-col2im-batched
    execute-col2im-batched-mr
    execute-col2im-nhwc-mr
+   execute-col2im-nhwc-classic
+   ;; Implicit GEMM convolution
+   execute-conv-fwd-nchw
+   execute-conv-fwd-nhwc
+   execute-conv-bwd-data-nchw
+   execute-conv-bwd-data-nhwc
+   execute-conv-bwd-weights-nchw
+   execute-conv-bwd-weights-nhwc
+   ;; BLAS-backed convolution: im2col-mr + single BLAS gemm per op
+   execute-conv-fwd-blas
+   execute-conv-fwd-nhwc-blas
+   execute-conv-bwd-data-blas
+   execute-conv-bwd-data-nhwc-blas
+   execute-conv-bwd-weights-blas
+   execute-conv-bwd-weights-nhwc-blas
    )
 
   (import scheme chicken.base chicken.module)
@@ -84,9 +100,41 @@
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-compat)
   (import array-morphisms-blas-exec)
-  
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  ;;; Memory Reuse Context Parameter (Phase 6)
+  ;;; Convolution kernel loop macros
+
+  ;; Simple counted loop: v from 0 to N-1.
+  (define-syntax for-range
+    (syntax-rules ()
+      ((_ (v N) body ...)
+       (do ((v 0 (+ v 1))) ((= v N))
+         body ...))))
+
+  ;; Counted loop with zero or more parallel stride variables.
+  ;; Each (aux init step) clause becomes a do-variable starting at init
+  ;; and advancing by step each iteration.
+  (define-syntax for-stride
+    (syntax-rules ()
+      ((_ (v N) ((aux init step) ...) body ...)
+       (do ((v 0 (+ v 1)) (aux init (+ aux step)) ...)
+           ((= v N))
+         body ...))))
+
+  ;; Skip body when spatial coordinate lies outside [0, limit).
+  (define-syntax when-valid
+    (syntax-rules ()
+      ((_ coord limit body ...)
+       (when (and (>= coord 0) (< coord limit))
+         body ...))))
+
+  ;; NOTE: CHICKEN Scheme's let-syntax does not propagate scope through
+  ;; define-syntax macro expansions (e.g. for-stride/for-range), so
+  ;; with-typed-vecs cannot inject vec-ref/vec-set! into loop bodies.
+  ;; Use explicit case dtype with f32vector-ref/f64vector-ref instead.
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Memory Reuse Context Parameter
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
   ;; When #f (default), realize behaves as in phases 1-5.
@@ -140,7 +188,7 @@
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  ;;; Conv2D Pattern Detection and Execution (Phase 4)
+  ;;; Conv2D Pattern Detection and Execution
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
   (define (detect-conv2d-pattern m)
@@ -411,13 +459,13 @@
   Fused attention: op 'attention is checked first (no tree scan required;
   faster than conv2d pattern detection).  Dispatches to execute-fused-attention.
 
-  Phase 4: Then checks for the fused conv2d pattern
+  Then checks for the fused conv2d pattern
     reshape(matmul(weight, im2col(input)))
   on the unrealized expression tree.  When matched and BLAS is enabled,
   executes as a single fused im2col + GEMM + reshape without materializing
   the intermediate im2col column matrix as a separate allocation.
 
-  Phase 3: Falls back to BLAS-accelerated matmul/matvec/dot via
+  Falls back to BLAS-accelerated matmul/matvec/dot via
   execute-blas-operation after realizing all operands.
 
   Standard path: zero-copy view or generic kernel execution."
@@ -429,7 +477,7 @@
       (if (eq? op 'attention)
           (execute-fused-attention m)
 
-          ;; Phase 4: detect conv2d pattern on the unrealized tree.
+          ;; Detect conv2d pattern on the unrealized tree.
           ;; Must run BEFORE (map realize operands) so the im2col/matmul
           ;; nodes are still visible as morphism-exprs.
           (let ((conv-result
@@ -442,10 +490,9 @@
             (if conv-result
                 conv-result
 
-                ;; Phases 3 + standard path
                 (let* ((realized-operands (map realize operands))
 
-                       ;; Phase 3: BLAS dispatch for matmul/matvec/dot.
+                       ;; BLAS dispatch for matmul/matvec/dot.
                        ;; Returns #f for other ops, allowing standard path below.
                        ;; For matmul/matvec/dot: always dispatches here since those
                        ;; morphisms carry an identity-fn placeholder that
@@ -479,7 +526,7 @@
 
   
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  ;;; Context-Aware Realization (Phase 6)
+  ;;; Context-Aware Realization
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
   (define (realize-morphism-expr/ctx ctx m)
@@ -491,7 +538,7 @@
       record!  - (lambda (id dtype size shape input-ids)) -> void
       get-buf! - (lambda (id dtype size)) -> typed-vector
 
-    Phase 7: uses execute-blas-gemm/into! and execute-blas-gemv/into! to fill
+    Uses execute-blas-gemm/into! and execute-blas-gemv/into! to fill
     the pool buffer with BLAS kernels in both trace and replay modes, resolving
     the prior limitation where ctx always used the pure Scheme kernel path."
 
@@ -1367,124 +1414,134 @@
     "Matmul-ready batched im2col: [N,C,H,W] -> [N*OH_OW, C*KH*KW].
     Loop order n,oh,ow,c,kh,kw -- output writes are sequential per row."
     (let* ((fan-in (* C KH KW))
+           (KH*KW  (* KH KW))
            (H*W    (* H W))
            (C*H*W  (* C H W)))
       (case dtype
         ((f32)
-         (do ((n 0 (+ n 1))) ((= n N))
-           (let ((n-src (* n C*H*W))
-                 (n-row (* n OH OW)))
-             (do ((oh 0 (+ oh 1))
-                  (ih0 (- 0 PH) (+ ih0 SH)))
-                 ((= oh OH))
-               (do ((ow 0 (+ ow 1))
-                    (iw0 (- 0 PW) (+ iw0 SW)))
-                   ((= ow OW))
-                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in))
-                       (col-idx  0))
-                   (do ((c 0 (+ c 1))) ((= c C))
+         (for-range (n N)
+           (let ((n-src (* n C*H*W)) (n-row (* n OH OW)))
+             (for-stride (oh OH) ((ih0 (- 0 PH) SH))
+               (for-stride (ow OW) ((iw0 (- 0 PW) SW))
+                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (for-stride (c C) ((c-col-base row-base KH*KW))
                      (let ((c-base (+ n-src (* c H*W))))
-                       (do ((kh 0 (+ kh 1))
-                            (ih ih0 (+ ih 1)))
-                           ((= kh KH))
+                       (for-stride (kh KH) ((ih ih0 1) (kh-col-base c-col-base KW))
                          (let* ((ih-ok? (and (>= ih 0) (< ih H)))
                                 (ih-W   (if ih-ok? (* ih W) 0)))
-                           (do ((kw 0 (+ kw 1))
-                                (iw iw0 (+ iw 1)))
-                               ((= kw KW))
-                             (f32vector-set! out-buf (+ row-base col-idx)
+                           (for-stride (kw KW) ((iw iw0 1) (col-i kh-col-base 1))
+                             (f32vector-set! out-buf col-i
                                (if (and ih-ok? (>= iw 0) (< iw W))
                                    (f32vector-ref src-data (+ c-base ih-W iw))
-                                   0.0))
-                             (set! col-idx (+ col-idx 1))))))))))))
-         )
+                                   0.0)))))))))))))
         ((f64)
-         (do ((n 0 (+ n 1))) ((= n N))
-           (let ((n-src (* n C*H*W))
-                 (n-row (* n OH OW)))
-             (do ((oh 0 (+ oh 1))
-                  (ih0 (- 0 PH) (+ ih0 SH)))
-                 ((= oh OH))
-               (do ((ow 0 (+ ow 1))
-                    (iw0 (- 0 PW) (+ iw0 SW)))
-                   ((= ow OW))
-                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in))
-                       (col-idx  0))
-                   (do ((c 0 (+ c 1))) ((= c C))
+         (for-range (n N)
+           (let ((n-src (* n C*H*W)) (n-row (* n OH OW)))
+             (for-stride (oh OH) ((ih0 (- 0 PH) SH))
+               (for-stride (ow OW) ((iw0 (- 0 PW) SW))
+                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (for-stride (c C) ((c-col-base row-base KH*KW))
                      (let ((c-base (+ n-src (* c H*W))))
-                       (do ((kh 0 (+ kh 1))
-                            (ih ih0 (+ ih 1)))
-                           ((= kh KH))
+                       (for-stride (kh KH) ((ih ih0 1) (kh-col-base c-col-base KW))
                          (let* ((ih-ok? (and (>= ih 0) (< ih H)))
                                 (ih-W   (if ih-ok? (* ih W) 0)))
-                           (do ((kw 0 (+ kw 1))
-                                (iw iw0 (+ iw 1)))
-                               ((= kw KW))
-                             (f64vector-set! out-buf (+ row-base col-idx)
+                           (for-stride (kw KW) ((iw iw0 1) (col-i kh-col-base 1))
+                             (f64vector-set! out-buf col-i
                                (if (and ih-ok? (>= iw 0) (< iw W))
                                    (f64vector-ref src-data (+ c-base ih-W iw))
-                                   0.0))
-                             (set! col-idx (+ col-idx 1))))))))))))
-         )
+                                   0.0)))))))))))))
         (else (error "execute-im2col-batched-mr: unsupported dtype" dtype)))))
 
   (define (execute-im2col-nhwc-mr out-buf src-data N C H W KH KW SH SW PH PW OH OW dtype)
     "Matmul-ready NHWC im2col: [N,H,W,C] -> [N*OH_OW, C*KH*KW].
     Reads are sequential in C for fixed (n,oh,ow,kh,kw) -- better cache behavior."
     (let* ((fan-in (* C KH KW))
-           (H*W    (* H W))
+           (KH*KW  (* KH KW))
            (H*W*C  (* H W C)))
+      (case dtype
+        ((f32)
+         (for-range (n N)
+           (let ((n-src (* n H*W*C)) (n-row (* n OH OW)))
+             (for-stride (oh OH) ((ih0 (- 0 PH) SH))
+               (for-stride (ow OW) ((iw0 (- 0 PW) SW))
+                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (for-stride (c C) ((c-col-base row-base KH*KW))
+                     (for-stride (kh KH) ((ih ih0 1) (kh-col-base c-col-base KW))
+                       (let ((ih-ok? (and (>= ih 0) (< ih H))))
+                         (for-stride (kw KW) ((iw iw0 1) (col-i kh-col-base 1))
+                           (f32vector-set! out-buf col-i
+                             (if (and ih-ok? (>= iw 0) (< iw W))
+                                 (f32vector-ref src-data (+ n-src (* (+ (* ih W) iw) C) c))
+                                 0.0))))))))))))
+        ((f64)
+         (for-range (n N)
+           (let ((n-src (* n H*W*C)) (n-row (* n OH OW)))
+             (for-stride (oh OH) ((ih0 (- 0 PH) SH))
+               (for-stride (ow OW) ((iw0 (- 0 PW) SW))
+                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (for-stride (c C) ((c-col-base row-base KH*KW))
+                     (for-stride (kh KH) ((ih ih0 1) (kh-col-base c-col-base KW))
+                       (let ((ih-ok? (and (>= ih 0) (< ih H))))
+                         (for-stride (kw KW) ((iw iw0 1) (col-i kh-col-base 1))
+                           (f64vector-set! out-buf col-i
+                             (if (and ih-ok? (>= iw 0) (< iw W))
+                                 (f64vector-ref src-data (+ n-src (* (+ (* ih W) iw) C) c))
+                                 0.0))))))))))))
+        (else (error "execute-im2col-nhwc-mr: unsupported dtype" dtype)))))
+
+  (define (execute-im2col-nhwc-classic out-buf src-data N C H W KH KW SH SW PH PW OH OW dtype)
+    "Classic NHWC im2col: [N,H,W,C] -> [N, C*KH*KW, OH*OW].
+    Loop (n,c,kh,kw,oh,ow): writes stride-1 (sequential), reads stride-C in ow."
+    (let* ((col-rows (* C KH KW))
+           (col-cols (* OH OW))
+           (H*W      (* H W))
+           (H*W*C    (* H W C)))
       (case dtype
         ((f32)
          (do ((n 0 (+ n 1))) ((= n N))
            (let ((n-src (* n H*W*C))
-                 (n-row (* n OH OW)))
-             (do ((oh 0 (+ oh 1))
-                  (ih0 (- 0 PH) (+ ih0 SH)))
-                 ((= oh OH))
-               (do ((ow 0 (+ ow 1))
-                    (iw0 (- 0 PW) (+ iw0 SW)))
-                   ((= ow OW))
-                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in)))
-                   (do ((c 0 (+ c 1))) ((= c C))
-                     (do ((kh 0 (+ kh 1))
-                          (ih ih0 (+ ih 1)))
-                         ((= kh KH))
-                       (let* ((ih-ok? (and (>= ih 0) (< ih H))))
-                         (do ((kw 0 (+ kw 1))
-                              (iw iw0 (+ iw 1)))
-                             ((= kw KW))
-                           (f32vector-set! out-buf (+ row-base (* c KH KW) (* kh KW) kw)
+                 (n-out (* n col-rows col-cols)))
+             (do ((c 0 (+ c 1))) ((= c C))
+               (do ((kh 0 (+ kh 1))) ((= kh KH))
+                 (do ((kw 0 (+ kw 1))) ((= kw KW))
+                   (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                          (row-base (+ n-out (* col-row col-cols))))
+                     (do ((oh 0 (+ oh 1))
+                          (ih (- kh PH) (+ ih SH)))
+                         ((= oh OH))
+                       (let* ((ih-ok?   (and (>= ih 0) (< ih H)))
+                              (ih-W     (if ih-ok? (* ih W) 0))
+                              (out-base (+ row-base (* oh OW))))
+                         (do ((ow 0 (+ ow 1))
+                              (iw (- kw PW) (+ iw SW)))
+                             ((= ow OW))
+                           (f32vector-set! out-buf (+ out-base ow)
                              (if (and ih-ok? (>= iw 0) (< iw W))
-                                 (f32vector-ref src-data
-                                   (+ n-src (* (+ (* ih W) iw) C) c))
+                                 (f32vector-ref src-data (+ n-src (* (+ ih-W iw) C) c))
                                  0.0))))))))))))
         ((f64)
          (do ((n 0 (+ n 1))) ((= n N))
            (let ((n-src (* n H*W*C))
-                 (n-row (* n OH OW)))
-             (do ((oh 0 (+ oh 1))
-                  (ih0 (- 0 PH) (+ ih0 SH)))
-                 ((= oh OH))
-               (do ((ow 0 (+ ow 1))
-                    (iw0 (- 0 PW) (+ iw0 SW)))
-                   ((= ow OW))
-                 (let ((row-base (* (+ n-row (* oh OW) ow) fan-in)))
-                   (do ((c 0 (+ c 1))) ((= c C))
-                     (do ((kh 0 (+ kh 1))
-                          (ih ih0 (+ ih 1)))
-                         ((= kh KH))
-                       (let* ((ih-ok? (and (>= ih 0) (< ih H))))
-                         (do ((kw 0 (+ kw 1))
-                              (iw iw0 (+ iw 1)))
-                             ((= kw KW))
-                           (f64vector-set! out-buf (+ row-base (* c KH KW) (* kh KW) kw)
+                 (n-out (* n col-rows col-cols)))
+             (do ((c 0 (+ c 1))) ((= c C))
+               (do ((kh 0 (+ kh 1))) ((= kh KH))
+                 (do ((kw 0 (+ kw 1))) ((= kw KW))
+                   (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                          (row-base (+ n-out (* col-row col-cols))))
+                     (do ((oh 0 (+ oh 1))
+                          (ih (- kh PH) (+ ih SH)))
+                         ((= oh OH))
+                       (let* ((ih-ok?   (and (>= ih 0) (< ih H)))
+                              (ih-W     (if ih-ok? (* ih W) 0))
+                              (out-base (+ row-base (* oh OW))))
+                         (do ((ow 0 (+ ow 1))
+                              (iw (- kw PW) (+ iw SW)))
+                             ((= ow OW))
+                           (f64vector-set! out-buf (+ out-base ow)
                              (if (and ih-ok? (>= iw 0) (< iw W))
-                                 (f64vector-ref src-data
-                                   (+ n-src (* (+ (* ih W) iw) C) c))
-                                 0.0)))))))))))
-         )
-        (else (error "execute-im2col-nhwc-mr: unsupported dtype" dtype)))))
+                                 (f64vector-ref src-data (+ n-src (* (+ ih-W iw) C) c))
+                                 0.0))))))))))))
+        (else (error "execute-im2col-nhwc-classic: unsupported dtype" dtype)))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Window Morphism Execution (im2col, Padding)
@@ -1605,12 +1662,12 @@
                 ((nchw-standard)
                  (execute-col2im-unbatched output-buffer shape col-data col-shape
                                            KH KW SH SW PH PW dtype))
-                ((nchw-mr)
-                 (execute-col2im-batched-mr output-buffer shape col-data col-shape
-                                            KH KW SH SW PH PW dtype))
-                ((nhwc-mr)
-                 (execute-col2im-nhwc-mr output-buffer shape col-data col-shape
+                ((nchw-classic)
+                 (execute-col2im-batched output-buffer shape col-data col-shape
                                          KH KW SH SW PH PW dtype))
+                ((nhwc-classic)
+                 (execute-col2im-nhwc-classic output-buffer shape col-data col-shape
+                                              KH KW SH SW PH PW dtype))
                 (else (error "col2im: unknown col-layout" col-layout))))
 
              (else (error "col2im operand must be concrete array")))))
@@ -1756,149 +1813,703 @@
          )
         (else (error "execute-col2im-batched: unsupported dtype" dtype)))))
 
-  (define (execute-col2im-batched-mr output-buffer output-shape
-                                     col-data col-shape
-                                     KH KW SH SW PH PW dtype)
-    "Fast col2im for matmul-ready col [N*OH_OW, fan_in] -> NCHW [N,C,H,W].
-    Scatter-accumulates: for each (n,oh,ow) row, iterates (c,kh,kw) columns."
-    (let* ((N         (vector-ref output-shape 0))
-           (C         (vector-ref output-shape 1))
-           (H         (vector-ref output-shape 2))
-           (W         (vector-ref output-shape 3))
-           (OH        (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
-           (OW        (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
-           (fan-in    (* C KH KW))
-           (H*W       (* H W))
-           (C*H*W     (* C H W))
-           (output-size (shape-size output-shape)))
-      (case dtype
-        ((f32)
-         (do ((i 0 (+ i 1))) ((= i output-size)) (f32vector-set! output-buffer i 0.0))
-         (do ((n 0 (+ n 1))) ((= n N))
-           (let ((n-out (* n C*H*W))
-                 (n-row (* n OH OW)))
-             (do ((oh 0 (+ oh 1))
-                  (ih0 (- 0 PH) (+ ih0 SH)))
-                 ((= oh OH))
-               (do ((ow 0 (+ ow 1))
-                    (iw0 (- 0 PW) (+ iw0 SW)))
-                   ((= ow OW))
-                 (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
-                   (do ((c 0 (+ c 1))) ((= c C))
-                     (let ((c-base (+ n-out (* c H*W))))
-                       (do ((kh 0 (+ kh 1))
-                            (ih ih0 (+ ih 1)))
-                           ((= kh KH))
-                         (when (and (>= ih 0) (< ih H))
-                           (let ((ih-W (* ih W)))
-                             (do ((kw 0 (+ kw 1))
-                                  (iw iw0 (+ iw 1)))
-                                 ((= kw KW))
-                               (when (and (>= iw 0) (< iw W))
-                                 (let ((out-i (+ c-base ih-W iw))
-                                       (col-i (+ col-base (* c KH KW) (* kh KW) kw)))
-                                   (f32vector-set! output-buffer out-i
-                                     (+ (f32vector-ref output-buffer out-i)
-                                        (f32vector-ref col-data col-i)))))))))))))))))
-        ((f64)
-         (do ((i 0 (+ i 1))) ((= i output-size)) (f64vector-set! output-buffer i 0.0))
-         (do ((n 0 (+ n 1))) ((= n N))
-           (let ((n-out (* n C*H*W))
-                 (n-row (* n OH OW)))
-             (do ((oh 0 (+ oh 1))
-                  (ih0 (- 0 PH) (+ ih0 SH)))
-                 ((= oh OH))
-               (do ((ow 0 (+ ow 1))
-                    (iw0 (- 0 PW) (+ iw0 SW)))
-                   ((= ow OW))
-                 (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
-                   (do ((c 0 (+ c 1))) ((= c C))
-                     (let ((c-base (+ n-out (* c H*W))))
-                       (do ((kh 0 (+ kh 1))
-                            (ih ih0 (+ ih 1)))
-                           ((= kh KH))
-                         (when (and (>= ih 0) (< ih H))
-                           (let ((ih-W (* ih W)))
-                             (do ((kw 0 (+ kw 1))
-                                  (iw iw0 (+ iw 1)))
-                                 ((= kw KW))
-                               (when (and (>= iw 0) (< iw W))
-                                 (let ((out-i (+ c-base ih-W iw))
-                                       (col-i (+ col-base (* c KH KW) (* kh KW) kw)))
-                                   (f64vector-set! output-buffer out-i
-                                     (+ (f64vector-ref output-buffer out-i)
-                                        (f64vector-ref col-data col-i)))))))))))))))))
-        (else (error "execute-col2im-batched-mr: unsupported dtype" dtype)))))
-
-  (define (execute-col2im-nhwc-mr output-buffer output-shape
-                                  col-data col-shape
-                                  KH KW SH SW PH PW dtype)
-    "Fast col2im for [N*OH_OW, fan_in] col -> NHWC [N,H,W,C].
-    Scatter-accumulates into channels-last layout."
+  (define (execute-col2im-nhwc-classic output-buffer output-shape
+                                       col-data col-shape
+                                       KH KW SH SW PH PW dtype)
+    "Classic col2im: [N, C*KH*KW, OH*OW] -> NHWC [N,H,W,C].
+    Reads stride-1 from col (sequential), scatter-add stride-C into NHWC output."
     (let* ((N         (vector-ref output-shape 0))
            (H         (vector-ref output-shape 1))
            (W         (vector-ref output-shape 2))
            (C         (vector-ref output-shape 3))
            (OH        (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
            (OW        (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
-           (fan-in    (* C KH KW))
+           (col-rows  (* C KH KW))
+           (col-cols  (* OH OW))
+           (H*W       (* H W))
            (H*W*C     (* H W C))
            (output-size (shape-size output-shape)))
       (case dtype
         ((f32)
-         (do ((i 0 (+ i 1))) ((= i output-size)) (f32vector-set! output-buffer i 0.0))
-         (do ((n 0 (+ n 1))) ((= n N))
-           (let ((n-out (* n H*W*C))
-                 (n-row (* n OH OW)))
-             (do ((oh 0 (+ oh 1))
-                  (ih0 (- 0 PH) (+ ih0 SH)))
-                 ((= oh OH))
-               (do ((ow 0 (+ ow 1))
-                    (iw0 (- 0 PW) (+ iw0 SW)))
-                   ((= ow OW))
+         (begin
+           (do ((i 0 (+ i 1))) ((= i output-size)) (f32vector-set! output-buffer i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-out (* n H*W*C))
+                   (n-col (* n col-rows col-cols)))
+               (do ((c 0 (+ c 1))) ((= c C))
+                 (do ((kh 0 (+ kh 1))) ((= kh KH))
+                   (do ((kw 0 (+ kw 1))) ((= kw KW))
+                     (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                            (cr-off   (+ n-col (* col-row col-cols))))
+                       (do ((oh 0 (+ oh 1))
+                            (ih (- kh PH) (+ ih SH)))
+                           ((= oh OH))
+                         (when (and (>= ih 0) (< ih H))
+                           (let ((col-base (+ cr-off (* oh OW))))
+                             (do ((ow 0 (+ ow 1))
+                                  (iw (- kw PW) (+ iw SW)))
+                                 ((= ow OW))
+                               (when (and (>= iw 0) (< iw W))
+                                 (let ((out-i (+ n-out (* (+ (* ih W) iw) C) c))
+                                       (col-i (+ col-base ow)))
+                                   (f32vector-set! output-buffer out-i
+                                                   (+ (f32vector-ref output-buffer out-i)
+                                                      (f32vector-ref col-data col-i)))))))))))))))
+           ))
+        ((f64)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i output-size)) (f64vector-set! output-buffer i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-out (* n H*W*C))
+                   (n-col (* n col-rows col-cols)))
+               (do ((c 0 (+ c 1))) ((= c C))
+                 (do ((kh 0 (+ kh 1))) ((= kh KH))
+                   (do ((kw 0 (+ kw 1))) ((= kw KW))
+                     (let* ((col-row  (+ (* c KH KW) (* kh KW) kw))
+                            (cr-off   (+ n-col (* col-row col-cols))))
+                       (do ((oh 0 (+ oh 1))
+                            (ih (- kh PH) (+ ih SH)))
+                           ((= oh OH))
+                         (when (and (>= ih 0) (< ih H))
+                           (let ((col-base (+ cr-off (* oh OW))))
+                             (do ((ow 0 (+ ow 1))
+                                  (iw (- kw PW) (+ iw SW)))
+                                 ((= ow OW))
+                               (when (and (>= iw 0) (< iw W))
+                                 (let ((out-i (+ n-out (* (+ (* ih W) iw) C) c))
+                                       (col-i (+ col-base ow)))
+                                   (f64vector-set! output-buffer out-i
+                                                   (+ (f64vector-ref output-buffer out-i)
+                                                      (f64vector-ref col-data col-i)))))))))))))))
+           ))
+        (else (error "execute-col2im-nhwc-classic: unsupported dtype" dtype)))))
+
+  (define (execute-col2im-batched-mr output-buffer output-shape
+                                     col-data col-shape
+                                     KH KW SH SW PH PW dtype)
+    "Scatter col2im for matmul-ready col [N*OH_OW, fan_in] -> NCHW [N,C,H,W].
+    Reads col sequentially per patch (cache-friendly for large fan_in); scattered dx writes."
+    (let* ((N          (vector-ref output-shape 0))
+           (C          (vector-ref output-shape 1))
+           (H          (vector-ref output-shape 2))
+           (W          (vector-ref output-shape 3))
+           (OH         (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
+           (OW         (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
+           (fan-in     (* C KH KW))
+           (KH*KW      (* KH KW))
+           (H*W        (* H W))
+           (C*H*W      (* C H W))
+           (output-size (shape-size output-shape)))
+      (case dtype
+        ((f32)
+         (begin
+           (for-range (i output-size) (f32vector-set! output-buffer i 0.0))
+           (for-range (n N)
+           (let ((n-out (* n C*H*W)) (n-row (* n OH OW)))
+             (for-stride (oh OH) ((ih0 (- 0 PH) SH))
+               (for-stride (ow OW) ((iw0 (- 0 PW) SW))
                  (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
-                   (do ((c 0 (+ c 1))) ((= c C))
-                     (do ((kh 0 (+ kh 1))
-                          (ih ih0 (+ ih 1)))
-                         ((= kh KH))
-                       (when (and (>= ih 0) (< ih H))
-                         (do ((kw 0 (+ kw 1))
-                              (iw iw0 (+ iw 1)))
-                             ((= kw KW))
-                           (when (and (>= iw 0) (< iw W))
-                             (let ((out-i (+ n-out (* (+ (* ih W) iw) C) c))
-                                   (col-i (+ col-base (* c KH KW) (* kh KW) kw)))
+                   (for-stride (c C) ((c-col-base col-base KH*KW))
+                     (let ((c-base (+ n-out (* c H*W))))
+                       (for-stride (kh KH) ((ih ih0 1) (kh-col-base c-col-base KW))
+                         (when-valid ih H
+                           (let ((ih-W (* ih W)))
+                             (for-stride (kw KW) ((iw iw0 1) (col-i kh-col-base 1))
+                               (when-valid iw W
+                                 (let ((out-i (+ c-base ih-W iw)))
+                                   (f32vector-set! output-buffer out-i
+                                     (+ (f32vector-ref output-buffer out-i)
+                                        (f32vector-ref col-data col-i))))))))))))))))))
+        ((f64)
+         (begin
+         (for-range (i output-size) (f64vector-set! output-buffer i 0.0))
+         (for-range (n N)
+           (let ((n-out (* n C*H*W)) (n-row (* n OH OW)))
+             (for-stride (oh OH) ((ih0 (- 0 PH) SH))
+               (for-stride (ow OW) ((iw0 (- 0 PW) SW))
+                 (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (for-stride (c C) ((c-col-base col-base KH*KW))
+                     (let ((c-base (+ n-out (* c H*W))))
+                       (for-stride (kh KH) ((ih ih0 1) (kh-col-base c-col-base KW))
+                         (when-valid ih H
+                           (let ((ih-W (* ih W)))
+                             (for-stride (kw KW) ((iw iw0 1) (col-i kh-col-base 1))
+                               (when-valid iw W
+                                 (let ((out-i (+ c-base ih-W iw)))
+                                   (f64vector-set! output-buffer out-i
+                                     (+ (f64vector-ref output-buffer out-i)
+                                        (f64vector-ref col-data col-i))))))))))))))))))
+        (else (error "execute-col2im-batched-mr: unsupported dtype" dtype)))))
+
+  (define (execute-col2im-nhwc-mr output-buffer output-shape
+                                  col-data col-shape
+                                  KH KW SH SW PH PW dtype)
+    "Scatter col2im for [N*OH_OW, fan_in] col -> NHWC [N,H,W,C].
+    Reads col sequentially per patch (cache-friendly for large fan_in); scattered dx writes."
+    (let* ((N          (vector-ref output-shape 0))
+           (H          (vector-ref output-shape 1))
+           (W          (vector-ref output-shape 2))
+           (C          (vector-ref output-shape 3))
+           (OH         (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH)))
+           (OW         (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))
+           (fan-in     (* C KH KW))
+           (KH*KW      (* KH KW))
+           (H*W*C      (* H W C))
+           (output-size (shape-size output-shape)))
+      (case dtype
+        ((f32)
+         (begin
+         (for-range (i output-size) (f32vector-set! output-buffer i 0.0))
+         (for-range (n N)
+           (let ((n-out (* n H*W*C)) (n-row (* n OH OW)))
+             (for-stride (oh OH) ((ih0 (- 0 PH) SH))
+               (for-stride (ow OW) ((iw0 (- 0 PW) SW))
+                 (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
+                   (for-stride (c C) ((c-col-base col-base KH*KW))
+                     (for-stride (kh KH) ((ih ih0 1) (kh-col-base c-col-base KW))
+                       (when-valid ih H
+                         (for-stride (kw KW) ((iw iw0 1) (col-i kh-col-base 1))
+                           (when-valid iw W
+                             (let ((out-i (+ n-out (* (+ (* ih W) iw) C) c)))
                                (f32vector-set! output-buffer out-i
                                  (+ (f32vector-ref output-buffer out-i)
-                                    (f32vector-ref col-data col-i)))))))))))))))
+                                    (f32vector-ref col-data col-i))))))))))))))))
         ((f64)
-         (do ((i 0 (+ i 1))) ((= i output-size)) (f64vector-set! output-buffer i 0.0))
-         (do ((n 0 (+ n 1))) ((= n N))
-           (let ((n-out (* n H*W*C))
-                 (n-row (* n OH OW)))
-             (do ((oh 0 (+ oh 1))
-                  (ih0 (- 0 PH) (+ ih0 SH)))
-                 ((= oh OH))
-               (do ((ow 0 (+ ow 1))
-                    (iw0 (- 0 PW) (+ iw0 SW)))
-                   ((= ow OW))
+         (begin
+         (for-range (i output-size) (f64vector-set! output-buffer i 0.0))
+         (for-range (n N)
+           (let ((n-out (* n H*W*C)) (n-row (* n OH OW)))
+             (for-stride (oh OH) ((ih0 (- 0 PH) SH))
+               (for-stride (ow OW) ((iw0 (- 0 PW) SW))
                  (let ((col-base (* (+ n-row (* oh OW) ow) fan-in)))
-                   (do ((c 0 (+ c 1))) ((= c C))
-                     (do ((kh 0 (+ kh 1))
-                          (ih ih0 (+ ih 1)))
-                         ((= kh KH))
-                       (when (and (>= ih 0) (< ih H))
-                         (do ((kw 0 (+ kw 1))
-                              (iw iw0 (+ iw 1)))
-                             ((= kw KW))
-                           (when (and (>= iw 0) (< iw W))
-                             (let ((out-i (+ n-out (* (+ (* ih W) iw) C) c))
-                                   (col-i (+ col-base (* c KH KW) (* kh KW) kw)))
+                   (for-stride (c C) ((c-col-base col-base KH*KW))
+                     (for-stride (kh KH) ((ih ih0 1) (kh-col-base c-col-base KW))
+                       (when-valid ih H
+                         (for-stride (kw KW) ((iw iw0 1) (col-i kh-col-base 1))
+                           (when-valid iw W
+                             (let ((out-i (+ n-out (* (+ (* ih W) iw) C) c)))
                                (f64vector-set! output-buffer out-i
                                  (+ (f64vector-ref output-buffer out-i)
-                                    (f64vector-ref col-data col-i)))))))))))))))
+                                    (f64vector-ref col-data col-i))))))))))))))))
         (else (error "execute-col2im-nhwc-mr: unsupported dtype" dtype)))))
 
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Implicit GEMM convolution: no intermediate col buffer
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (execute-conv-fwd-nchw out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype)
+    "Fused im2col+GEMM+bias for NCHW input. wt is [fan_in, out_ch] (W transposed).
+    Output [N*OH_OW, out_ch]. Outer (n,oh,ow)/inner (c,kh,kw)/innermost (co).
+    src_val is hoisted above co loop; wt reads and out writes are stride-1."
+    (let* ((fan-in (* C KH KW))
+           (C*H*W  (* C H W))
+           (H*W    (* H W))
+           (OH*OW  (* OH OW)))
+      (case dtype
+        ((f32)
+         (begin
+           ;; Initialize output rows to bias
+           (do ((m 0 (+ m 1))) ((= m (* N OH*OW)))
+             (let ((out-base (* m out-ch)))
+               (do ((co 0 (+ co 1))) ((= co out-ch))
+                 (f32vector-set! out-buf (+ out-base co) (f32vector-ref b co)))))
+           ;; Accumulate: outer (n,oh,ow) / inner (c,kh,kw) / innermost (co)
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n C*H*W))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((row-base (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx  0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (let ((c-base (+ n-src (* c H*W))))
+                         (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                           (if (and (>= ih 0) (< ih H))
+                               (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                                 (let* ((src-val (if (and (>= iw 0) (< iw W))
+                                                     (f32vector-ref src (+ c-base (* ih W) iw))
+                                                     0.0))
+                                        (wt-base (* col-idx out-ch)))
+                                   (do ((co 0 (+ co 1))) ((= co out-ch))
+                                     (f32vector-set! out-buf (+ row-base co)
+                                                     (+ (f32vector-ref out-buf (+ row-base co))
+                                                        (* src-val (f32vector-ref wt (+ wt-base co))))))
+                                   (set! col-idx (+ col-idx 1))))
+                               (set! col-idx (+ col-idx KW)))))))))))
+           ))
+        ((f64)
+         (begin
+           (do ((m 0 (+ m 1))) ((= m (* N OH*OW)))
+             (let ((out-base (* m out-ch)))
+               (do ((co 0 (+ co 1))) ((= co out-ch))
+                 (f64vector-set! out-buf (+ out-base co) (f64vector-ref b co)))))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n C*H*W))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((row-base (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx  0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (let ((c-base (+ n-src (* c H*W))))
+                         (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                           (if (and (>= ih 0) (< ih H))
+                               (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                                 (let* ((src-val (if (and (>= iw 0) (< iw W))
+                                                     (f64vector-ref src (+ c-base (* ih W) iw))
+                                                     0.0))
+                                        (wt-base (* col-idx out-ch)))
+                                   (do ((co 0 (+ co 1))) ((= co out-ch))
+                                     (f64vector-set! out-buf (+ row-base co)
+                                                     (+ (f64vector-ref out-buf (+ row-base co))
+                                                        (* src-val (f64vector-ref wt (+ wt-base co))))))
+                                   (set! col-idx (+ col-idx 1))))
+                               (set! col-idx (+ col-idx KW)))))))))))
+           ))
+        (else (error "execute-conv-fwd-nchw: unsupported dtype" dtype)))))
+
+  (define (execute-conv-fwd-nhwc out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype)
+    "Fused im2col+GEMM+bias for NHWC [N,H,W,C] input. wt is [fan_in, out_ch]."
+    (let* ((fan-in (* C KH KW))
+           (H*W    (* H W))
+           (H*W*C  (* H W C))
+           (OH*OW  (* OH OW)))
+      (case dtype
+        ((f32)
+         (begin
+           (do ((m 0 (+ m 1))) ((= m (* N OH*OW)))
+             (let ((out-base (* m out-ch)))
+               (do ((co 0 (+ co 1))) ((= co out-ch))
+                 (f32vector-set! out-buf (+ out-base co) (f32vector-ref b co)))))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n H*W*C))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((row-base (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx  0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                         (if (and (>= ih 0) (< ih H))
+                             (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                               (let* ((src-val (if (and (>= iw 0) (< iw W))
+                                                   (f32vector-ref src (+ n-src (* (+ (* ih W) iw) C) c))
+                                                   0.0))
+                                      (wt-base (* col-idx out-ch)))
+                                 (do ((co 0 (+ co 1))) ((= co out-ch))
+                                   (f32vector-set! out-buf (+ row-base co)
+                                                   (+ (f32vector-ref out-buf (+ row-base co))
+                                                      (* src-val (f32vector-ref wt (+ wt-base co))))))
+                                 (set! col-idx (+ col-idx 1))))
+                             (set! col-idx (+ col-idx KW))))))))))
+           ))
+        ((f64)
+         (begin
+           (do ((m 0 (+ m 1))) ((= m (* N OH*OW)))
+             (let ((out-base (* m out-ch)))
+               (do ((co 0 (+ co 1))) ((= co out-ch))
+                 (f64vector-set! out-buf (+ out-base co) (f64vector-ref b co)))))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n H*W*C))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((row-base (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx  0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                         (if (and (>= ih 0) (< ih H))
+                             (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                               (let* ((src-val (if (and (>= iw 0) (< iw W))
+                                                   (f64vector-ref src (+ n-src (* (+ (* ih W) iw) C) c))
+                                                   0.0))
+                                      (wt-base (* col-idx out-ch)))
+                                 (do ((co 0 (+ co 1))) ((= co out-ch))
+                                   (f64vector-set! out-buf (+ row-base co)
+                                                   (+ (f64vector-ref out-buf (+ row-base co))
+                                                      (* src-val (f64vector-ref wt (+ wt-base co))))))
+                                 (set! col-idx (+ col-idx 1))))
+                             (set! col-idx (+ col-idx KW))))))))))
+           ))
+        (else (error "execute-conv-fwd-nhwc: unsupported dtype" dtype)))))
+
+  (define (execute-conv-bwd-data-nchw dx-buf x-shape g-data g-shape wt-data
+                                       N C H W KH KW SH SW PH PW OH OW out-ch dtype)
+    "Backward w.r.t. X for NCHW: dX[n,c,ih,iw] += g[m,co]*WT[col_idx,co].
+    g reads and wt reads are stride-1 per co."
+    (let* ((C*H*W  (* C H W))
+           (H*W    (* H W))
+           (OH*OW  (* OH OW))
+           (dx-size (shape-size x-shape)))
+      (case dtype
+        ((f32)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i dx-size)) (f32vector-set! dx-buf i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n C*H*W))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((g-base  (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx 0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (let ((c-base (+ n-src (* c H*W))))
+                         (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                           (if (and (>= ih 0) (< ih H))
+                               (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                                 (when (and (>= iw 0) (< iw W))
+                                   (let ((dx-i   (+ c-base (* ih W) iw))
+                                         (wt-base (* col-idx out-ch)))
+                                     (do ((co 0 (+ co 1))) ((= co out-ch))
+                                       (f32vector-set! dx-buf dx-i
+                                                       (+ (f32vector-ref dx-buf dx-i)
+                                                          (* (f32vector-ref g-data  (+ g-base  co))
+                                                             (f32vector-ref wt-data (+ wt-base co)))))))
+                                   (set! col-idx (+ col-idx 1))))
+                               (set! col-idx (+ col-idx KW)))))))))))
+           ))
+        ((f64)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i dx-size)) (f64vector-set! dx-buf i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n C*H*W))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((g-base  (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx 0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (let ((c-base (+ n-src (* c H*W))))
+                         (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                           (if (and (>= ih 0) (< ih H))
+                               (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                                 (when (and (>= iw 0) (< iw W))
+                                   (let ((dx-i   (+ c-base (* ih W) iw))
+                                         (wt-base (* col-idx out-ch)))
+                                     (do ((co 0 (+ co 1))) ((= co out-ch))
+                                       (f64vector-set! dx-buf dx-i
+                                                       (+ (f64vector-ref dx-buf dx-i)
+                                                          (* (f64vector-ref g-data  (+ g-base  co))
+                                                             (f64vector-ref wt-data (+ wt-base co)))))))
+                                   (set! col-idx (+ col-idx 1))))
+                               (set! col-idx (+ col-idx KW)))))))))))
+           ))
+        
+        (else (error "execute-conv-bwd-data-nchw: unsupported dtype" dtype)))))
+      
+  (define (execute-conv-bwd-data-nhwc dx-buf x-shape g-data g-shape wt-data
+                                       N C H W KH KW SH SW PH PW OH OW out-ch dtype)
+    "Backward w.r.t. X for NHWC: dX[n,ih,iw,c] += g[m,co]*WT[col_idx,co]."
+    (let* ((H*W*C  (* H W C))
+           (OH*OW  (* OH OW))
+           (dx-size (shape-size x-shape)))
+      (case dtype
+        ((f32)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i dx-size)) (f32vector-set! dx-buf i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n H*W*C))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((g-base  (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx 0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                         (if (and (>= ih 0) (< ih H))
+                             (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                               (when (and (>= iw 0) (< iw W))
+                                 (let ((dx-i   (+ n-src (* (+ (* ih W) iw) C) c))
+                                       (wt-base (* col-idx out-ch)))
+                                   (do ((co 0 (+ co 1))) ((= co out-ch))
+                                     (f32vector-set! dx-buf dx-i
+                                                     (+ (f32vector-ref dx-buf dx-i)
+                                                        (* (f32vector-ref g-data  (+ g-base  co))
+                                                           (f32vector-ref wt-data (+ wt-base co)))))))
+                                 (set! col-idx (+ col-idx 1))))
+                             (set! col-idx (+ col-idx KW)))))))))
+             ))
+         )
+        ((f64)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i dx-size)) (f64vector-set! dx-buf i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n H*W*C))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((g-base  (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx 0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                         (if (and (>= ih 0) (< ih H))
+                             (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                               (when (and (>= iw 0) (< iw W))
+                                 (let ((dx-i   (+ n-src (* (+ (* ih W) iw) C) c))
+                                       (wt-base (* col-idx out-ch)))
+                                   (do ((co 0 (+ co 1))) ((= co out-ch))
+                                     (f64vector-set! dx-buf dx-i
+                                                     (+ (f64vector-ref dx-buf dx-i)
+                                                        (* (f64vector-ref g-data  (+ g-base  co))
+                                                           (f64vector-ref wt-data (+ wt-base co)))))))
+                                 (set! col-idx (+ col-idx 1))))
+                             (set! col-idx (+ col-idx KW))))))))))
+           ))
+        (else (error "execute-conv-bwd-data-nhwc: unsupported dtype" dtype)))))
+
+  (define (execute-conv-bwd-weights-nchw dwt-buf wt-shape g-data g-shape src-data
+                                          N C H W KH KW SH SW PH PW OH OW out-ch dtype)
+    "Backward w.r.t. WT for NCHW: dwt[col_idx,co] += g[m,co]*src_val.
+    src_val hoisted above co loop; dwt and g writes/reads are stride-1."
+    (let* ((C*H*W  (* C H W))
+           (H*W    (* H W))
+           (OH*OW  (* OH OW))
+           (dwt-size (shape-size wt-shape)))
+      (case dtype
+        ((f32)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i dwt-size)) (f32vector-set! dwt-buf i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n C*H*W))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((g-base  (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx 0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (let ((c-base (+ n-src (* c H*W))))
+                         (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                           (if (and (>= ih 0) (< ih H))
+                               (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                                 (let* ((src-val (if (and (>= iw 0) (< iw W))
+                                                     (f32vector-ref src-data (+ c-base (* ih W) iw))
+                                                     0.0))
+                                        (wt-base (* col-idx out-ch)))
+                                   (do ((co 0 (+ co 1))) ((= co out-ch))
+                                     (f32vector-set! dwt-buf (+ wt-base co)
+                                                     (+ (f32vector-ref dwt-buf (+ wt-base co))
+                                                        (* (f32vector-ref g-data (+ g-base co)) src-val))))
+                                   (set! col-idx (+ col-idx 1))))
+                               (set! col-idx (+ col-idx KW)))))))))))
+           ))
+        ((f64)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i dwt-size)) (f64vector-set! dwt-buf i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n C*H*W))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((g-base  (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx 0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (let ((c-base (+ n-src (* c H*W))))
+                         (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                           (if (and (>= ih 0) (< ih H))
+                               (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                                 (let* ((src-val (if (and (>= iw 0) (< iw W))
+                                                     (f64vector-ref src-data (+ c-base (* ih W) iw))
+                                                     0.0))
+                                        (wt-base (* col-idx out-ch)))
+                                   (do ((co 0 (+ co 1))) ((= co out-ch))
+                                     (f64vector-set! dwt-buf (+ wt-base co)
+                                                     (+ (f64vector-ref dwt-buf (+ wt-base co))
+                                                        (* (f64vector-ref g-data (+ g-base co)) src-val))))
+                                   (set! col-idx (+ col-idx 1))))
+                               (set! col-idx (+ col-idx KW)))))))))))
+           ))
+        (else (error "execute-conv-bwd-weights-nchw: unsupported dtype" dtype))
+        )
+      ))
+
+  (define (execute-conv-bwd-weights-nhwc dwt-buf wt-shape g-data g-shape src-data
+                                          N C H W KH KW SH SW PH PW OH OW out-ch dtype)
+    "Backward w.r.t. WT for NHWC: dwt[col_idx,co] += g[m,co]*src[n,ih,iw,c]."
+    (let* ((H*W*C  (* H W C))
+           (OH*OW  (* OH OW))
+           (dwt-size (shape-size wt-shape)))
+      (case dtype
+        ((f32)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i dwt-size)) (f32vector-set! dwt-buf i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n H*W*C))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((g-base  (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx 0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                         (if (and (>= ih 0) (< ih H))
+                             (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                               (let* ((src-val (if (and (>= iw 0) (< iw W))
+                                                   (f32vector-ref src-data (+ n-src (* (+ (* ih W) iw) C) c))
+                                                   0.0))
+                                      (wt-base (* col-idx out-ch)))
+                                 (do ((co 0 (+ co 1))) ((= co out-ch))
+                                   (f32vector-set! dwt-buf (+ wt-base co)
+                                                   (+ (f32vector-ref dwt-buf (+ wt-base co))
+                                                      (* (f32vector-ref g-data (+ g-base co)) src-val))))
+                                 (set! col-idx (+ col-idx 1))))
+                             (set! col-idx (+ col-idx KW)))))))))
+             ))
+         )
+        ((f64)
+         (begin
+           (do ((i 0 (+ i 1))) ((= i dwt-size)) (f64vector-set! dwt-buf i 0.0))
+           (do ((n 0 (+ n 1))) ((= n N))
+             (let ((n-src (* n H*W*C))
+                   (n-row (* n OH*OW)))
+               (do ((oh 0 (+ oh 1)) (ih0 (- 0 PH) (+ ih0 SH))) ((= oh OH))
+                 (do ((ow 0 (+ ow 1)) (iw0 (- 0 PW) (+ iw0 SW))) ((= ow OW))
+                   (let ((g-base  (* (+ n-row (* oh OW) ow) out-ch))
+                         (col-idx 0))
+                     (do ((c 0 (+ c 1))) ((= c C))
+                       (do ((kh 0 (+ kh 1)) (ih ih0 (+ ih 1))) ((= kh KH))
+                         (if (and (>= ih 0) (< ih H))
+                             (do ((kw 0 (+ kw 1)) (iw iw0 (+ iw 1))) ((= kw KW))
+                               (let* ((src-val (if (and (>= iw 0) (< iw W))
+                                                   (f64vector-ref src-data (+ n-src (* (+ (* ih W) iw) C) c))
+                                                   0.0))
+                                      (wt-base (* col-idx out-ch)))
+                                 (do ((co 0 (+ co 1))) ((= co out-ch))
+                                   (f64vector-set! dwt-buf (+ wt-base co)
+                                                   (+ (f64vector-ref dwt-buf (+ wt-base co))
+                                                      (* (f64vector-ref g-data (+ g-base co)) src-val))))
+                                 (set! col-idx (+ col-idx 1))))
+                             (set! col-idx (+ col-idx KW)))))))))
+             ))
+         )
+        (else (error "execute-conv-bwd-weights-nhwc: unsupported dtype" dtype)))))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; BLAS-Backed Convolution Execute Functions
+  ;;;
+  ;;; All three ops use the matmul-ready [N*OHOW, fan_in] col layout so that
+  ;;; each operation maps to a single BLAS gemm call (no N-loop, no offsets).
+  ;;; col buffer is freshly allocated per call.
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (%conv-blas-gemm backend dtype M N K alpha A B beta C)
+    "Select and call the dtype-appropriate gemm kernel from backend."
+    (let ((fn (if (eq? dtype 'f64)
+                  (blas-backend-gemm-f64 backend)
+                  (blas-backend-gemm-f32 backend))))
+      (fn M N K alpha A B beta C)))
+
+  (define (%conv-blas-gemm-strided backend dtype M N K alpha A lda transa B ldb transb beta C)
+    "Select and call the dtype-appropriate gemm-strided kernel from backend."
+    (let ((fn (if (eq? dtype 'f64)
+                  (blas-backend-gemm-strided-f64 backend)
+                  (blas-backend-gemm-strided-f32 backend))))
+      (fn M N K alpha A lda transa B ldb transb beta C)))
+
+  (define (execute-conv-fwd-blas out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype
+                                 #!optional (pre-col #f))
+    "Forward conv via im2col-mr + single BLAS gemm + bias.
+    col[M, fan_in] = im2col-mr(src);  out[M, out_ch] = col @ wt;  out += bias.
+    pre-col: optional pre-allocated scratch buffer of size M*fan_in."
+    (let* ((fan-in (* C KH KW))
+           (M      (* N OH OW))
+           (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
+           (be     (active-blas-backend)))
+      (execute-im2col-batched-mr col src N C H W KH KW SH SW PH PW OH OW dtype)
+      (%conv-blas-gemm be dtype M out-ch fan-in 1.0 col wt 0.0 out-buf)
+      (if (eq? dtype 'f64)
+          (do ((m 0 (+ m 1))) ((= m M))
+            (let ((base (* m out-ch)))
+              (do ((co 0 (+ co 1))) ((= co out-ch))
+                (f64vector-set! out-buf (+ base co)
+                  (+ (f64vector-ref out-buf (+ base co))
+                     (f64vector-ref b co))))))
+          (do ((m 0 (+ m 1))) ((= m M))
+            (let ((base (* m out-ch)))
+              (do ((co 0 (+ co 1))) ((= co out-ch))
+                (f32vector-set! out-buf (+ base co)
+                  (+ (f32vector-ref out-buf (+ base co))
+                     (f32vector-ref b co)))))))))
+
+  (define (execute-conv-fwd-nhwc-blas out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype
+                                      #!optional (pre-col #f))
+    "Forward conv via im2col-nhwc-mr + single BLAS gemm + bias (NHWC input)."
+    (let* ((fan-in (* C KH KW))
+           (M      (* N OH OW))
+           (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
+           (be     (active-blas-backend)))
+      (execute-im2col-nhwc-mr col src N C H W KH KW SH SW PH PW OH OW dtype)
+      (%conv-blas-gemm be dtype M out-ch fan-in 1.0 col wt 0.0 out-buf)
+      (if (eq? dtype 'f64)
+          (do ((m 0 (+ m 1))) ((= m M))
+            (let ((base (* m out-ch)))
+              (do ((co 0 (+ co 1))) ((= co out-ch))
+                (f64vector-set! out-buf (+ base co)
+                  (+ (f64vector-ref out-buf (+ base co))
+                     (f64vector-ref b co))))))
+          (do ((m 0 (+ m 1))) ((= m M))
+            (let ((base (* m out-ch)))
+              (do ((co 0 (+ co 1))) ((= co out-ch))
+                (f32vector-set! out-buf (+ base co)
+                  (+ (f32vector-ref out-buf (+ base co))
+                     (f32vector-ref b co)))))))))
+
+  (define (execute-conv-bwd-data-blas dx-buf x-shape g-data g-shape wt-data
+                                       N C H W KH KW SH SW PH PW OH OW out-ch dtype
+                                       #!optional (pre-col #f))
+    "Backward w.r.t. X via single BLAS gemm (g @ wt^T) + col2im-mr.
+    col[M, fan_in] = g[M, out_ch] @ wt[fan_in, out_ch]^T;  dx = col2im-mr(col)."
+    (let* ((fan-in (* C KH KW))
+           (M      (* N OH OW))
+           (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
+           (be     (active-blas-backend)))
+      (%conv-blas-gemm-strided be dtype M fan-in out-ch
+                               1.0 g-data out-ch 'no-trans
+                               wt-data out-ch 'trans
+                               0.0 col)
+      (execute-col2im-batched-mr dx-buf x-shape col (vector M fan-in) KH KW SH SW PH PW dtype)))
+
+  (define (execute-conv-bwd-data-nhwc-blas dx-buf x-shape g-data g-shape wt-data
+                                            N C H W KH KW SH SW PH PW OH OW out-ch dtype
+                                            #!optional (pre-col #f))
+    "Backward w.r.t. X via single BLAS gemm (g @ wt^T) + col2im-nhwc-mr (NHWC output)."
+    (let* ((fan-in (* C KH KW))
+           (M      (* N OH OW))
+           (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
+           (be     (active-blas-backend)))
+      (%conv-blas-gemm-strided be dtype M fan-in out-ch
+                               1.0 g-data out-ch 'no-trans
+                               wt-data out-ch 'trans
+                               0.0 col)
+      (execute-col2im-nhwc-mr dx-buf x-shape col (vector M fan-in) KH KW SH SW PH PW dtype)))
+
+  (define (execute-conv-bwd-weights-blas dwt-buf wt-shape g-data g-shape src-data
+                                          N C H W KH KW SH SW PH PW OH OW out-ch dtype
+                                          #!optional (pre-col #f))
+    "Backward w.r.t. WT via im2col-mr + single BLAS gemm (col^T @ g).
+    col[M, fan_in] = im2col-mr(src);  dwt[fan_in, out_ch] = col^T @ g[M, out_ch]."
+    (let* ((fan-in (* C KH KW))
+           (M      (* N OH OW))
+           (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
+           (be     (active-blas-backend)))
+      (execute-im2col-batched-mr col src-data N C H W KH KW SH SW PH PW OH OW dtype)
+      (%conv-blas-gemm-strided be dtype fan-in out-ch M
+                               1.0 col fan-in 'trans
+                               g-data out-ch 'no-trans
+                               0.0 dwt-buf)))
+
+  (define (execute-conv-bwd-weights-nhwc-blas dwt-buf wt-shape g-data g-shape src-data
+                                               N C H W KH KW SH SW PH PW OH OW out-ch dtype
+                                               #!optional (pre-col #f))
+    "Backward w.r.t. WT via im2col-nhwc-mr + single BLAS gemm (col^T @ g) (NHWC input)."
+    (let* ((fan-in (* C KH KW))
+           (M      (* N OH OW))
+           (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
+           (be     (active-blas-backend)))
+      (execute-im2col-nhwc-mr col src-data N C H W KH KW SH SW PH PW OH OW dtype)
+      (%conv-blas-gemm-strided be dtype fan-in out-ch M
+                               1.0 col fan-in 'trans
+                               g-data out-ch 'no-trans
+                               0.0 dwt-buf)))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Reduction Morphism Execution

@@ -491,8 +491,8 @@
   (test-assert "im2col batched shape"
     (let* ((m (morph-from-list (make-list 72 1) #(4 2 3 3) 'f64 batch-axis: 0))
            (col (im2col-morph m '(2 2) 1 0)))
-      ;; N=4, C=2, KH=KW=2, OH=OW=2 -> (N*OH*OW, C*KH*KW) = (16, 8)
-      (shapes-equal? #(16 8) (get-morphism-shape col))))
+      ;; N=4, C=2, KH=KW=2, OH=OW=2 -> classic [N, fan_in, OH_OW] = [4, 8, 4]
+      (shapes-equal? #(4 8 4) (get-morphism-shape col))))
   
   (test-assert "im2col with stride"
     (let* ((m (morph-from-list (make-list 50 1) #(2 5 5) 'f64))
@@ -573,8 +573,8 @@
                  (= -1 (get-morphism-batch-axis im))))
   
   (test-assert "col2im batched"
-    ;; N=4, C=2, H=3, W=3, KH=KW=2, OH=OW=2 -> col shape [N*OH*OW, C*KH*KW] = [16, 8]
-    (let* ((col (morph-from-list (make-list 128 1) #(16 8) 'f64 batch-axis: 0))
+    ;; N=4, C=2, H=3, W=3, KH=KW=2, OH=OW=2 -> col shape [N, C*KH*KW, OH*OW] = [4, 8, 4]
+    (let* ((col (morph-from-list (make-list 128 1) #(4 8 4) 'f64 batch-axis: 0))
            (im (col2im-morph col #(4 2 3 3) '(2 2))))
       (= 0 (get-morphism-batch-axis im))))
   
