@@ -668,6 +668,13 @@
 ;;; Group 10: Configuration and Backend Record
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; A real backend (microBLAS) is now auto-registered by default (see
+;; realization.scm's bootstrap), so this group's "no backend registered"
+;; baseline assertions must save/restore *active-backend* around the whole
+;; group rather than assuming a pristine #f starting state.
+(let ((saved-backend *active-backend*))
+  (set! *active-backend* #f)
+
 (test-group "Phase 2 - Configuration and Backend Record"
 
   (test-assert "blas-enabled? is true initially"
@@ -698,7 +705,7 @@
 
   (test-assert "make-blas-backend constructs a record with correct name"
     (let ((b (make-blas-backend 'test-backend
-                #f #f #f #f #f #f #f #f #f #f)))
+                #f #f #f #f #f #f #f #f #f #f #f #f #f)))
       (and (blas-backend? b)
            (eq? 'test-backend (blas-backend-name b)))))
 
@@ -706,7 +713,7 @@
     ;; Use a dummy procedure for all slots and verify retrieval.
     (let* ((dummy (lambda args 0))
            (b (make-blas-backend 'dummy-backend
-                dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy)))
+                dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy)))
       (and (eq? dummy (blas-backend-gemm-f64 b))
            (eq? dummy (blas-backend-gemm-f32 b))
            (eq? dummy (blas-backend-gemv-f64 b))
@@ -719,7 +726,7 @@
   (test-assert "register-blas-backend! makes blas-available? return #t"
     (let* ((dummy (lambda args 0))
            (b (make-blas-backend 'test-backend
-                dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy)))
+                dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy)))
       (register-blas-backend! b)
       (let ((r (blas-available?)))
         ;; Deregister so other tests are unaffected
@@ -729,7 +736,7 @@
   (test-assert "active-blas-backend returns registered record"
     (let* ((dummy (lambda args 0))
            (b (make-blas-backend 'my-blas
-                dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy)))
+                dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy dummy)))
       (register-blas-backend! b)
       (let ((r (eq? b (active-blas-backend))))
         (set! *active-backend* #f)
@@ -753,6 +760,8 @@
         (set! *active-backend* saved)
         (concrete-values-approx? C '((3 0) (0 3))))))
 )
+
+  (set! *active-backend* saved-backend))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 11: Phase 3 - Realization Engine Integration

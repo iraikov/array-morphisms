@@ -61,6 +61,9 @@
    blas-backend-dot-f32
    blas-backend-axpy-f64
    blas-backend-axpy-f32
+   blas-backend-conv-fwd-im2col-f32
+   blas-backend-conv-bwd-data-im2col-f32
+   blas-backend-conv-bwd-weights-im2col-f32
 
    ;; Backend registration and inspection
    register-blas-backend!
@@ -136,16 +139,19 @@
   ;; on the 'blas' egg, CUDA bindings, or chicken-crunch.
   (define-record blas-backend
     name              ; symbol: backend identity
-    gemm-f64          ; (M N K alpha data-A data-B beta data-C) -> void, or #f
-    gemm-f32          ; (M N K alpha data-A data-B beta data-C) -> void, or #f
-    gemm-strided-f64  ; (M N K alpha data-A lda-A transa data-B ldb-B transb beta data-C) -> void, or #f
-    gemm-strided-f32  ; (M N K alpha data-A lda-A transa data-B ldb-B transb beta data-C) -> void, or #f
-    gemv-f64          ; (M N alpha data-A data-x beta data-y) -> void, or #f
-    gemv-f32          ; (M N alpha data-A data-x beta data-y) -> void, or #f
-    dot-f64           ; (N data-x data-y) -> number, or #f
-    dot-f32           ; (N data-x data-y) -> number, or #f
-    axpy-f64          ; (N alpha data-x data-y) -> void, or #f
-    axpy-f32)         ; (N alpha data-x data-y) -> void, or #f
+   gemm-f64          ; (M N K alpha data-A data-B beta data-C) -> void, or #f
+   gemm-f32          ; (M N K alpha data-A data-B beta data-C) -> void, or #f
+   gemm-strided-f64  ; (M N K alpha data-A lda-A transa data-B ldb-B transb beta data-C) -> void, or #f
+   gemm-strided-f32  ; (M N K alpha data-A lda-A transa data-B ldb-B transb beta data-C) -> void, or #f
+   gemv-f64          ; (M N alpha data-A data-x beta data-y) -> void, or #f
+   gemv-f32          ; (M N alpha data-A data-x beta data-y) -> void, or #f
+   dot-f64           ; (N data-x data-y) -> number, or #f
+   dot-f32           ; (N data-x data-y) -> number, or #f
+   axpy-f64          ; (N alpha data-x data-y) -> void, or #f
+   axpy-f32          ; (N alpha data-x data-y) -> void, or #f
+   conv-fwd-im2col-f32         ; (out bias col src weight M N K out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
+   conv-bwd-data-im2col-f32    ; (dx col g wt M K N out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
+   conv-bwd-weights-im2col-f32)  ; (dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Configuration
@@ -192,7 +198,7 @@
     Example using a custom CUDA backend:
       (register-blas-backend!
         (make-blas-backend 'cuda
-          cuda-dgemm cuda-sgemm
+          cuda-dgemm cuda-sgemm cuda-conv-fwd-im2col-f32
           cuda-dgemv cuda-sgemv
           cuda-ddot  cuda-sdot
           cuda-daxpy cuda-saxpy))

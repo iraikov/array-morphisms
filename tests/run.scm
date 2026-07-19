@@ -15,6 +15,7 @@
 (include-relative "test-basic-ops.scm")
 (include-relative "test-batch-ops.scm")
 (include-relative "test-blas.scm")
+(include-relative "test-microblas.scm")
 (include-relative "test-structural-ops.scm")
 (include-relative "test-realization.scm")
 (include-relative "test-context.scm")

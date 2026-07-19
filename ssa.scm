@@ -71,18 +71,18 @@
    compile-replay-plan
    execute-replay-plan
 
-   ;; Diagnostics
-   replay-plan-stats
+    ;; Diagnostics
+    replay-plan-stats
 
-   ;; Per-instruction timing
-   replay-timing-reset!
-   replay-timing-results)
+    ;; Per-instruction timing
+    replay-timing-reset!
+    replay-timing-results)
 
-  (import scheme (chicken base) (chicken time))
+  (import scheme (chicken base) (chicken time) (chicken format))
   (import (only srfi-1 iota fold filter map for-each append-map filter-map every))
   (import (only srfi-4
-                f64vector f64vector? f64vector-set! f64vector-length
-                f32vector f32vector? f32vector-set! f32vector-length))
+                f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
+                f32vector f32vector? f32vector-ref f32vector-set! f32vector-length))
   (import (only srfi-69
                 make-hash-table
                 hash-table-ref
@@ -1402,18 +1402,113 @@
 
 ;; De-transpose a concrete-array to a fresh row-major non-pooled buffer (alloc-id=-1).
 ;; Used for output bindings that are zero-copy transposed views (no pool slot of their own).
+
+(define (%copy-concrete-array-slow data shape strides offset dtype new-data size)
+  "Generic element-by-element copy using multi-index conversion (fallback)."
+  (do ((i 0 (+ i 1)))
+      ((= i size))
+    (let* ((multi (linear-to-multi-index i shape))
+           (phys  (multi-to-linear-index multi strides offset)))
+      (typed-vector-set! new-data dtype i (typed-vector-ref data dtype phys)))))
+
+(define (%copy-concrete-array-fast-f32 data shape strides offset new-data)
+  "Fast copy for f32 arrays up to rank 4 using direct stride arithmetic."
+  (let ((rank (vector-length shape)))
+    (case rank
+      ((1)
+       (let ((d0 (vector-ref shape 0))
+             (s0 (vector-ref strides 0)))
+         (do ((i0 0 (+ i0 1))) ((= i0 d0))
+           (f32vector-set! new-data i0
+             (f32vector-ref data (+ offset (* i0 s0)))))))
+      ((2)
+       (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1))
+             (s0 (vector-ref strides 0)) (s1 (vector-ref strides 1)))
+         (let ((idx 0))
+           (do ((i0 0 (+ i0 1))) ((= i0 d0))
+             (do ((i1 0 (+ i1 1))) ((= i1 d1))
+               (f32vector-set! new-data idx
+                 (f32vector-ref data (+ offset (* i0 s0) (* i1 s1))))
+               (set! idx (+ idx 1)))))))
+      ((3)
+       (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1)) (d2 (vector-ref shape 2))
+             (s0 (vector-ref strides 0)) (s1 (vector-ref strides 1)) (s2 (vector-ref strides 2)))
+         (let ((idx 0))
+           (do ((i0 0 (+ i0 1))) ((= i0 d0))
+             (do ((i1 0 (+ i1 1))) ((= i1 d1))
+               (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                 (f32vector-set! new-data idx
+                   (f32vector-ref data (+ offset (* i0 s0) (* i1 s1) (* i2 s2))))
+                 (set! idx (+ idx 1))))))))
+      ((4)
+       (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1)) (d2 (vector-ref shape 2)) (d3 (vector-ref shape 3))
+             (s0 (vector-ref strides 0)) (s1 (vector-ref strides 1)) (s2 (vector-ref strides 2)) (s3 (vector-ref strides 3)))
+         (let ((idx 0))
+           (do ((i0 0 (+ i0 1))) ((= i0 d0))
+             (do ((i1 0 (+ i1 1))) ((= i1 d1))
+               (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                 (do ((i3 0 (+ i3 1))) ((= i3 d3))
+                   (f32vector-set! new-data idx
+                     (f32vector-ref data (+ offset (* i0 s0) (* i1 s1) (* i2 s2) (* i3 s3))))
+                   (set! idx (+ idx 1)))))))))
+      (else (error "%copy-concrete-array-fast-f32: unsupported rank" rank)))))
+
+(define (%copy-concrete-array-fast-f64 data shape strides offset new-data)
+  "Fast copy for f64 arrays up to rank 4 using direct stride arithmetic."
+  (let ((rank (vector-length shape)))
+    (case rank
+      ((1)
+       (let ((d0 (vector-ref shape 0))
+             (s0 (vector-ref strides 0)))
+         (do ((i0 0 (+ i0 1))) ((= i0 d0))
+           (f64vector-set! new-data i0
+             (f64vector-ref data (+ offset (* i0 s0)))))))
+      ((2)
+       (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1))
+             (s0 (vector-ref strides 0)) (s1 (vector-ref strides 1)))
+         (let ((idx 0))
+           (do ((i0 0 (+ i0 1))) ((= i0 d0))
+             (do ((i1 0 (+ i1 1))) ((= i1 d1))
+               (f64vector-set! new-data idx
+                 (f64vector-ref data (+ offset (* i0 s0) (* i1 s1))))
+               (set! idx (+ idx 1)))))))
+      ((3)
+       (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1)) (d2 (vector-ref shape 2))
+             (s0 (vector-ref strides 0)) (s1 (vector-ref strides 1)) (s2 (vector-ref strides 2)))
+         (let ((idx 0))
+           (do ((i0 0 (+ i0 1))) ((= i0 d0))
+             (do ((i1 0 (+ i1 1))) ((= i1 d1))
+               (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                 (f64vector-set! new-data idx
+                   (f64vector-ref data (+ offset (* i0 s0) (* i1 s1) (* i2 s2))))
+                 (set! idx (+ idx 1))))))))
+      ((4)
+       (let ((d0 (vector-ref shape 0)) (d1 (vector-ref shape 1)) (d2 (vector-ref shape 2)) (d3 (vector-ref shape 3))
+             (s0 (vector-ref strides 0)) (s1 (vector-ref strides 1)) (s2 (vector-ref strides 2)) (s3 (vector-ref strides 3)))
+         (let ((idx 0))
+           (do ((i0 0 (+ i0 1))) ((= i0 d0))
+             (do ((i1 0 (+ i1 1))) ((= i1 d1))
+               (do ((i2 0 (+ i2 1))) ((= i2 d2))
+                 (do ((i3 0 (+ i3 1))) ((= i3 d3))
+                   (f64vector-set! new-data idx
+                     (f64vector-ref data (+ offset (* i0 s0) (* i1 s1) (* i2 s2) (* i3 s3))))
+                   (set! idx (+ idx 1)))))))))
+      (else (error "%copy-concrete-array-fast-f64: unsupported rank" rank)))))
+
 (define (copy-concrete-array m)
   (cases array-morphism m
     (concrete-array (data shape strides offset dtype alloc-id batch-axis)
       (let* ((size     (shape-size shape))
              (new-data (allocate-typed-vector dtype size))
-             (new-strs (compute-strides shape)))
-        (do ((i 0 (+ i 1)))
-            ((= i size))
-          (let* ((multi (linear-to-multi-index i shape))
-                 (phys  (multi-to-linear-index multi strides offset))
-                 (val   (typed-vector-ref data dtype phys)))
-            (typed-vector-set! new-data dtype i val)))
+             (new-strs (compute-strides shape))
+             (rank     (vector-length shape)))
+         (cond
+          ((and (eq? dtype 'f32) (<= rank 4))
+           (%copy-concrete-array-fast-f32 data shape strides offset new-data))
+          ((and (eq? dtype 'f64) (<= rank 4))
+           (%copy-concrete-array-fast-f64 data shape strides offset new-data))
+          (else
+           (%copy-concrete-array-slow data shape strides offset dtype new-data size)))
         (concrete-array new-data shape new-strs 0 dtype -1 batch-axis)))
     (else (error "copy-concrete-array: not a concrete-array" m))))
 
@@ -1999,6 +2094,7 @@
              (result
               (cases replay-instruction instr
 
+
                 (ri-gemm (pool-idx shape strides dtype A-ref B-ref)
                   (time-instr 'ri-gemm
                     (let ((buf (vector-ref pool-bufs pool-idx)))
@@ -2309,8 +2405,7 @@
       (else
        ;; Lazily compile replay-plan on first replay call (pool is now available)
        (unless (ssa-program-replay-plan prog)
-         (ssa-program-replay-plan-set! prog
-           (compile-replay-plan prog ctx)))
+         (ssa-program-replay-plan-set! prog (compile-replay-plan prog ctx)))
        ;; Execute the pre-compiled plan directly
        (let* ((plan  (ssa-program-replay-plan prog))
               (pool  (morphism-context-pool ctx))
@@ -2318,13 +2413,15 @@
               ;; output-specs pre-computed by compile-replay-plan: list of
               ;; (integer | concrete-array) -- no hash-table rebuild per step.
               (specs (ssa-program-output-specs prog)))
-         (map (lambda (spec)
-                (if (integer? spec)
-                    (let ((v (vector-ref vals spec)))
-                      (if (concrete-row-major? v) v (copy-concrete-array v)))
-                    spec))   ; const-ref: direct concrete-array from constants
-              specs))))))
+           (time-instr 'ri-output-mapping
+             (map (lambda (spec)
+                    (if (integer? spec)
+                        (let ((v (vector-ref vals spec)))
+                          (if (concrete-row-major? v) v (copy-concrete-array v)))
+                        spec))   ; const-ref: direct concrete-array from constants
+                  specs)))))
 
+    ))
 
   (define (replay-plan-stats prog)
     "Return alist with:

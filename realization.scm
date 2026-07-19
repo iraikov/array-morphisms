@@ -100,6 +100,18 @@
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-compat)
   (import array-morphisms-blas-exec)
+  (import array-morphisms-micro-blas-backend)
+
+  ;; Default-backend bootstrap: register the dependency-free microBLAS
+  ;; backend unless something (e.g. the system-BLAS egg backend) has
+  ;; already registered a backend first.  This must live here rather than
+  ;; in blas-exec.scm itself: array-morphisms-micro-blas-backend imports
+  ;; array-morphisms-blas-exec, so registering from within blas-exec.scm
+  ;; would be a circular module dependency.  realization.scm already
+  ;; depends on blas-exec and is never depended on by micro-blas-backend,
+  ;; so this is the natural place for the auto-registration side effect.
+  (unless (blas-available?)
+    (register-blas-backend! (make-micro-blas-backend)))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Convolution kernel loop macros
@@ -2000,12 +2012,24 @@
   (define (execute-conv-fwd-nchw out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype)
     "Fused im2col+GEMM+bias for NCHW input. wt is [fan_in, out_ch] (W transposed).
     Output [N*OH_OW, out_ch]. Outer (n,oh,ow)/inner (c,kh,kw)/innermost (co).
-    src_val is hoisted above co loop; wt reads and out writes are stride-1."
+    src_val is hoisted above co loop; wt reads and out writes are stride-1.
+    When dtype is f32, BLAS is enabled, an active backend is registered, and
+    the backend provides a conv-fwd-im2col-f32 hot-kernel, that C path is
+    used instead of the scalar loops."
     (let* ((fan-in (* C KH KW))
            (C*H*W  (* C H W))
            (H*W    (* H W))
            (OH*OW  (* OH OW)))
-      (case dtype
+            (cond
+        ((and (eq? dtype 'f32) (blas-enabled?) (active-blas-backend)
+              (blas-backend-conv-fwd-im2col-f32 (active-blas-backend)))
+         (let* ((M (* N OH*OW))
+                (K fan-in))
+           (let ((col (allocate-typed-vector 'f32 (* M K))))
+             ((blas-backend-conv-fwd-im2col-f32 (active-blas-backend))
+              out-buf b col src wt M out-ch K out-ch N C H W KH KW SH SW PH PW OH OW))))
+        (else
+(case dtype
         ((f32)
          (begin
            ;; Initialize output rows to bias
@@ -2060,9 +2084,7 @@
                                         (+ (f64vector-ref out-buf (+ row-base co))
                                            (* src-val (f64vector-ref wt (+ wt-base co)))))))))))))))))))
             )
-         (else (error "execute-conv-fwd-nchw: unsupported dtype" dtype)))))
-
-  (define (execute-conv-fwd-nhwc out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype)
+         (else (error "execute-conv-fwd-nchw: unsupported dtype" dtype)))))))  (define (execute-conv-fwd-nhwc out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype)
     "Fused im2col+GEMM+bias for NHWC [N,H,W,C] input. wt is [fan_in, out_ch]."
     (let* ((fan-in (* C KH KW))
            (H*W    (* H W))
@@ -2371,26 +2393,32 @@
                                  #!optional (pre-col #f))
     "Forward conv via im2col-mr + single BLAS gemm + bias.
     col[M, fan_in] = im2col-mr(src);  out[M, out_ch] = col @ wt;  out += bias.
+    When dtype is f32 and the active backend provides a conv-fwd-im2col-f32
+    hot-kernel, that single C call is used instead of the Scheme im2col loop.
     pre-col: optional pre-allocated scratch buffer of size M*fan_in."
     (let* ((fan-in (* C KH KW))
            (M      (* N OH OW))
            (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
-           (be     (active-blas-backend)))
-      (execute-im2col-batched-mr col src N C H W KH KW SH SW PH PW OH OW dtype)
-      (%conv-blas-gemm be dtype M out-ch fan-in 1.0 col wt 0.0 out-buf)
-      (if (eq? dtype 'f64)
-          (for-range (m M)
-            (let ((base (* m out-ch)))
-              (for-range (co out-ch)
-                (f64vector-set! out-buf (+ base co)
-                  (+ (f64vector-ref out-buf (+ base co))
-                     (f64vector-ref b co))))))
-          (for-range (m M)
-            (let ((base (* m out-ch)))
-              (for-range (co out-ch)
-                (f32vector-set! out-buf (+ base co)
-                  (+ (f32vector-ref out-buf (+ base co))
-                     (f32vector-ref b co)))))))))
+           (be     (active-blas-backend))
+           (hook   (and (eq? dtype 'f32) (blas-backend-conv-fwd-im2col-f32 be))))
+      (if hook
+          (hook out-buf b col src wt M out-ch fan-in out-ch N C H W KH KW SH SW PH PW OH OW)
+          (begin
+            (execute-im2col-batched-mr col src N C H W KH KW SH SW PH PW OH OW dtype)
+            (%conv-blas-gemm be dtype M out-ch fan-in 1.0 col wt 0.0 out-buf)
+            (if (eq? dtype 'f64)
+                (for-range (m M)
+                  (let ((base (* m out-ch)))
+                    (for-range (co out-ch)
+                      (f64vector-set! out-buf (+ base co)
+                        (+ (f64vector-ref out-buf (+ base co))
+                           (f64vector-ref b co))))))
+                (for-range (m M)
+                  (let ((base (* m out-ch)))
+                    (for-range (co out-ch)
+                      (f32vector-set! out-buf (+ base co)
+                        (+ (f32vector-ref out-buf (+ base co))
+                           (f32vector-ref b co)))))))))))
 
   (define (execute-conv-fwd-nhwc-blas out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype
                                       #!optional (pre-col #f))
@@ -2416,19 +2444,25 @@
                      (f32vector-ref b co)))))))))
   
   (define (execute-conv-bwd-data-blas dx-buf x-shape g-data g-shape wt-data
-                                       N C H W KH KW SH SW PH PW OH OW out-ch dtype
-                                       #!optional (pre-col #f))
+                                        N C H W KH KW SH SW PH PW OH OW out-ch dtype
+                                        #!optional (pre-col #f))
     "Backward w.r.t. X via single BLAS gemm (g @ wt^T) + col2im-mr.
-    col[M, fan_in] = g[M, out_ch] @ wt[fan_in, out_ch]^T;  dx = col2im-mr(col)."
+     col[M, fan_in] = g[M, out_ch] @ wt[fan_in, out_ch]^T;  dx = col2im-mr(col).
+     When dtype is f32 and the backend provides a conv-bwd-data-im2col-f32
+     hot-kernel, that single C call is used instead."
     (let* ((fan-in (* C KH KW))
            (M      (* N OH OW))
            (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
-           (be     (active-blas-backend)))
-      (%conv-blas-gemm-strided be dtype M fan-in out-ch
-                               1.0 g-data out-ch 'no-trans
-                               wt-data out-ch 'trans
-                               0.0 col)
-      (execute-col2im-batched-mr dx-buf x-shape col (vector M fan-in) KH KW SH SW PH PW dtype)))
+           (be     (active-blas-backend))
+           (hook   (and (eq? dtype 'f32) (blas-backend-conv-bwd-data-im2col-f32 be))))
+      (if hook
+          (hook dx-buf col g-data wt-data M fan-in out-ch out-ch N C H W KH KW SH SW PH PW OH OW)
+          (begin
+            (%conv-blas-gemm-strided be dtype M fan-in out-ch
+                                     1.0 g-data out-ch 'no-trans
+                                     wt-data out-ch 'trans
+                                     0.0 col)
+            (execute-col2im-batched-mr dx-buf x-shape col (vector M fan-in) KH KW SH SW PH PW dtype)))))
 
   (define (execute-conv-bwd-data-nhwc-blas dx-buf x-shape g-data g-shape wt-data
                                             N C H W KH KW SH SW PH PW OH OW out-ch dtype
@@ -2445,19 +2479,25 @@
       (execute-col2im-nhwc-mr dx-buf x-shape col (vector M fan-in) KH KW SH SW PH PW dtype)))
 
   (define (execute-conv-bwd-weights-blas dwt-buf wt-shape g-data g-shape src-data
-                                          N C H W KH KW SH SW PH PW OH OW out-ch dtype
-                                          #!optional (pre-col #f))
+                                           N C H W KH KW SH SW PH PW OH OW out-ch dtype
+                                           #!optional (pre-col #f))
     "Backward w.r.t. WT via im2col-mr + single BLAS gemm (col^T @ g).
-    col[M, fan_in] = im2col-mr(src);  dwt[fan_in, out_ch] = col^T @ g[M, out_ch]."
+     col[M, fan_in] = im2col-mr(src);  dwt[fan_in, out_ch] = col^T @ g[M, out_ch].
+     When dtype is f32 and the backend provides a conv-bwd-weights-im2col-f32
+     hot-kernel, that single C call is used instead."
     (let* ((fan-in (* C KH KW))
            (M      (* N OH OW))
            (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
-           (be     (active-blas-backend)))
-      (execute-im2col-batched-mr col src-data N C H W KH KW SH SW PH PW OH OW dtype)
-      (%conv-blas-gemm-strided be dtype fan-in out-ch M
-                               1.0 col fan-in 'trans
-                               g-data out-ch 'no-trans
-                               0.0 dwt-buf)))
+           (be     (active-blas-backend))
+           (hook   (and (eq? dtype 'f32) (blas-backend-conv-bwd-weights-im2col-f32 be))))
+      (if hook
+          (hook dwt-buf col src-data g-data fan-in out-ch M N C H W KH KW SH SW PH PW OH OW)
+          (begin
+            (execute-im2col-batched-mr col src-data N C H W KH KW SH SW PH PW OH OW dtype)
+            (%conv-blas-gemm-strided be dtype fan-in out-ch M
+                                     1.0 col fan-in 'trans
+                                     g-data out-ch 'no-trans
+                                     0.0 dwt-buf)))))
 
   (define (execute-conv-bwd-weights-nhwc-blas dwt-buf wt-shape g-data g-shape src-data
                                                N C H W KH KW SH SW PH PW OH OW out-ch dtype
@@ -2674,7 +2714,90 @@
             ))
         )
 
+      (define *1d-reduce-ones-cache* '())
+
+      (define (ones-vector dtype N)
+        (let ((key (cons dtype N)))
+          (let loop ((cache *1d-reduce-ones-cache*))
+            (cond ((null? cache)
+                   (let ((v (allocate-typed-vector dtype N)))
+                     (case dtype
+                       ((f32) (do ((i 0 (+ i 1))) ((= i N)) (f32vector-set! v i 1.0)))
+                       ((f64) (do ((i 0 (+ i 1))) ((= i N)) (f64vector-set! v i 1.0)))
+                       (else  (do ((i 0 (+ i 1))) ((= i N)) (typed-vector-set! v dtype i 1.0))))
+                     (set! *1d-reduce-ones-cache* (cons (cons key v) *1d-reduce-ones-cache*))
+                     v))
+                  ((and (eq? (car key) (caar cache)) (= (cdr key) (cdar cache)))
+                   (cdar cache))
+                  (else (loop (cdr cache)))))))
+
+      (define (reduce-1d-sum-mean-via-dot! dtype N op)
+        (let ((fn (cond ((and (eq? dtype 'f32) *active-backend*)
+                         (blas-backend-dot-f32 *active-backend*))
+                        ((and (eq? dtype 'f64) *active-backend*)
+                         (blas-backend-dot-f64 *active-backend*))
+                        (else #f))))
+          (if fn
+              (let ((val (fn N src-data (ones-vector dtype N))))
+                (typed-vector-set! output-buffer dtype 0
+                                   (if (eq? op 'mean) (/ val N) val)))
+              ;; Fallback to tight loop when no BLAS backend/kernel is available.
+              (case dtype
+                ((f32)
+                 (let ((acc 0.0))
+                   (do ((i 0 (+ i 1))) ((= i N))
+                     (set! acc (+ acc (f32vector-ref src-data i))))
+                   (f32vector-set! output-buffer 0 (if (eq? op 'mean) (/ acc N) acc))))
+                ((f64)
+                 (let ((acc 0.0))
+                   (do ((i 0 (+ i 1))) ((= i N))
+                     (set! acc (+ acc (f64vector-ref src-data i))))
+                   (f64vector-set! output-buffer 0 (if (eq? op 'mean) (/ acc N) acc))))))))
+
       (cond
+        ;; Fast path: 1D row-major, reduce all axes (scalar result).
+        ((and (= src-rank 1)
+              (= src-offset 0)
+              (= (vector-ref src-strides 0) 1)
+              (null? (cdr reduce-axes))   ; single axis
+              (= (car reduce-axes) 0)
+              (memq op '(sum mean max min)))
+          (let ((N (vector-ref src-shape 0)))
+            (case src-dtype
+              ((f32)
+               (case op
+                 ((sum mean)
+                  (reduce-1d-sum-mean-via-dot! 'f32 N op))
+                 ((max)
+                  (let ((acc -inf.0))
+                    (do ((i 0 (+ i 1))) ((= i N))
+                      (let ((v (f32vector-ref src-data i)))
+                        (when (> v acc) (set! acc v))))
+                    (f32vector-set! output-buffer 0 acc)))
+                 ((min)
+                  (let ((acc +inf.0))
+                    (do ((i 0 (+ i 1))) ((= i N))
+                      (let ((v (f32vector-ref src-data i)))
+                        (when (< v acc) (set! acc v))))
+                    (f32vector-set! output-buffer 0 acc)))))
+              ((f64)
+               (case op
+                 ((sum mean)
+                  (reduce-1d-sum-mean-via-dot! 'f64 N op))
+                 ((max)
+                  (let ((acc -inf.0))
+                    (do ((i 0 (+ i 1))) ((= i N))
+                      (let ((v (f64vector-ref src-data i)))
+                        (when (> v acc) (set! acc v))))
+                    (f64vector-set! output-buffer 0 acc)))
+                 ((min)
+                  (let ((acc +inf.0))
+                    (do ((i 0 (+ i 1))) ((= i N))
+                      (let ((v (f64vector-ref src-data i)))
+                        (when (< v acc) (set! acc v))))
+                    (f64vector-set! output-buffer 0 acc)))))
+              (else (error "execute-reduction-morphism: unsupported dtype for 1D fast path" src-dtype)))))
+
         ;; Fast path: 2D row-major, reduce axis 0
         ((and (row-major-2d?)
               (equal? reduce-axes '(0))

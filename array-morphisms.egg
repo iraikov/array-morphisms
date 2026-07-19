@@ -22,7 +22,20 @@
              (extension array-morphisms-blas-compat (source "blas-compat.scm")   (csc-options "-O2" "-d1"))
              (extension array-morphisms-blas-exec   (source "blas-exec.scm")     (csc-options "-O2" "-d1"))
              (extension array-morphisms-structural-ops (source "structural-ops.scm") (csc-options "-O2" "-d1"))
-             (extension array-morphisms-realization (source "realization.scm") (csc-options "-O3" "-d1"))
+
+             ;; Vendored, header-only microBLAS backend: dependency-free
+             ;; default BLAS tier (no system BLAS / OpenBLAS required).
+             (c-object microblas-shim-f32 (source "kernels/microblas_wrapper.c") (csc-options "-O3"))
+             (c-object microblas-shim-f64 (source "kernels/microblas_wrapper.c") (csc-options "-O3" "-C" "-DREAL_TYPE_DOUBLE"))
+             (c-object im2col-kernels     (source "kernels/im2col.c")         (csc-options "-O3"))
+             (extension array-morphisms-micro-blas-backend
+                        (source "micro-blas-backend.scm")
+                        (csc-options "-O2" "-d1")
+                        (objects microblas-shim-f32 microblas-shim-f64 im2col-kernels)
+                        (component-dependencies array-morphisms-blas-exec))
+
+             (extension array-morphisms-realization (source "realization.scm") (csc-options "-O3" "-d1")
+                        (component-dependencies array-morphisms-micro-blas-backend))
              (extension array-morphisms-context     (source "context.scm")     (csc-options "-O2" "-d1"))
              (extension array-morphisms-batch-ops   (source "batch-ops.scm")   (csc-options "-O2" "-d1"))
              (extension array-morphisms-grad        (source "grad.scm")        (csc-options "-O2" "-d1"))

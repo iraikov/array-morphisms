@@ -37,8 +37,32 @@
   (make-blas-egg-backend)
 
   (import scheme (chicken base))
+  (import (chicken foreign))
+  (import srfi-4)
   (import blas)                       ; Chicken 5 'blas' egg
   (import array-morphisms-blas-exec)  ; for make-blas-backend and register-blas-backend!
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Optional C hot-kernel declarations
+  ;;; These routines live in kernels/im2col.c and are linked into the final
+  ;;; compiled program.  They are only available in compiled mode
+  ;;; (foreign-lambda); the Scheme fallback path is always present.
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (foreign-declare "extern void im2col_batched_mr_f32(float* col, const float* src, int N, int C, int H, int W, int KH, int KW, int SH, int SW, int PH, int PW, int OH, int OW);")
+  (foreign-declare "extern void bias_add_f32(float* out, const float* b, int M, int out_ch);")
+  (foreign-declare "extern void col2im_batched_mr_f32(float* dx, const float* col, int N, int C, int H, int W, int KH, int KW, int SH, int SW, int PH, int PW, int OH, int OW);")
+
+  (define %c-im2col-batched-mr-f32
+    (foreign-lambda void "im2col_batched_mr_f32"
+      f32vector f32vector int int int int int int int int int int int int))
+
+  (define %c-bias-add-f32
+    (foreign-lambda void "bias_add_f32" f32vector f32vector int int))
+
+  (define %c-col2im-batched-mr-f32
+    (foreign-lambda void "col2im_batched_mr_f32"
+      f32vector f32vector int int int int int int int int int int int int))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; GEMM kernels
@@ -130,6 +154,41 @@
     (saxpy! N alpha data-x data-y))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Convolution hot-kernels (optional C path)
+  ;;;
+  ;;; conv-fwd:  out bias col src wt M N K out-ch Nbatch C H W KH KW SH SW PH PW OH OW
+  ;;;   im2col(src->col), gemm(col,wt->out, beta=0), then bias-add.
+  ;;;
+  ;;; conv-bwd-data: dx col g wt M K N out-ch Nbatch C H W KH KW SH SW PH PW OH OW
+  ;;;   col = g @ wt^T  (gemm with transposed B), then col2im(col->dx).
+  ;;;
+  ;;; conv-bwd-weights: dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW
+  ;;;   im2col(src->col), dwt = col^T @ g.
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (%egg-conv-fwd-im2col-f32 out bias col src wt M N K out-ch Nbatch C H W KH KW SH SW PH PW OH OW)
+    (%c-im2col-batched-mr-f32 col src Nbatch C H W KH KW SH SW PH PW OH OW)
+    (%egg-sgemm M N K 1.0 col wt 0.0 out)
+    (%c-bias-add-f32 out bias M out-ch))
+
+  (define (%egg-conv-bwd-data-im2col-f32 dx col g wt M K N out-ch Nbatch C H W KH KW SH SW PH PW OH OW)
+    ;; g is [M, N]=[M,out-ch], wt is [K,N]=[fan-in,out-ch].
+    ;; Compute col[M,K] = g * wt^T, then col2im(col)->dx.
+    (%egg-sgemm-strided M K N
+                        1.0 g N 'no-trans
+                        wt N 'trans
+                        0.0 col)
+    (%c-col2im-batched-mr-f32 dx col Nbatch C H W KH KW SH SW PH PW OH OW))
+
+  (define (%egg-conv-bwd-weights-im2col-f32 dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW)
+    ;; col[fan_in, M] = im2col(src); dwt[fan_in, out_ch] = col^T * g.
+    (%c-im2col-batched-mr-f32 col src Nbatch C H W KH KW SH SW PH PW OH OW)
+    (%egg-sgemm-strided fan-in out-ch M
+                        1.0 col fan-in 'trans
+                        g out-ch 'no-trans
+                        0.0 dwt))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Public Constructor
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -137,7 +196,9 @@
     "Construct a blas-backend record that wraps the Chicken 'blas' egg.
 
     All eight kernel slots are populated; both f64 and f32 variants are
-    provided via the egg's d* and s* routines respectively.
+    provided via the egg's d* and s* routines respectively.  When the C
+    hot-kernel object is linked, the conv-* hot-kernel slots are also
+    populated.
 
     Usage:
       (import array-morphisms-blas-egg-backend)
@@ -148,6 +209,9 @@
      %egg-dgemm-strided  %egg-sgemm-strided   ; gemm-strided-f64  gemm-strided-f32
      %egg-dgemv          %egg-sgemv           ; gemv-f64          gemv-f32
      %egg-ddot           %egg-sdot            ; dot-f64           dot-f32
-     %egg-daxpy          %egg-saxpy))         ; axpy-f64          axpy-f32
+     %egg-daxpy          %egg-saxpy           ; axpy-f64          axpy-f32
+     %egg-conv-fwd-im2col-f32
+     %egg-conv-bwd-data-im2col-f32
+     %egg-conv-bwd-weights-im2col-f32))
 
 ) ;; end module array-morphisms-blas-egg-backend
