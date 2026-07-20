@@ -50,6 +50,8 @@
   (foreign-declare "extern void im2col_batched_mr_f32(float* col, const float* src, int N, int C, int H, int W, int KH, int KW, int SH, int SW, int PH, int PW, int OH, int OW);")
   (foreign-declare "extern void bias_add_f32(float* out, const float* b, int M, int out_ch);")
   (foreign-declare "extern void col2im_batched_mr_f32(float* dx, const float* col, int N, int C, int H, int W, int KH, int KW, int SH, int SW, int PH, int PW, int OH, int OW);")
+  (foreign-declare "extern void im2col_batched_nhwc_f32(float* col, const float* src, int N, int C, int H, int W, int KH, int KW, int SH, int SW, int PH, int PW, int OH, int OW);")
+  (foreign-declare "extern void col2im_batched_nhwc_f32(float* dx, const float* col, int N, int C, int H, int W, int KH, int KW, int SH, int SW, int PH, int PW, int OH, int OW);")
 
   (define %c-sgemm
     (foreign-lambda int "mb_sgemm" int int int float f32vector int int f32vector int int float f32vector))
@@ -77,6 +79,14 @@
 
   (define %c-col2im-batched-mr-f32
     (foreign-lambda void "col2im_batched_mr_f32"
+      f32vector f32vector int int int int int int int int int int int int))
+
+  (define %c-im2col-batched-nhwc-f32
+    (foreign-lambda void "im2col_batched_nhwc_f32"
+      f32vector f32vector int int int int int int int int int int int int))
+
+  (define %c-col2im-batched-nhwc-f32
+    (foreign-lambda void "col2im_batched_nhwc_f32"
       f32vector f32vector int int int int int int int int int int int int))
 
   (define (%check-mb-error! who err)
@@ -182,6 +192,28 @@
                        g out-ch 'no-trans
                        0.0 dwt))
 
+  ;; NHWC counterparts: identical structure to the NCHW hooks above, but the
+  ;; im2col/col2im step reads/writes src/dx in NHWC layout [N,H,W,C].
+
+  (define (%mb-conv-fwd-nhwc-im2col-f32 out bias col src wt M N K out-ch Nbatch C H W KH KW SH SW PH PW OH OW)
+    (%c-im2col-batched-nhwc-f32 col src Nbatch C H W KH KW SH SW PH PW OH OW)
+    (%mb-sgemm M N K 1.0 col wt 0.0 out)
+    (%c-bias-add-f32 out bias M out-ch))
+
+  (define (%mb-conv-bwd-data-nhwc-im2col-f32 dx col g wt M K N out-ch Nbatch C H W KH KW SH SW PH PW OH OW)
+    (%mb-sgemm-strided M K N
+                       1.0 g N 'no-trans
+                       wt N 'trans
+                       0.0 col)
+    (%c-col2im-batched-nhwc-f32 dx col Nbatch C H W KH KW SH SW PH PW OH OW))
+
+  (define (%mb-conv-bwd-weights-nhwc-im2col-f32 dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW)
+    (%c-im2col-batched-nhwc-f32 col src Nbatch C H W KH KW SH SW PH PW OH OW)
+    (%mb-sgemm-strided fan-in out-ch M
+                       1.0 col fan-in 'trans
+                       g out-ch 'no-trans
+                       0.0 dwt))
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Public Constructor
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -208,6 +240,9 @@
      %mb-daxpy          %mb-saxpy           ; axpy-f64          axpy-f32
      %mb-conv-fwd-im2col-f32
      %mb-conv-bwd-data-im2col-f32
-     %mb-conv-bwd-weights-im2col-f32))
+     %mb-conv-bwd-weights-im2col-f32
+     %mb-conv-fwd-nhwc-im2col-f32
+     %mb-conv-bwd-data-nhwc-im2col-f32
+     %mb-conv-bwd-weights-nhwc-im2col-f32))
 
 ) ;; end module array-morphisms-micro-blas-backend

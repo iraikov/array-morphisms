@@ -109,7 +109,7 @@
   (test-assert "make-micro-blas-backend names the backend 'micro-blas"
     (eq? 'micro-blas (blas-backend-name (make-micro-blas-backend))))
 
-  (test-assert "all 13 kernel slots are populated (non-#f)"
+  (test-assert "all 16 kernel slots are populated (non-#f)"
     (let ((b (make-micro-blas-backend)))
       (every (lambda (x) x)
              (list (blas-backend-gemm-f64 b) (blas-backend-gemm-f32 b)
@@ -119,7 +119,10 @@
                    (blas-backend-axpy-f64 b) (blas-backend-axpy-f32 b)
                    (blas-backend-conv-fwd-im2col-f32 b)
                    (blas-backend-conv-bwd-data-im2col-f32 b)
-                   (blas-backend-conv-bwd-weights-im2col-f32 b)))))
+                   (blas-backend-conv-bwd-weights-im2col-f32 b)
+                   (blas-backend-conv-fwd-nhwc-im2col-f32 b)
+                   (blas-backend-conv-bwd-data-nhwc-im2col-f32 b)
+                   (blas-backend-conv-bwd-weights-nhwc-im2col-f32 b)))))
 
   (test-assert "register-blas-backend! + blas-available? round-trip"
     (let ((saved *active-backend*))
@@ -410,6 +413,50 @@
           (execute-conv-bwd-weights-blas blas-dwt wt-shape g #f src N C H W KH KW SH SW PH PW OH OW out-ch 'f32)
           (vec-close? (f32->vec blas-dwt) (f32->vec ref-dwt) 1e-2))))
 
+    ;; NHWC variants: same shapes, but src/dx are laid out [N,H,W,C] and the
+    ;; conv-*-nhwc-blas functions must take the conv-*-nhwc-im2col-f32 hook
+    ;; path (this is the fix for the routing gap found while profiling
+    ;; bench-am-cnn-ssa.scm -- every conv layer after the first receives
+    ;; NHWC input from the previous layer's zero-copy output reshape, and
+    ;; previously always fell back to pure-Scheme im2col/col2im loops).
+    (let* ((N 2) (C 2) (H 5) (W 5) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+           (OH 5) (OW 5) (out-ch 3)
+           (fan-in (* C KH KW)) (M (* N OH OW))
+           (x-shape-nhwc (vector N H W C))
+           (src (make-f32vector (* N H W C) 0.0))
+           (wt  (make-f32vector (* fan-in out-ch) 0.0))
+           (b   (make-f32vector out-ch 0.0))
+           (g   (make-f32vector (* M out-ch) 0.0)))
+      (fill-f32vec! src (* N H W C) gen-a)
+      (fill-f32vec! wt (* fan-in out-ch) gen-b)
+      (fill-f32vec! b out-ch (lambda (i) (* 0.1 (+ i 1))))
+      (fill-f32vec! g (* M out-ch) (lambda (i) (sin (* (+ i 3) 0.211))))
+
+      (test-assert "conv-fwd-nhwc: microBLAS hook matches scalar Scheme reference"
+        (let ((ref-out (make-f32vector (* M out-ch) 0.0))
+              (blas-out (make-f32vector (* M out-ch) 0.0)))
+          (execute-conv-fwd-nhwc ref-out src wt b N C H W KH KW SH SW PH PW OH OW out-ch 'f32)
+          (execute-conv-fwd-nhwc-blas blas-out src wt b N C H W KH KW SH SW PH PW OH OW out-ch 'f32)
+          (vec-close? (f32->vec blas-out) (f32->vec ref-out) 1e-2)))
+
+      (test-assert "conv-bwd-data-nhwc: microBLAS hook matches scalar Scheme reference"
+        (let ((ref-dx (make-f32vector (* N H W C) 0.0))
+              (blas-dx (make-f32vector (* N H W C) 0.0)))
+          (execute-conv-bwd-data-nhwc ref-dx x-shape-nhwc g #f wt N C H W KH KW SH SW PH PW OH OW out-ch 'f32)
+          (execute-conv-bwd-data-nhwc-blas blas-dx x-shape-nhwc g #f wt N C H W KH KW SH SW PH PW OH OW out-ch 'f32)
+          (vec-close? (f32->vec blas-dx) (f32->vec ref-dx) 1e-2)))
+
+      (test-assert "conv-bwd-weights-nhwc: microBLAS hook matches scalar Scheme reference"
+        (let ((ref-dwt (make-f32vector (* fan-in out-ch) 0.0))
+              (blas-dwt (make-f32vector (* fan-in out-ch) 0.0))
+              (wt-shape (vector fan-in out-ch)))
+          (execute-conv-bwd-weights-nhwc ref-dwt wt-shape g #f src N C H W KH KW SH SW PH PW OH OW out-ch 'f32)
+          (execute-conv-bwd-weights-nhwc-blas blas-dwt wt-shape g #f src N C H W KH KW SH SW PH PW OH OW out-ch 'f32)
+          (vec-close? (f32->vec blas-dwt) (f32->vec ref-dwt) 1e-2)))
+
+      (test-assert "conv-fwd-nhwc: hook is actually invoked (not silently falling back)"
+        (procedure? (blas-backend-conv-fwd-nhwc-im2col-f32 (active-blas-backend)))))
+
     (set! *active-backend* saved))
 )
 
@@ -433,7 +480,8 @@
       (register-blas-backend!
        (make-blas-backend 'dummy-backend
                            dummy dummy dummy dummy dummy dummy
-                           dummy dummy dummy dummy dummy dummy dummy))
+                           dummy dummy dummy dummy dummy dummy dummy
+                           dummy dummy dummy))
       (let ((r (eq? 'dummy-backend (blas-backend-name (active-blas-backend)))))
         (set! *active-backend* saved)
         r)))

@@ -1230,34 +1230,59 @@
 
   ;; src-dtype is the dtype of the input data vector; dtype is the output dtype.
   ;; These may differ when type promotion occurs (e.g. s32 -> f64 for sqrt).
+  ;;
+  ;; Fast paths below specialize both the input READ and the output WRITE
+  ;; for the common no-promotion float cases (f32->f32, f64->f64), so the
+  ;; loop body is a direct f32vector-ref/f32vector-set! pair with no
+  ;; per-element dtype dispatch (typed-vector-ref does a fresh `case` on
+  ;; every call otherwise).  Mixed/promoted/integer dtypes fall back to the
+  ;; original generic path.
   (define (execute-flat-unary-compute combiner data src-dtype output-buffer size dtype)
-    (case dtype
-      ((f64) (do ((i 0 (+ i 1))) ((= i size))
-               (f64vector-set! output-buffer i (combiner (typed-vector-ref data src-dtype i)))))
-      ((f32) (do ((i 0 (+ i 1))) ((= i size))
-               (f32vector-set! output-buffer i (combiner (typed-vector-ref data src-dtype i)))))
-      ((s32) (do ((i 0 (+ i 1))) ((= i size))
-               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data src-dtype i)))))))
-      ((s64) (do ((i 0 (+ i 1))) ((= i size))
-               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data src-dtype i)))))))
-      (else (error "execute-flat-unary-compute: unsupported dtype" dtype))))
+    (cond
+      ((and (eq? src-dtype 'f32) (eq? dtype 'f32))
+       (do ((i 0 (+ i 1))) ((= i size))
+         (f32vector-set! output-buffer i (combiner (f32vector-ref data i)))))
+      ((and (eq? src-dtype 'f64) (eq? dtype 'f64))
+       (do ((i 0 (+ i 1))) ((= i size))
+         (f64vector-set! output-buffer i (combiner (f64vector-ref data i)))))
+      (else
+       (case dtype
+         ((f64) (do ((i 0 (+ i 1))) ((= i size))
+                  (f64vector-set! output-buffer i (combiner (typed-vector-ref data src-dtype i)))))
+         ((f32) (do ((i 0 (+ i 1))) ((= i size))
+                  (f32vector-set! output-buffer i (combiner (typed-vector-ref data src-dtype i)))))
+         ((s32) (do ((i 0 (+ i 1))) ((= i size))
+                  (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data src-dtype i)))))))
+         ((s64) (do ((i 0 (+ i 1))) ((= i size))
+                  (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data src-dtype i)))))))
+         (else (error "execute-flat-unary-compute: unsupported dtype" dtype))))))
 
   ;; src-dtype1/src-dtype2 are the input dtypes; dtype is the output dtype.
+  ;; See execute-flat-unary-compute above for why the f32/f32/f32 and
+  ;; f64/f64/f64 fast paths exist.
   (define (execute-flat-binary-compute combiner data1 src-dtype1 data2 src-dtype2 output-buffer size dtype)
-    (case dtype
-      ((f64) (do ((i 0 (+ i 1))) ((= i size))
-               (f64vector-set! output-buffer i (exact->inexact (combiner (typed-vector-ref data1 src-dtype1 i)
-                                                                          (typed-vector-ref data2 src-dtype2 i))))))
-      ((f32) (do ((i 0 (+ i 1))) ((= i size))
-               (f32vector-set! output-buffer i (exact->inexact (combiner (typed-vector-ref data1 src-dtype1 i)
-                                                                          (typed-vector-ref data2 src-dtype2 i))))))
-      ((s32) (do ((i 0 (+ i 1))) ((= i size))
-               (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data1 src-dtype1 i)
-                                                                                    (typed-vector-ref data2 src-dtype2 i)))))))
-      ((s64) (do ((i 0 (+ i 1))) ((= i size))
-               (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data1 src-dtype1 i)
-                                                                                    (typed-vector-ref data2 src-dtype2 i)))))))
-      (else (error "execute-flat-binary-compute: unsupported dtype" dtype))))
+    (cond
+      ((and (eq? src-dtype1 'f32) (eq? src-dtype2 'f32) (eq? dtype 'f32))
+       (do ((i 0 (+ i 1))) ((= i size))
+         (f32vector-set! output-buffer i (exact->inexact (combiner (f32vector-ref data1 i) (f32vector-ref data2 i))))))
+      ((and (eq? src-dtype1 'f64) (eq? src-dtype2 'f64) (eq? dtype 'f64))
+       (do ((i 0 (+ i 1))) ((= i size))
+         (f64vector-set! output-buffer i (exact->inexact (combiner (f64vector-ref data1 i) (f64vector-ref data2 i))))))
+      (else
+       (case dtype
+         ((f64) (do ((i 0 (+ i 1))) ((= i size))
+                  (f64vector-set! output-buffer i (exact->inexact (combiner (typed-vector-ref data1 src-dtype1 i)
+                                                                             (typed-vector-ref data2 src-dtype2 i))))))
+         ((f32) (do ((i 0 (+ i 1))) ((= i size))
+                  (f32vector-set! output-buffer i (exact->inexact (combiner (typed-vector-ref data1 src-dtype1 i)
+                                                                             (typed-vector-ref data2 src-dtype2 i))))))
+         ((s32) (do ((i 0 (+ i 1))) ((= i size))
+                  (s32vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data1 src-dtype1 i)
+                                                                                       (typed-vector-ref data2 src-dtype2 i)))))))
+         ((s64) (do ((i 0 (+ i 1))) ((= i size))
+                  (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data1 src-dtype1 i)
+                                                                                       (typed-vector-ref data2 src-dtype2 i)))))))
+         (else (error "execute-flat-binary-compute: unsupported dtype" dtype))))))
 
   (define (execute-flat-bias-broadcast-compute combiner data1 data2 output-buffer size N dtype)
     ;; Use outer (row) + inner (col) loops to avoid (modulo i N) per element.
@@ -2422,26 +2447,32 @@
 
   (define (execute-conv-fwd-nhwc-blas out-buf src wt b N C H W KH KW SH SW PH PW OH OW out-ch dtype
                                       #!optional (pre-col #f))
-    "Forward conv via im2col-nhwc-mr + single BLAS gemm + bias (NHWC input)."
+    "Forward conv via im2col-nhwc-mr + single BLAS gemm + bias (NHWC input).
+    When dtype is f32 and the active backend provides a conv-fwd-nhwc-im2col-f32
+    hot-kernel, that single C call is used instead of the Scheme im2col loop."
     (let* ((fan-in (* C KH KW))
            (M      (* N OH OW))
            (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
-           (be     (active-blas-backend)))
-      (execute-im2col-nhwc-mr col src N C H W KH KW SH SW PH PW OH OW dtype)
-      (%conv-blas-gemm be dtype M out-ch fan-in 1.0 col wt 0.0 out-buf)
-      (if (eq? dtype 'f64)
-          (do ((m 0 (+ m 1))) ((= m M))
-            (let ((base (* m out-ch)))
-              (do ((co 0 (+ co 1))) ((= co out-ch))
-                (f64vector-set! out-buf (+ base co)
-                  (+ (f64vector-ref out-buf (+ base co))
-                     (f64vector-ref b co))))))
-          (do ((m 0 (+ m 1))) ((= m M))
-            (let ((base (* m out-ch)))
-              (do ((co 0 (+ co 1))) ((= co out-ch))
-                (f32vector-set! out-buf (+ base co)
-                  (+ (f32vector-ref out-buf (+ base co))
-                     (f32vector-ref b co)))))))))
+           (be     (active-blas-backend))
+           (hook   (and (eq? dtype 'f32) (blas-backend-conv-fwd-nhwc-im2col-f32 be))))
+      (if hook
+          (hook out-buf b col src wt M out-ch fan-in out-ch N C H W KH KW SH SW PH PW OH OW)
+          (begin
+            (execute-im2col-nhwc-mr col src N C H W KH KW SH SW PH PW OH OW dtype)
+            (%conv-blas-gemm be dtype M out-ch fan-in 1.0 col wt 0.0 out-buf)
+            (if (eq? dtype 'f64)
+                (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m out-ch)))
+                    (do ((co 0 (+ co 1))) ((= co out-ch))
+                      (f64vector-set! out-buf (+ base co)
+                        (+ (f64vector-ref out-buf (+ base co))
+                           (f64vector-ref b co))))))
+                (do ((m 0 (+ m 1))) ((= m M))
+                  (let ((base (* m out-ch)))
+                    (do ((co 0 (+ co 1))) ((= co out-ch))
+                      (f32vector-set! out-buf (+ base co)
+                        (+ (f32vector-ref out-buf (+ base co))
+                           (f32vector-ref b co)))))))))))
   
   (define (execute-conv-bwd-data-blas dx-buf x-shape g-data g-shape wt-data
                                         N C H W KH KW SH SW PH PW OH OW out-ch dtype
@@ -2467,16 +2498,22 @@
   (define (execute-conv-bwd-data-nhwc-blas dx-buf x-shape g-data g-shape wt-data
                                             N C H W KH KW SH SW PH PW OH OW out-ch dtype
                                             #!optional (pre-col #f))
-    "Backward w.r.t. X via single BLAS gemm (g @ wt^T) + col2im-nhwc-mr (NHWC output)."
+    "Backward w.r.t. X via single BLAS gemm (g @ wt^T) + col2im-nhwc-mr (NHWC output).
+    When dtype is f32 and the backend provides a conv-bwd-data-nhwc-im2col-f32
+    hot-kernel, that single C call is used instead."
     (let* ((fan-in (* C KH KW))
            (M      (* N OH OW))
            (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
-           (be     (active-blas-backend)))
-      (%conv-blas-gemm-strided be dtype M fan-in out-ch
-                               1.0 g-data out-ch 'no-trans
-                               wt-data out-ch 'trans
-                               0.0 col)
-      (execute-col2im-nhwc-mr dx-buf x-shape col (vector M fan-in) KH KW SH SW PH PW dtype)))
+           (be     (active-blas-backend))
+           (hook   (and (eq? dtype 'f32) (blas-backend-conv-bwd-data-nhwc-im2col-f32 be))))
+      (if hook
+          (hook dx-buf col g-data wt-data M fan-in out-ch out-ch N C H W KH KW SH SW PH PW OH OW)
+          (begin
+            (%conv-blas-gemm-strided be dtype M fan-in out-ch
+                                     1.0 g-data out-ch 'no-trans
+                                     wt-data out-ch 'trans
+                                     0.0 col)
+            (execute-col2im-nhwc-mr dx-buf x-shape col (vector M fan-in) KH KW SH SW PH PW dtype)))))
 
   (define (execute-conv-bwd-weights-blas dwt-buf wt-shape g-data g-shape src-data
                                            N C H W KH KW SH SW PH PW OH OW out-ch dtype
@@ -2502,16 +2539,22 @@
   (define (execute-conv-bwd-weights-nhwc-blas dwt-buf wt-shape g-data g-shape src-data
                                                N C H W KH KW SH SW PH PW OH OW out-ch dtype
                                                #!optional (pre-col #f))
-    "Backward w.r.t. WT via im2col-nhwc-mr + single BLAS gemm (col^T @ g) (NHWC input)."
+    "Backward w.r.t. WT via im2col-nhwc-mr + single BLAS gemm (col^T @ g) (NHWC input).
+    When dtype is f32 and the backend provides a conv-bwd-weights-nhwc-im2col-f32
+    hot-kernel, that single C call is used instead."
     (let* ((fan-in (* C KH KW))
            (M      (* N OH OW))
            (col    (or pre-col (allocate-typed-vector dtype (* M fan-in))))
-           (be     (active-blas-backend)))
-      (execute-im2col-nhwc-mr col src-data N C H W KH KW SH SW PH PW OH OW dtype)
-      (%conv-blas-gemm-strided be dtype fan-in out-ch M
-                               1.0 col fan-in 'trans
-                               g-data out-ch 'no-trans
-                               0.0 dwt-buf)))
+           (be     (active-blas-backend))
+           (hook   (and (eq? dtype 'f32) (blas-backend-conv-bwd-weights-nhwc-im2col-f32 be))))
+      (if hook
+          (hook dwt-buf col src-data g-data fan-in out-ch M N C H W KH KW SH SW PH PW OH OW)
+          (begin
+            (execute-im2col-nhwc-mr col src-data N C H W KH KW SH SW PH PW OH OW dtype)
+            (%conv-blas-gemm-strided be dtype fan-in out-ch M
+                                     1.0 col fan-in 'trans
+                                     g-data out-ch 'no-trans
+                                     0.0 dwt-buf)))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Reduction Morphism Execution

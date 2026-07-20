@@ -64,6 +64,9 @@
    blas-backend-conv-fwd-im2col-f32
    blas-backend-conv-bwd-data-im2col-f32
    blas-backend-conv-bwd-weights-im2col-f32
+   blas-backend-conv-fwd-nhwc-im2col-f32
+   blas-backend-conv-bwd-data-nhwc-im2col-f32
+   blas-backend-conv-bwd-weights-nhwc-im2col-f32
 
    ;; Backend registration and inspection
    register-blas-backend!
@@ -151,7 +154,14 @@
    axpy-f32          ; (N alpha data-x data-y) -> void, or #f
    conv-fwd-im2col-f32         ; (out bias col src weight M N K out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
    conv-bwd-data-im2col-f32    ; (dx col g wt M K N out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
-   conv-bwd-weights-im2col-f32)  ; (dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
+   conv-bwd-weights-im2col-f32 ; (dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
+   ;; NHWC counterparts: identical signatures to the slots above, but the
+   ;; im2col/col2im step reads/writes src/dx in NHWC layout [N,H,W,C]
+   ;; instead of NCHW. The col/weight/output layouts are unchanged (always
+   ;; the layout-independent matmul-ready [.., C*KH*KW] / [.., out_ch] form).
+   conv-fwd-nhwc-im2col-f32
+   conv-bwd-data-nhwc-im2col-f32
+   conv-bwd-weights-nhwc-im2col-f32)
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Configuration
