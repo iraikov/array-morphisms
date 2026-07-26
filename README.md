@@ -233,6 +233,27 @@ Type promotion rules:
 (define result (realize (morph-sqrt temp2)))
 ```
 
+## BLAS Backends
+
+Matmul, matvec, dot, axpy, and conv2d are dispatched through a pluggable `blas-backend`
+(`array-morphisms-blas-exec`). Three tiers are available:
+
+| Tier | Package | Dependencies | Default? |
+|---|---|---|---|
+| Pure Scheme | built in | none | fallback only |
+| microBLAS | built in (`array-morphisms-micro-blas-backend`) | none (vendored, header-only) | yes, auto-registered |
+| System BLAS | separate egg: [`array-morphisms-blas`](https://github.com/iraikov/array-morphisms-blas) | the `blas` egg + a system BLAS library | opt-in |
+
+The dependency-free microBLAS backend is registered automatically at load time if nothing else
+has registered a backend first, so `array-morphisms` alone never requires a system BLAS library.
+For maximum performance, install the companion `array-morphisms-blas` egg and register it
+explicitly (it overrides the default):
+
+```scheme
+(import array-morphisms-blas-egg-backend)
+(register-blas-backend! (make-blas-egg-backend))
+```
+
 ## Comparison with Fusion Arrays
 
 | Feature              | Fusion Arrays        | Array Morphisms                 |
