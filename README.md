@@ -254,17 +254,6 @@ explicitly (it overrides the default):
 (register-blas-backend! (make-blas-egg-backend))
 ```
 
-## Comparison with Fusion Arrays
-
-| Feature              | Fusion Arrays        | Array Morphisms                 |
-|----------------------|----------------------|----------------------------------|
-| Core abstraction     | Fusion arrays        | Array morphisms                  |
-| Structural ops       | Copy on non-contiguous | Zero-copy via MoA              |
-| Memory reuse         | Manual               | Automatic (context-based)        |
-| Index functions      | Hidden               | First-class, composable          |
-| Batch operations     | Limited              | First-class combinators          |
-| BLAS integration     | No                   | Yes (GEMM, GEMV, DOT)            |
-
 ## Examples
 
 ### Layer Normalization
