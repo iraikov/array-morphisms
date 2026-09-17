@@ -44,6 +44,11 @@
   (import array-morphisms-core)
   (import array-morphisms-realization)
 
+  ;; Mutable-cell and stack utilities (plain define files, kept private
+  ;; to this module).
+  (include "box.scm")
+  (include "stack.scm")
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Record Types
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -59,6 +64,19 @@
   ;;   assignment - #(buf-id ...)        alloc-id -> buf-id
   ;;   sizes      - #(count ...)         buf-id -> max element count
   (define-record buffer-pool buffers dtypes assignment sizes)
+
+  ;; Mutable state threaded through the greedy interval scheduling loop.
+  ;;   active      - alist: dtype -> list of (buf-id . end), live buffers
+  ;;   free        - alist: dtype -> list of (buf-id . max-size), reclaimable
+  ;;   buf-info    - list of (buf-id dtype max-size), most recent first
+  ;;   next-buf-id - id to assign to the next fresh logical buffer
+  (define-record-type allocator-state
+    (%make-allocator-state active free buf-info next-buf-id)
+    allocator-state?
+    (active      allocator-state-active      allocator-state-active-set!)
+    (free        allocator-state-free        allocator-state-free-set!)
+    (buf-info    allocator-state-buf-info    allocator-state-buf-info-set!)
+    (next-buf-id allocator-state-next-buf-id allocator-state-next-buf-id-set!))
 
   ;; Mutable execution context.
   ;;   mode    - symbol 'trace or 'replay
@@ -322,93 +340,115 @@
     (cons (cons dtype entries)
           (filter (lambda (p) (not (eq? (car p) dtype))) free)))
 
+  ;; Look up the recorded max size of logical buffer bid, or 0 if unknown.
+  (define (buf-info-max-size st bid)
+    (let ((r (find (lambda (x) (= (car x) bid))
+                   (allocator-state-buf-info st))))
+      (if r (caddr r) 0)))
+
+  ;; Move expired buffers of dtype into the dtype's free list, then
+  ;; retain only the still-live buffers on the active list.
+  (define (expire-buffers! st dtype i)
+    (let* ((active     (allocator-state-active st))
+           (dtype-active (active-get active dtype))
+           (still-live  (filter (lambda (e) (>= (cdr e) i)) dtype-active))
+           (expired     (filter (lambda (e) (<  (cdr e) i)) dtype-active)))
+      ;; Accumulate the expired entries onto the free list
+      (let ((dtype-free (list->stack (free-get (allocator-state-free st) dtype))))
+        (for-each
+         (lambda (e)
+           ;; e = (buf-id . end)
+           (stack-push! dtype-free
+                        (cons (car e) (buf-info-max-size st (car e)))))
+         expired)
+        (allocator-state-free-set!
+         st (free-set (allocator-state-free st) dtype (stack->list dtype-free))))
+      (allocator-state-active-set!
+       st (active-set active dtype still-live))))
+
+  ;; Find a free same-dtype buffer with capacity >= size, remove it from
+  ;; the free list, and grow its recorded max size if needed.
+  ;; Returns the buf-id, or #f when no reusable buffer exists.
+  (define (take-reusable-buffer! st dtype size)
+    (let* ((dtype-free (free-get (allocator-state-free st) dtype))
+           (reusable   (find (lambda (e) (>= (cdr e) size))
+                             dtype-free)))
+      (and reusable
+           (let ((bid (car reusable)))
+             ;; Update max-size in buf-info if current size is larger
+             (allocator-state-buf-info-set!
+              st
+              (map (lambda (x)
+                     (if (= (car x) bid)
+                         (list bid (cadr x) (max (caddr x) size))
+                         x))
+                   (allocator-state-buf-info st)))
+             ;; Remove the buffer from the dtype's free list
+             (allocator-state-free-set!
+              st
+              (free-set (allocator-state-free st) dtype
+                        (filter (lambda (e) (not (= (car e) bid)))
+                                dtype-free)))
+             bid))))
+
+  ;; Allocate a new logical slot for dtype and return its buf-id.
+  (define (allocate-fresh-buffer! st dtype size)
+    (let ((bid (allocator-state-next-buf-id st)))
+      (allocator-state-next-buf-id-set! st (+ bid 1))
+      (allocator-state-buf-info-set!
+       st (cons (list bid dtype size) (allocator-state-buf-info st)))
+      bid))
+
+  ;; Mark buffer bid as live for dtype with end-of-interval `end`.
+  (define (activate-buffer! st dtype bid end)
+    (allocator-state-active-set!
+     st
+     (active-set (allocator-state-active st) dtype
+                 (cons (cons bid end)
+                       (active-get (allocator-state-active st) dtype)))))
+
+  ;; Build the immutable pool from the recorded buffer metadata.
+  (define (build-buffer-pool st assignment)
+    (let* ((num-bufs    (allocator-state-next-buf-id st))
+           (sizes-vec   (make-vector num-bufs 0))
+           (dtypes-vec  (make-vector num-bufs 'f64))
+           (buffers-vec (make-vector num-bufs #f)))
+
+      (for-each (lambda (info)
+                  (let ((bid (car info)) (dtype (cadr info)) (sz (caddr info)))
+                    (vector-set! sizes-vec  bid sz)
+                    (vector-set! dtypes-vec bid dtype)))
+                (allocator-state-buf-info st))
+
+      ;; Allocate physical typed vectors
+      (do ((i 0 (+ i 1)))
+          ((= i num-bufs))
+        (vector-set! buffers-vec i
+                     (allocate-typed-vector (vector-ref dtypes-vec i)
+                                            (vector-ref sizes-vec  i))))
+
+      (make-buffer-pool buffers-vec dtypes-vec assignment sizes-vec)))
+
   (define (allocate-buffers allocs-vec n)
     "Greedy interval graph colouring by birth order, dtype-aware.
     Returns a buffer-pool record."
-    (let ((assignment  (make-vector n -1))
-          (active      '())    ; dtype -> list of (buf-id . end)
-          (free        '())    ; dtype -> list of (buf-id . max-size)
-          (buf-info    '())    ; growing list of (buf-id dtype max-size)
-          (next-buf-id 0))
-
+    (let ((assignment (make-vector n -1))
+          (st         (%make-allocator-state '() '() '() 0)))
       (do ((i 0 (+ i 1)))
           ((= i n))
-
         (let* ((rec   (vector-ref allocs-vec i))
                (dtype (allocation-rec-dtype rec))
                (size  (allocation-rec-size  rec))
                (end   (allocation-rec-last-use rec)))
-
-          ;; Expire buffers whose interval ended before i
-          (let* ((dtype-active  (active-get active dtype))
-                 (still-live    (filter (lambda (e) (>= (cdr e) i)) dtype-active))
-                 (expired       (filter (lambda (e) (<  (cdr e) i)) dtype-active)))
-
-            ;; Move expired entries into the free list
-            (let ((dtype-free (free-get free dtype)))
-              (for-each
-               (lambda (e)
-                 ;; e = (buf-id . end); find max-size from buf-info
-                 (let* ((bid       (car e))
-                        (max-size  (let ((r (find (lambda (x) (= (car x) bid))
-                                                  buf-info)))
-                                     (if r (caddr r) 0))))
-                   (set! dtype-free (cons (cons bid max-size) dtype-free))))
-               expired)
-              (set! free (free-set free dtype dtype-free))
-              (set! active (active-set active dtype still-live)))
-
-            ;; Find a free same-dtype buffer large enough to hold this alloc
-            (let* ((dtype-free (free-get free dtype))
-                   (reusable   (find (lambda (e) (>= (cdr e) size))
-                                     dtype-free)))
-
-              (if reusable
-                  ;; Reuse: remove from free, add to active
-                  (let ((bid (car reusable)))
-                    (vector-set! assignment i bid)
-                    ;; Update max-size in buf-info if current size is larger
-                    (set! buf-info
-                          (map (lambda (x)
-                                 (if (= (car x) bid)
-                                     (list bid (cadr x) (max (caddr x) size))
-                                     x))
-                               buf-info))
-                    (set! free   (free-set   free   dtype
-                                             (filter (lambda (e) (not (= (car e) bid)))
-                                                     dtype-free)))
-                    (set! active (active-set active dtype
-                                             (cons (cons bid end)
-                                                   (active-get active dtype)))))
-
-                  ;; No reusable buffer: allocate a new logical slot
-                  (let ((bid next-buf-id))
-                    (set! next-buf-id (+ bid 1))
-                    (set! buf-info    (cons (list bid dtype size) buf-info))
-                    (vector-set! assignment i bid)
-                    (set! active (active-set active dtype
-                                             (cons (cons bid end)
-                                                   (active-get active dtype))))))))))
-
-      ;; Build immutable pool from buf-info
-      (let* ((num-bufs    next-buf-id)
-             (sizes-vec   (make-vector num-bufs 0))
-             (dtypes-vec  (make-vector num-bufs 'f64))
-             (buffers-vec (make-vector num-bufs #f)))
-
-        (for-each (lambda (info)
-                    (let ((bid (car info)) (dtype (cadr info)) (sz (caddr info)))
-                      (vector-set! sizes-vec  bid sz)
-                      (vector-set! dtypes-vec bid dtype)))
-                  buf-info)
-
-        ;; Allocate physical typed vectors
-        (do ((i 0 (+ i 1)))
-            ((= i num-bufs))
-          (vector-set! buffers-vec i
-                       (allocate-typed-vector (vector-ref dtypes-vec i)
-                                              (vector-ref sizes-vec  i))))
-
-        (make-buffer-pool buffers-vec dtypes-vec assignment sizes-vec))))
+          (expire-buffers! st dtype i)
+          (let ((bid (take-reusable-buffer! st dtype size)))
+            (if bid
+                (begin
+                  (vector-set! assignment i bid)
+                  (activate-buffer! st dtype bid end))
+                (let ((new-bid (allocate-fresh-buffer! st dtype size)))
+                  (vector-set! assignment i new-bid)
+                  (activate-buffer! st dtype new-bid end))))))
+      (build-buffer-pool st assignment)))
 
 ) ;; end module

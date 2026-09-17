@@ -66,6 +66,11 @@
 
   (import scheme (chicken base) datatype srfi-1)
 
+  ;; Mutable-cell and stack utilities (plain define files, kept private
+  ;; to this module).
+  (include "box.scm")
+  (include "stack.scm")
+
 
   ;;; ==========================================================
   ;;; Layer 1: morph-env  -- immutable GC-safe associative map
@@ -188,8 +193,8 @@
   ;;; ==========================================================
   ;;; Layer 2: env-builder  -- functional core / imperative shell
   ;;;
-  ;;; Holds a mutable pointer to an immutable morph-env, plus a
-  ;;; reverse-order list for O(1) accumulation (items).
+  ;;; Holds a mutable pointer to an immutable morph-env, plus a stack
+  ;;; of emitted items (newest first) for O(1) accumulation.
   ;;;
   ;;; The immutable env is updated by rebinding the internal pointer;
   ;;; the env VALUE itself is never mutated.  This reconciles the need
@@ -214,7 +219,7 @@
     "Create an env-builder initialised with initial-env (default: empty).
      Returns a YASOS-style dispatch procedure."
     (let ((current-env initial-env)
-          (rev-items   '()))
+          (items-stack (make-stack)))
       (lambda (msg . args)
         (case msg
           ;; Lookup key; returns value or #f
@@ -224,19 +229,19 @@
           ((extend!)
            (set! current-env
                  (morph-env-extend current-env (car args) (cadr args))))
-          ;; Emit: cons item onto reverse list in O(1); returns item
+          ;; Emit: push item onto the stack in O(1); returns item
           ((emit!)
            (let ((item (car args)))
-             (set! rev-items (cons item rev-items))
+             (stack-push! items-stack item)
              item))
            ;; Snapshot: return (env . items-in-emission-order) as a single
            ;; value; env-builder-snapshot converts the pair to two values.
            ((snapshot)
-            (cons current-env (reverse rev-items)))
+            (cons current-env (reverse (stack->list items-stack))))
            ;; Read current env without items
            ((env)   current-env)
            ;; Read items in emission order
-           ((items) (reverse rev-items))
+           ((items) (reverse (stack->list items-stack)))
            (else
             (error "env-builder: unknown message" msg))))))
 

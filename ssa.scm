@@ -92,6 +92,11 @@
                 hash-table->alist
                 eq?-hash))
   (import datatype matchable)
+
+  ;; Mutable-cell and stack utilities (plain define files, kept private
+  ;; to this module).
+  (include "box.scm")
+  (include "stack.scm")
   (import array-morphisms-core)
   (import array-morphisms-index-fn)
   (import array-morphisms-basic-ops)
@@ -544,12 +549,12 @@
    Returns an ssa-program with outputs = (list loss-binding-val) and n-params = 0."
   (let* ((constants   (make-hash-table))  ; cid-symbol -> concrete-array
          (visited-eb  (make-env-builder)) ; stable-id (symbol) -> ssa-value
-         (bindings    '()))               ; accumulated in reverse topo order
+         (bindings-stack (make-stack)))   ; bindings, newest first (reverse topo order)
 
     (define (emit-binding! op inputs shape dtype meta)
       (let* ((bid (gensym 'bid-))
              (b   (make-ssa-binding bid op inputs shape dtype meta)))
-        (set! bindings (cons b bindings))  ; O(1); reversed at end
+        (stack-push! bindings-stack b)  ; O(1); reversed at end
         (binding-ref bid)))
 
     (define (visit m)
@@ -593,7 +598,7 @@
     (let* ((loss-m   (am:var-value loss-mv))
            (loss-val (visit loss-m)))
       (make-ssa-program constants (env-builder-env visited-eb)
-                        (reverse bindings) (list loss-val) 0 #f #f #f))))
+                        (reverse (stack->list bindings-stack)) (list loss-val) 0 #f #f #f))))
 
 
 ;;; ============================================================
@@ -628,8 +633,8 @@
   (let* (;; Build shape/dtype lookup from forward bindings (single env-builder)
          (fwd-bindings  (ssa-program-bindings fwd-prog))
          (binding-sd-eb (make-env-builder)) ; sym -> (shape . dtype)
-         ;; Accumulate backward bindings in reverse order; reverse at end
-         (bwd-bindings  '())
+         ;; Accumulate backward bindings newest-first; reverse at end
+         (bwd-bindings-stack (make-stack))
          ;; Adjoint table: bid-symbol -> ssa-value (the accumulated dL/d(bid))
          (adjoint-eb    (make-env-builder))
          ;; Param gradient table: cid-symbol -> ssa-value
@@ -664,11 +669,11 @@
       (let ((sd (env-builder-lookup binding-sd-eb (ssa-value-id v))))
         (and sd (cdr sd))))
 
-    ;; emit! -- create a new backward SSA binding (O(1) cons; reversed at end)
+    ;; emit! -- create a new backward SSA binding (O(1) push; reversed at end)
     (define (emit! op inputs shape dtype meta)
       (let* ((adj-id (gensym 'adj-))
              (b      (make-ssa-binding adj-id op inputs shape dtype meta)))
-        (set! bwd-bindings (cons b bwd-bindings))
+        (stack-push! bwd-bindings-stack b)
         (env-builder-extend! binding-sd-eb adj-id (cons shape dtype))
         (binding-ref adj-id)))
 
@@ -1166,7 +1171,7 @@
                              (env-builder-lookup param-grad-eb cid-sym)))
                          param-const-vals))
            (all-outputs  (cons loss-out-val grad-vals))
-           (all-bindings (append fwd-bindings (reverse bwd-bindings))))
+           (all-bindings (append fwd-bindings (reverse (stack->list bwd-bindings-stack)))))
       ;; Apply MoA psi-composition fusion to the full joint forward+backward program.
       ;; Cross-AD-boundary fusion is automatic: backward element-wise bindings
       ;; with use-count=1 are eligible under the same rules as forward ones.
@@ -2432,19 +2437,21 @@
       (if (not plan)
           '()
           (let ((counts       (make-hash-table))
-                (index-shapes '())
-                (reduce-specs '()))
+                (index-shapes (make-stack))
+                (reduce-specs (make-stack)))
             (do ((i 0 (+ i 1))) ((= i (vector-length plan)))
               (let* ((instr (vector-ref plan i))
                      (tag (cases replay-instruction instr
                             (ri-gemm             (_ _ _ _ _ _)           'ri-gemm)
                             (ri-gemm-strided     (_ _ _ _ _ _)           'ri-gemm-strided)
                             (ri-index            (_ shape _ _ _ _)
-                             (set! index-shapes (cons (cons i shape) index-shapes))
-                             'ri-index)
+                                                 (begin
+                                                   (stack-push! index-shapes (cons i shape))
+                                                   'ri-index))
                             (ri-reduce           (_ shape _ _ _ _ axes _ keepdims? _)
-                             (set! reduce-specs (cons (list i axes keepdims? shape) reduce-specs))
-                             'ri-reduce)
+                                                 (begin
+                                                   (stack-push! reduce-specs (list i axes keepdims? shape))
+                                                   'ri-reduce))
                             (ri-view             (_ _)                   'ri-view)
                             (ri-flat-unary       (_ _ _ _ _ _)           'ri-flat-unary)
                             (ri-flat-binary      (_ _ _ _ _ _ _)         'ri-flat-binary)
@@ -2452,14 +2459,15 @@
                             (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _)  'ri-gemm-epilogue)
                             (ri-alias            (_ _ _ _ _)             'ri-alias)
                             (ri-im2col           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-im2col)
-                            (ri-col2im           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)     'ri-col2im)
-                            (ri-conv-fwd         (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-conv-fwd)
-                            (ri-conv-bwd-data    (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  'ri-conv-bwd-data)
+                            (ri-col2im           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _)     'ri-col2im)
+                            (ri-conv-fwd         (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-conv-fwd)
+                            (ri-conv-bwd-data    (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  'ri-conv-bwd-data)
                             (ri-conv-bwd-weights (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  'ri-conv-bwd-weights))))
                 (hash-table-set! counts tag
                                  (+ (hash-table-ref/default counts tag 0) 1))))
             `((counts . ,(hash-table->alist counts))
-              (ri-index-shapes . ,(reverse index-shapes))
-              (ri-reduce-specs . ,(reverse reduce-specs)))))))
+              (ri-index-shapes . ,(reverse (stack->list index-shapes)))
+              (ri-reduce-specs . ,(reverse (stack->list reduce-specs)))))))
+    )
 
 ) ; end module array-morphisms-ssa

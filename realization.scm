@@ -85,7 +85,7 @@
    )
 
   (import scheme (scheme base) (chicken base) (chicken module))
-  (import (only srfi-1 make-list fold iota every zip drop-right take last drop append-map filter-map filter count fold-right))
+  (import (only srfi-1 make-list fold iota every zip drop-right take last drop append-map filter-map filter count fold-right find))
   (import (only srfi-4 f32vector f64vector s32vector s64vector u32vector u64vector
                        f32vector-length f64vector-length s32vector-length
                        s64vector-length u32vector-length u64vector-length
@@ -94,6 +94,11 @@
                        f32vector-set! f64vector-set! s32vector-set! s64vector-set!
                        u32vector-set! u64vector-set!))
   (import datatype matchable)
+
+  ;; Mutable-cell and stack utilities (plain define files, kept private
+  ;; to this module).
+  (include "box.scm")
+  (include "stack.scm")
 
   (import array-morphisms-core)
   (import array-morphisms-index-fn)
@@ -163,7 +168,7 @@
     "Realize morphism to concrete array.
 
     When current-morphism-context is #f (the default), all existing
-    behaviour is unchanged.  When it holds a dispatch vector installed
+    behavior is unchanged.  When it holds a dispatch vector installed
     by realize/ctx, context-aware variants are used for allocation."
 
     (let ((ctx (current-morphism-context)))
@@ -391,7 +396,7 @@
                 (do ((k 0 (+ k 1))) ((= k n))
                   (set! acc (+ acc (* (/ (typed-vector-ref e-vec dtype k) Z)
                                       (typed-vector-ref vd dtype
-                                        (+ v-base (* k vr0) (* p vr1)))))))
+                                                        (+ v-base (* k vr0) (* p vr1)))))))
                 (typed-vector-set! out-data dtype
                                    (+ out-base (* i dv) p) acc))))))))
 
@@ -2757,22 +2762,25 @@
             ))
         )
 
-      (define *1d-reduce-ones-cache* '())
+      ;; Cache of all-ones typed vectors keyed by (dtype . N), newest
+      ;; first; a stack holds the entries so insertion is a push and the
+      ;; whole list is never rebound.
+      (define *1d-reduce-ones-cache* (make-stack))
 
       (define (ones-vector dtype N)
         (let ((key (cons dtype N)))
-          (let loop ((cache *1d-reduce-ones-cache*))
-            (cond ((null? cache)
-                   (let ((v (allocate-typed-vector dtype N)))
-                     (case dtype
-                       ((f32) (do ((i 0 (+ i 1))) ((= i N)) (f32vector-set! v i 1.0)))
-                       ((f64) (do ((i 0 (+ i 1))) ((= i N)) (f64vector-set! v i 1.0)))
-                       (else  (do ((i 0 (+ i 1))) ((= i N)) (typed-vector-set! v dtype i 1.0))))
-                     (set! *1d-reduce-ones-cache* (cons (cons key v) *1d-reduce-ones-cache*))
-                     v))
-                  ((and (eq? (car key) (caar cache)) (= (cdr key) (cdar cache)))
-                   (cdar cache))
-                  (else (loop (cdr cache)))))))
+          (or (find (lambda (entry)
+                      (and (eq? (car key) (caar entry))
+                           (= (cdr key) (cdar entry))))
+                    (unbox *1d-reduce-ones-cache*))
+              (let ((v (allocate-typed-vector dtype N)))
+                (case dtype
+                  ((f32) (do ((i 0 (+ i 1))) ((= i N)) (f32vector-set! v i 1.0)))
+                  ((f64) (do ((i 0 (+ i 1))) ((= i N)) (f64vector-set! v i 1.0)))
+                  (else  (do ((i 0 (+ i 1))) ((= i N)) (typed-vector-set! v dtype i 1.0))))
+                (stack-push! *1d-reduce-ones-cache* (cons key v))
+                v))
+          ))
 
       (define (reduce-1d-sum-mean-via-dot! dtype N op)
         (let ((fn (cond ((and (eq? dtype 'f32) *active-backend*)
