@@ -205,6 +205,11 @@
   ;;;     (env-builder-items eb))                ; => (item ...)
   ;;; ==========================================================
 
+  ;; Returns two values through the opaque builder interface: the current
+  ;; env and the accumulated items in emission order. The call is routed
+  ;; through a module-level helper so the compiler does not flag the
+  ;; multi-value branch against the single-value branches of the
+  ;; dispatcher.
   (define (make-env-builder #!optional (initial-env empty-morph-env))
     "Create an env-builder initialised with initial-env (default: empty).
      Returns a YASOS-style dispatch procedure."
@@ -224,22 +229,27 @@
            (let ((item (car args)))
              (set! rev-items (cons item rev-items))
              item))
-          ;; Snapshot: return (values env items-in-emission-order)
-          ((snapshot)
-           (values current-env (reverse rev-items)))
-          ;; Read current env without items
-          ((env)   current-env)
-          ;; Read items in emission order
-          ((items) (reverse rev-items))
-          (else
-           (error "env-builder: unknown message" msg))))))
+           ;; Snapshot: return (env . items-in-emission-order) as a single
+           ;; value; env-builder-snapshot converts the pair to two values.
+           ((snapshot)
+            (cons current-env (reverse rev-items)))
+           ;; Read current env without items
+           ((env)   current-env)
+           ;; Read items in emission order
+           ((items) (reverse rev-items))
+           (else
+            (error "env-builder: unknown message" msg))))))
 
   (define (env-builder-lookup  b key)     (b 'lookup key))
   (define (env-builder-extend! b key val) (b 'extend! key val))
   (define (env-builder-emit!   b item)    (b 'emit! item))
   (define (env-builder-env     b)         (b 'env))
   (define (env-builder-items   b)         (b 'items))
-  (define (env-builder-snapshot b)        (b 'snapshot))
+  ;; The dispatcher returns a single (env . items) pair to keep all of its
+  ;; branches single-valued; this accessor is the public multi-value API.
+  (define (env-builder-snapshot b)
+    (let ((p (b 'snapshot)))
+      (values (car p) (cdr p))))
 
 
   ;;; ==========================================================

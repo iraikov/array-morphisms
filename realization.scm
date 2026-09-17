@@ -84,7 +84,7 @@
    execute-conv-bwd-weights-nhwc-blas
    )
 
-  (import scheme chicken.base chicken.module)
+  (import scheme (scheme base) (chicken base) (chicken module))
   (import (only srfi-1 make-list fold iota every zip drop-right take last drop append-map filter-map filter count fold-right))
   (import (only srfi-4 f32vector f64vector s32vector s64vector u32vector u64vector
                        f32vector-length f64vector-length s32vector-length

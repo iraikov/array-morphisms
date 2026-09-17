@@ -21,7 +21,7 @@
    morphism-expr               ; Constructor
    reduction-morphism          ; Constructor
 
-   ;; Stable per-node identity (GC-safe symbol, survives minor GC moves)
+   ;; Stable per-node identity
    morph-id           ; accessor: morphism-expr, reduction-morphism -> symbol
    morph-stable-id    ; unified helper for all three variants
 
@@ -224,7 +224,7 @@
    flatten-nested-list
    )
 
-  (import scheme (chicken base) srfi-4 datatype srfi-1 srfi-69)
+  (import scheme (scheme base) (chicken base) srfi-4 datatype srfi-1 srfi-69)
 
   (define (typed-vector? x)
     (or (f32vector? x)
@@ -319,7 +319,7 @@
   combiner      ; Function combining retrieved values
   input-shapes) ; Operand shapes for validation
 
-;; Morphism composition: f ∘ g
+;; Morphism composition: f o g
 (define-record composed-index-fn
   outer         ; Outer morphism index function
   inner)        ; Inner morphism index function

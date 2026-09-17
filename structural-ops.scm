@@ -918,7 +918,7 @@
            
            ;; Output shape
            (output-shape (make-vector (vector-length first-shape)))
-           (_ (vector-copy! first-shape output-shape))
+           (_ (vector-copy! output-shape 0 first-shape 0 (vector-length first-shape)))
            (_ (vector-set! output-shape norm-axis concat-size))
            
            ;; Common dtype

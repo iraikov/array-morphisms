@@ -3,7 +3,7 @@
 ;;; Usage: csi -s tests/run.scm   (from the project root)
 ;;;        csi -s run.scm         (from within tests/)
 
-(import scheme (chicken base) test)
+(import scheme (scheme base) (chicken base) test)
 
 ;;; Override test-exit so included files do not terminate the process early.
 ;;; test-failure-count is a global parameter in the test egg that accumulates
