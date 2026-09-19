@@ -307,7 +307,7 @@ explicitly (it overrides the default):
 
 ## Requirements
 
-- CHICKEN Scheme 5.0+
+- CHICKEN Scheme 6.0+
 - Dependencies: datatype, matchable, srfi-1, srfi-4, srfi-69
 - Optional: BLAS library for accelerated linear algebra
 
