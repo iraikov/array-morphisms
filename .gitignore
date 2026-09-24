@@ -1,7 +1,18 @@
-*.ss~
+*~
+
 *.ss#*
 .#*.ss
 
 *.scm~
 *.scm#*
 .#*.scm
+*.import.scm
+
+
+*.build.sh
+*.install.sh
+
+*.link
+*.a
+*.o
+*.so
