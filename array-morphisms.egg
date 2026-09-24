@@ -21,6 +21,7 @@
              (extension array-morphisms-basic-ops (source "basic-ops.scm") (csc-options "-O3" "-d1"))
              (extension array-morphisms-blas-compat (source "blas-compat.scm")   (csc-options "-O2" "-d1"))
              (extension array-morphisms-blas-exec   (source "blas-exec.scm")     (csc-options "-O2" "-d1"))
+             (extension array-morphisms-activation-exec (source "activation-exec.scm") (csc-options "-O2" "-d1"))
              (extension array-morphisms-structural-ops (source "structural-ops.scm") (csc-options "-O2" "-d1"))
 
              ;; Vendored, header-only microBLAS backend: dependency-free
@@ -35,7 +36,8 @@
                         (component-dependencies array-morphisms-blas-exec))
 
              (extension array-morphisms-realization (source "realization.scm") (csc-options "-O3" "-d1")
-                        (component-dependencies array-morphisms-micro-blas-backend))
+                        (component-dependencies array-morphisms-micro-blas-backend
+                                                array-morphisms-activation-exec))
              (extension array-morphisms-context     (source "context.scm")     (csc-options "-O2" "-d1"))
              (extension array-morphisms-batch-ops   (source "batch-ops.scm")   (csc-options "-O2" "-d1"))
              (extension array-morphisms-grad        (source "grad.scm")        (csc-options "-O2" "-d1"))
@@ -43,7 +45,8 @@
              (extension array-morphisms-ssa         (source "ssa.scm")         (csc-options "-O3" "-d1")
                         (component-dependencies array-morphisms-grad
                                                 array-morphisms-realization
-                                                array-morphisms-context))
+                                                array-morphisms-context
+                                                array-morphisms-activation-exec))
              )
 
  (test-dependencies test)

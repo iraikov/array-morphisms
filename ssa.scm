@@ -58,6 +58,7 @@
    replay-instruction replay-instruction?
    ri-gemm ri-gemm-strided ri-index ri-reduce ri-view
    ri-flat-unary ri-flat-binary ri-flat-bias-broadcast
+   ri-activation-unary
    ri-gemm-epilogue ri-alias
    ri-im2col ri-col2im
    ri-conv-fwd ri-conv-bwd-data ri-conv-bwd-weights
@@ -103,6 +104,7 @@
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-exec)
   (import array-morphisms-blas-compat)
+  (import array-morphisms-activation-exec)
   (import array-morphisms-realization)
   (import array-morphisms-context)
   (import array-morphisms-morph-env)
@@ -232,6 +234,21 @@
     (out-shape    vector?)
     (out-strides  vector?)
     (out-dtype    symbol?)
+    (combiner     procedure?)
+    (in-A         replay-ref?))
+
+  ;; Element-wise activation: output[i] = op(A[i]), where op is one of the
+  ;; activation op names of array-morphisms-activation-exec.
+  ;; Emitted under the same layout conditions as ri-flat-unary.  At
+  ;; execution time the active activation backend's kernel for op, if any,
+  ;; replaces the per-element combiner loop; combiner is the fallback and
+  ;; computes the same values.
+  (ri-activation-unary
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (op           symbol?)
     (combiner     procedure?)
     (in-A         replay-ref?))
 
@@ -983,12 +1000,12 @@
                   (accumulate-input-adjoint! x-val dx)))
 
                ;; relu(x) -- dx = g * heaviside(x)
-               ;; Decomposed as: hx = map(heaviside, x); dx = mul(g, hx)
+               ;; Decomposed as: hx = relu-deriv(x); dx = mul(g, hx)
                ;; (abs-style decomposition keeps rebuild-morphism simple)
                ((eq? op 'relu)
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
-                       (hx      (emit! 'map (list x-val) x-shape dtype
+                       (hx      (emit! 'relu-deriv (list x-val) x-shape dtype
                                         `((fn . ,(lambda (xv) (if (> xv 0.0) 1.0 0.0)))
                                           (combiner . ,(lambda (xv) (if (> xv 0.0) 1.0 0.0))))))
                        (dx-raw  (emit! 'mul (list g-val hx) g-shape dtype
@@ -1001,7 +1018,7 @@
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
                        (fwd-out (binding-ref bid-sym))
-                       (deriv   (emit! 'map (list fwd-out) g-shape dtype
+                       (deriv   (emit! 'sigmoid-deriv (list fwd-out) g-shape dtype
                                         `((fn . ,(lambda (sv) (* sv (- 1.0 sv))))
                                           (combiner . ,(lambda (sv) (* sv (- 1.0 sv)))))))
                        (dx-raw  (emit! 'mul (list g-val deriv) g-shape dtype
@@ -1014,7 +1031,7 @@
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
                        (fwd-out (binding-ref bid-sym))
-                       (deriv   (emit! 'map (list fwd-out) g-shape dtype
+                       (deriv   (emit! 'tanh-deriv (list fwd-out) g-shape dtype
                                         `((fn . ,(lambda (tv) (- 1.0 (* tv tv))))
                                           (combiner . ,(lambda (tv) (- 1.0 (* tv tv)))))))
                        (dx-raw  (emit! 'mul (list g-val deriv) g-shape dtype
@@ -1128,8 +1145,10 @@
                ((equal? op '(reduce max))
                 (void))
 
-               ;; map(x, fn) -- no grad (non-differentiable; sign fn used in abs backward)
-               ((eq? op 'map)
+               ;; map(x, fn) -- no grad (non-differentiable; sign fn used in abs backward).
+               ;; The activation derivative ops are maps too, emitted only in the
+               ;; backward pass, and likewise have no gradient of their own.
+               ((memq op '(map relu-deriv sigmoid-deriv tanh-deriv))
                 (void))
 
                (else
@@ -1265,7 +1284,9 @@
       ((eq? op 'relu)    (morph-relu    (car inputs)))
       ((eq? op 'sigmoid) (morph-sigmoid (car inputs)))
       ((eq? op 'tanh)    (morph-tanh-am (car inputs)))
-       ((eq? op 'map)
+       ;; map, and the activation derivative ops, which ssa-vjp emits as maps
+       ;; under their own op names so they can be compiled to ri-activation-unary.
+       ((memq op '(map relu-deriv sigmoid-deriv tanh-deriv))
         (let ((fn (cdr (assq 'fn meta))))
           (morph-map fn (car inputs))))
 
@@ -1869,6 +1890,16 @@
            ((not (compute-index-fn? index-fn))
             (ri-index pool-idx shape strides dtype index-fn in-refs))
 
+           ;; Activation op, unary, row-major, same shape.  Fused bindings are
+           ;; excluded: they keep the consumer's op name but carry a composed
+           ;; combiner, so the op's own kernel would compute the wrong function.
+           ((and (activation-op-registered? op)
+                 (not (assq 'fused? meta))
+                 (flat-unary-eligible? shape in-traces))
+            (ri-activation-unary pool-idx shape strides dtype op
+                                 (compute-index-fn-combiner index-fn)
+                                 (car in-refs)))
+
            ;; Fast path 1: unary, row-major, same shape
            ((flat-unary-eligible? shape in-traces)
             (ri-flat-unary pool-idx shape strides dtype
@@ -1959,6 +1990,14 @@
                    (g-dtype    (ssa-binding-dtype g)))
               (cases replay-instruction e-instr
                 (ri-flat-unary (_ _ _ _ e-comb _)
+                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
+                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
+                                      (car g-in-refs) (cadr g-in-refs)
+                                      'unary e-comb 0 (rr-val 0)))
+                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
+                ;; An activation directly after its GEMM stays a combiner
+                ;; epilogue applied in place to the GEMM output.
+                (ri-activation-unary (_ _ _ _ _ e-comb _)
                   (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
                     (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
                                       (car g-in-refs) (cadr g-in-refs)
@@ -2146,6 +2185,18 @@
                           (execute-flat-unary-compute combiner data src-dtype buf size dtype)
                           (make-pool-arr pool-idx shape strides dtype))
                         (else (error "ri-flat-unary: source not concrete" src))))))
+
+                (ri-activation-unary (pool-idx shape strides dtype op combiner in-A)
+                  (time-instr 'ri-activation-unary
+                    (let* ((src  (deref in-A))
+                           (buf  (vector-ref pool-bufs pool-idx))
+                           (size (shape-size shape)))
+                      (cases array-morphism src
+                        (concrete-array (data _ _ _ src-dtype _ _)
+                          (execute-activation-unary-compute op combiner data src-dtype
+                                                            buf size dtype)
+                          (make-pool-arr pool-idx shape strides dtype))
+                        (else (error "ri-activation-unary: source not concrete" src))))))
 
                 (ri-flat-binary (pool-idx shape strides dtype combiner in-A in-B)
                   (time-instr 'ri-flat-binary
@@ -2454,6 +2505,7 @@
                                                    'ri-reduce))
                             (ri-view             (_ _)                   'ri-view)
                             (ri-flat-unary       (_ _ _ _ _ _)           'ri-flat-unary)
+                            (ri-activation-unary (_ _ _ _ _ _ _)         'ri-activation-unary)
                             (ri-flat-binary      (_ _ _ _ _ _ _)         'ri-flat-binary)
                             (ri-flat-bias-broadcast (_ _ _ _ _ _ _ _)   'ri-flat-bias-broadcast)
                             (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _)  'ri-gemm-epilogue)

@@ -911,7 +911,17 @@
            (x-m (morph-from-list xs #(3) 'f64))
            (got (map exact->inexact (concrete->list (realize (morph-tanh-am x-m)))))
            (exp (map my-tanh xs)))
-      (lists-approx= got exp))))
+      (lists-approx= got exp)))
+
+  (test "tanh: saturates to +-1.0 for large |x| instead of overflowing"
+    '(1.0 -1.0 1.0 -1.0)
+    (let ((x-m (morph-from-list '(400.0 -400.0 710.0 -710.0) #(4) 'f64)))
+      (map exact->inexact (concrete->list (realize (morph-tanh-am x-m))))))
+
+  (test "tanh: f32 saturates to +-1.0 for large |x|"
+    '(1.0 -1.0)
+    (let ((x-m (morph-from-list '(400.0 -400.0) #(2) 'f32)))
+      (map exact->inexact (concrete->list (realize (morph-tanh-am x-m)))))))
 
 
 (test-group "E1: var-relu SSA gradient"

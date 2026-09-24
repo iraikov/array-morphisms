@@ -52,6 +52,7 @@
 
    ;; Flat-loop fast-path kernels (zero allocation per element; called by SSA replay plan)
    execute-flat-unary-compute
+   execute-activation-unary-compute
    execute-flat-binary-compute
    execute-flat-bias-broadcast-compute
    execute-flat-unary-compute-inplace!
@@ -105,6 +106,7 @@
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-compat)
   (import array-morphisms-blas-exec)
+  (import array-morphisms-activation-exec)
   (import array-morphisms-micro-blas-backend)
 
   ;; Default-backend bootstrap: register the dependency-free microBLAS
@@ -1261,6 +1263,19 @@
          ((s64) (do ((i 0 (+ i 1))) ((= i size))
                   (s64vector-set! output-buffer i (inexact->exact (truncate (combiner (typed-vector-ref data src-dtype i)))))))
          (else (error "execute-flat-unary-compute: unsupported dtype" dtype))))))
+
+  ;; Element-wise activation over a whole array.  When the active
+  ;; activation backend has a kernel for op on arrays of this dtype, and the
+  ;; source and output share that dtype, the kernel processes all size
+  ;; elements in one call.  In every other case the combiner is applied per
+  ;; element exactly as in execute-flat-unary-compute.
+  (define (execute-activation-unary-compute op combiner data src-dtype output-buffer size dtype)
+    (let ((kernel (and (eq? src-dtype dtype)
+                       (memq dtype '(f32 f64))
+                       (lookup-activation-kernel (active-activation-backend) op dtype))))
+      (if kernel
+          (kernel size data output-buffer)
+          (execute-flat-unary-compute combiner data src-dtype output-buffer size dtype))))
 
   ;; src-dtype1/src-dtype2 are the input dtypes; dtype is the output dtype.
   ;; See execute-flat-unary-compute above for why the f32/f32/f32 and

@@ -26,5 +26,6 @@
 (include-relative "test-grad-check.scm")
 (include-relative "test-attention.scm")
 (include-relative "test-ssa.scm")
+(include-relative "test-activation-exec.scm")
 
 (exit (min 255 (test-failure-count)))

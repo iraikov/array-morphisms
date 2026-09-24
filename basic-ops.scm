@@ -276,10 +276,14 @@
     ((relu)    (lambda (x) (max 0.0 (exact->inexact x))))
     ((sigmoid) (lambda (x) (let ((xf (exact->inexact x)))
                               (/ 1.0 (+ 1.0 (exp (- xf)))))))
+    ;; tanh x = sign(x) (1 - e) / (1 + e) with e = exp(-2|x|).  Since
+    ;; e <= 1 this never overflows, so large |x| gives +-1.0 rather than
+    ;; the NaN of inf/inf.
     ((tanh)    (lambda (x)
                  (let* ((xf (exact->inexact x))
-                        (e2 (exp (* 2.0 xf))))
-                   (/ (- e2 1.0) (+ e2 1.0)))))
+                        (e  (exp (* -2.0 (abs xf))))
+                        (t  (/ (- 1.0 e) (+ 1.0 e))))
+                   (if (< xf 0.0) (- t) t))))
 
     (else (error "Unknown unary operation" operation))))
 
