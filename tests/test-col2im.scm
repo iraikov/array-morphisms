@@ -327,4 +327,32 @@
 ;;; Run Tests
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Strided column input
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(test-group "col2im - Strided column input"
+  ;; A column array given as a zero-copy transposed view must give the
+  ;; same image as the same values stored contiguously.
+  (let* ((N 2) (C 2) (H 4) (W 4) (K 3) (S 1) (P 1)
+         (OHOW 16) (FI (* C K K))
+         ;; t[n][p][f] = value; the classic layout is col[n][f][p] = t[n][p][f]
+         (value (lambda (n p f) (* 0.01 (+ (* n 1000) (* p 37) (* f 11)))))
+         (t-data (append-map (lambda (n)
+                               (append-map (lambda (p) (map (lambda (f) (value n p f)) (iota FI)))
+                                           (iota OHOW)))
+                             (iota N)))
+         (c-data (append-map (lambda (n)
+                               (append-map (lambda (f) (map (lambda (p) (value n p f)) (iota OHOW)))
+                                           (iota FI)))
+                             (iota N)))
+         (t-morph (morph-from-list t-data (vector N OHOW FI) 'f64))
+         (view    (morph-transpose t-morph '(0 2 1)))       ; [N, FI, OHOW], strided
+         (contig  (morph-from-list c-data (vector N FI OHOW) 'f64))
+         (target  (vector N C H W)))
+    (test-assert "transposed view and contiguous copy give the same image"
+      (morphism-values-equal? (col2im-morph view target (list K K) S P)
+                              (col2im-morph contig target (list K K) S P)
+                              1e-9))))
+
 (test-exit)

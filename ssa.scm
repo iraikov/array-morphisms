@@ -58,7 +58,7 @@
    replay-instruction replay-instruction?
    ri-gemm ri-gemm-strided ri-index ri-reduce ri-view
    ri-flat-unary ri-flat-binary ri-flat-bias-broadcast
-   ri-activation-unary
+   ri-activation-unary ri-activation-binary
    ri-gemm-epilogue ri-alias
    ri-im2col ri-col2im
    ri-conv-fwd ri-conv-bwd-data ri-conv-bwd-weights
@@ -80,6 +80,7 @@
     replay-timing-results)
 
   (import scheme (chicken base) (chicken time) (chicken format))
+  (import (only (scheme time) current-jiffy jiffies-per-second))
   (import (only srfi-1 iota fold filter map for-each append-map filter-map every))
   (import (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
@@ -259,6 +260,21 @@
     (out-shape    vector?)
     (out-strides  vector?)
     (out-dtype    symbol?)
+    (combiner     procedure?)
+    (in-A         replay-ref?)
+    (in-B         replay-ref?))
+
+  ;; Element-wise binary op: output[i] = op(A[i], B[i]), where op is one of
+  ;; the binary op names of array-morphisms-activation-exec.  Emitted under
+  ;; the same layout conditions as ri-flat-binary.  At execution time the
+  ;; active backend's binary kernel for op, if any, replaces the
+  ;; per-element combiner loop; combiner is the fallback.
+  (ri-activation-binary
+    (out-pool-idx integer?)
+    (out-shape    vector?)
+    (out-strides  vector?)
+    (out-dtype    symbol?)
+    (op           symbol?)
     (combiner     procedure?)
     (in-A         replay-ref?)
     (in-B         replay-ref?))
@@ -1324,7 +1340,9 @@
                (N     (vector-ref col-s 0))
                (fi    (vector-ref col-s 1))
                (ohow  (vector-ref col-s 2))
-               (col-r (morph-reshape col (vector (* N ohow) fi)))
+               ;; col is [N, fan_in, OH_OW]; bring OH_OW next to N before
+               ;; flattening to the matmul-ready [N*OH_OW, fan_in].
+               (col-r (morph-reshape (morph-transpose col '(0 2 1)) (vector (* N ohow) fi)))
                (res   (morph-matmul col-r wt-m)))
           (morph+ res b-m)))
 
@@ -1347,8 +1365,11 @@
                (fi    (vector-ref (get-morphism-shape wt-m) 0))
                (OH    (if meta-so (car  (cdr meta-so)) (error "conv2d-bwd-data rebuild: no spatial-output")))
                (OW    (if meta-so (cadr (cdr meta-so)) (error "conv2d-bwd-data rebuild: no spatial-output")))
-               ;; reshape g-col to classic [N, fan_in, OH_OW] for col2im
-               (g-col-3d (morph-reshape g-col (vector N fi (* OH OW)))))
+               ;; g-col rows are ordered (n, oh_ow); split them into
+               ;; [N, OH_OW, fan_in], then transpose to the classic
+               ;; [N, fan_in, OH_OW] layout that col2im expects.
+               (g-col-3d (morph-transpose (morph-reshape g-col (vector N (* OH OW) fi))
+                                          '(0 2 1))))
           (col2im-morph g-col-3d x-shape kernel-size stride padding layout: layout)))
 
        ;; conv2d-bwd-weights: reference: col^T @ g
@@ -1365,7 +1386,9 @@
                (N     (vector-ref col-s 0))
                (fi    (vector-ref col-s 1))
                (ohow  (vector-ref col-s 2))
-               (col-r (morph-reshape col (vector (* N ohow) fi)))
+               ;; col is [N, fan_in, OH_OW]; transpose before flattening to
+               ;; the matmul-ready [N*OH_OW, fan_in].
+               (col-r (morph-reshape (morph-transpose col '(0 2 1)) (vector (* N ohow) fi)))
                ;; col-r [N*OH_OW, fan_in] -> col-t [fan_in, N*OH_OW]
                (col-t (morph-transpose col-r '(1 0))))
           ;; col-t [fan_in, N*OH_OW] @ g [N*OH_OW, out_ch] = dwt [fan_in, out_ch]
@@ -1529,6 +1552,8 @@
              (new-strs (compute-strides shape))
              (rank     (vector-length shape)))
          (cond
+          ((and (<= rank 4) (lookup-copy-kernel (active-activation-backend) dtype))
+           => (lambda (kernel) (kernel data offset shape strides new-data)))
           ((and (eq? dtype 'f32) (<= rank 4))
            (%copy-concrete-array-fast-f32 data shape strides offset new-data))
           ((and (eq? dtype 'f64) (<= rank 4))
@@ -1906,6 +1931,16 @@
                            (compute-index-fn-combiner index-fn)
                            (car in-refs)))
 
+           ;; Registered binary op, both operands row-major with the
+           ;; output's shape.  Fused bindings are excluded, as for
+           ;; activations.
+           ((and (binary-op-registered? op)
+                 (not (assq 'fused? meta))
+                 (flat-binary-eligible? shape in-traces))
+            (ri-activation-binary pool-idx shape strides dtype op
+                                  (compute-index-fn-combiner index-fn)
+                                  (car in-refs) (cadr in-refs)))
+
            ;; Fast path 2: binary, both row-major, same shape
            ((flat-binary-eligible? shape in-traces)
             (ri-flat-binary pool-idx shape strides dtype
@@ -1952,6 +1987,17 @@
     ;; When found, pre-compile ri-gemm-epilogue for the GEMM position and
     ;; arrange for ri-alias at the epilogue position.
     (define use-counts (ssa-compute-use-counts bindings))
+    ;; Pool slot holding the value of binding input v at replay time, or #f
+    ;; for constants and values without a slot.  A view shares the
+    ;; allocation id, and so the slot, of the array it views.
+    (define (input-pool-idx v)
+      (cases ssa-value v
+        (binding-ref (bid)
+          (let ((info (morph-env-lookup trace-info bid)))
+            (and info
+                 (let ((aid (concrete-alloc-id (car info))))
+                   (and (>= aid 0) (context-alloc->pool-idx ctx aid))))))
+        (else #f)))
     (define gemm-epilogue-eb (make-env-builder))  ;; g.name -> ri-gemm-epilogue
     (define epilogue-gemm-eb (make-env-builder))  ;; e.name -> g's position index
     (let lp ((bs bindings) (i 0))
@@ -1988,6 +2034,11 @@
                    (g-shape    (ssa-binding-shape g))
                    (g-strides  (compute-strides g-shape))
                    (g-dtype    (ssa-binding-dtype g)))
+              ;; The fused instruction writes the product straight into e's
+              ;; slot while it still reads g's inputs.  The trace allocated
+              ;; e's slot only after g had run, so it may be the slot of one
+              ;; of g's inputs; the pair is then left unfused.
+              (unless (memv e-pool-idx (filter-map input-pool-idx (ssa-binding-inputs g)))
               (cases replay-instruction e-instr
                 (ri-flat-unary (_ _ _ _ e-comb _)
                   (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
@@ -2009,7 +2060,7 @@
                                       (car g-in-refs) (cadr g-in-refs)
                                       'bias-broadcast e-comb N e-in-B))
                   (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
-                (else #f)))))
+                (else #f))))))
         (lp (cdr bs) (+ i 1))))
 
     (let loop ((bs bindings) (i 0))
@@ -2069,29 +2120,40 @@
 
 ;; Timing is accumulated in a hash table tag -> total-ms across all steps.
 ;; Call replay-timing-reset! before a timing run; replay-timing-results after.
+;; Times are wall-clock milliseconds (microsecond resolution), so that
+;; kernels running on several threads are not over-counted.  The
+;; per-tag-counts entry gives how many instructions ran under each tag.
 (define *timing-enabled?* #f)
 (define *timing-table* (make-hash-table eq?))
+(define *timing-counts* (make-hash-table eq?))
 (define *timing-steps* 0)
 
 (define (replay-timing-reset!)
   (set! *timing-table* (make-hash-table eq?))
+  (set! *timing-counts* (make-hash-table eq?))
   (set! *timing-steps* 0)
   (set! *timing-enabled?* #t))
 
 (define (replay-timing-results)
   (set! *timing-enabled?* #f)
   (list (cons 'steps *timing-steps*)
-        (cons 'per-tag (hash-table->alist *timing-table*))))
+        (cons 'per-tag (hash-table->alist *timing-table*))
+        (cons 'per-tag-counts (hash-table->alist *timing-counts*))))
+
+(define (timing-wall-ms)
+  (/ (* 1000.0 (current-jiffy)) (jiffies-per-second)))
 
 (define-syntax time-instr
   (syntax-rules ()
     ((_ tag body ...)
      (if *timing-enabled?*
-         (let* ((t0 (current-process-milliseconds))
+         (let* ((t0 (timing-wall-ms))
                 (result (begin body ...))
-                (elapsed (- (current-process-milliseconds) t0)))
+                (elapsed (- (timing-wall-ms) t0)))
            (hash-table-set! *timing-table* tag
                             (+ elapsed (hash-table-ref/default *timing-table* tag 0)))
+           (hash-table-set! *timing-counts* tag
+                            (+ 1 (hash-table-ref/default *timing-counts* tag 0)))
            result)
          (begin body ...)))))
 
@@ -2213,6 +2275,22 @@
                             (else (error "ri-flat-binary: B not concrete" B))))
                         (else (error "ri-flat-binary: A not concrete" A))))))
 
+                (ri-activation-binary (pool-idx shape strides dtype op combiner in-A in-B)
+                  (time-instr 'ri-activation-binary
+                    (let* ((A    (deref in-A))
+                           (B    (deref in-B))
+                           (buf  (vector-ref pool-bufs pool-idx))
+                           (size (shape-size shape)))
+                      (cases array-morphism A
+                        (concrete-array (data1 _ _ _ src-dtype1 _ _)
+                          (cases array-morphism B
+                            (concrete-array (data2 _ _ _ src-dtype2 _ _)
+                              (execute-activation-binary-compute op combiner data1 src-dtype1
+                                                                 data2 src-dtype2 buf size dtype)
+                              (make-pool-arr pool-idx shape strides dtype))
+                            (else (error "ri-activation-binary: B not concrete" B))))
+                        (else (error "ri-activation-binary: A not concrete" A))))))
+
                 (ri-flat-bias-broadcast (pool-idx shape strides dtype combiner N in-A in-B)
                   (time-instr 'ri-flat-bias-broadcast
                     (let* ((A    (deref in-A))
@@ -2265,7 +2343,8 @@
                     (let* ((src (deref src-ref))
                            (buf (vector-ref pool-bufs pool-idx)))
                       (cases array-morphism src
-                        (concrete-array (src-data _ _ _ _ _ _)
+                        (concrete-array (_ _ _ _ _ _ _)
+                          (let ((src-data (concrete-data/row-major src)))
                           (case col-layout
                             ((nchw-standard)
                              (execute-im2col-unbatched buf src-data C H W KH KW SH SW PH PW OH OW dtype))
@@ -2273,7 +2352,7 @@
                              (execute-im2col-batched buf src-data N C H W KH KW SH SW PH PW OH OW dtype))
                             ((nhwc-classic)
                              (execute-im2col-nhwc-classic buf src-data N C H W KH KW SH SW PH PW OH OW dtype))
-                            (else (error "ri-im2col: unknown col-layout" col-layout)))
+                            (else (error "ri-im2col: unknown col-layout" col-layout))))
                           (make-pool-arr pool-idx shape strides dtype))
                         (else (error "ri-im2col: source not concrete" src))))))
 
@@ -2283,7 +2362,8 @@
                     (let* ((col (deref col-ref))
                            (buf (vector-ref pool-bufs pool-idx)))
                       (cases array-morphism col
-                        (concrete-array (col-data col-shape _ _ _ _ _)
+                        (concrete-array (_ col-shape _ _ _ _ _)
+                          (let ((col-data (concrete-data/row-major col)))
                           (case col-layout
                             ((nchw-standard)
                              (execute-col2im-unbatched buf shape col-data col-shape KH KW SH SW PH PW dtype))
@@ -2291,21 +2371,18 @@
                              (execute-col2im-batched buf shape col-data col-shape KH KW SH SW PH PW dtype))
                             ((nhwc-classic)
                              (execute-col2im-nhwc-classic buf shape col-data col-shape KH KW SH SW PH PW dtype))
-                            (else (error "ri-col2im: unknown col-layout" col-layout)))
+                            (else (error "ri-col2im: unknown col-layout" col-layout))))
                           (make-pool-arr pool-idx shape strides dtype))
                         (else (error "ri-col2im: col not concrete" col))))))
 
                 (ri-conv-fwd (pool-idx shape strides dtype src-ref wt-ref b-ref col-buf
                               N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
                   (time-instr 'ri-conv-fwd
-                    (let ((src (deref src-ref)) (wt (deref wt-ref)) (b (deref b-ref))
-                          (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism src
-                        (concrete-array (src-d _ _ _ _ _ _)
-                          (cases array-morphism wt
-                            (concrete-array (wt-d _ _ _ _ _ _)
-                              (cases array-morphism b
-                                (concrete-array (b-d _ _ _ _ _ _)
+                    (let* ((src  (deref src-ref)) (wt (deref wt-ref)) (b (deref b-ref))
+                           (buf  (vector-ref pool-bufs pool-idx))
+                           (src-d (concrete-data/row-major src))
+                           (wt-d  (concrete-data/row-major wt))
+                           (b-d   (concrete-data/row-major b)))
                                   (if (and (blas-enabled?) (blas-available?))
                                       (case col-layout
                                         ((nchw-classic)
@@ -2319,20 +2396,18 @@
                                         ((nhwc-classic)
                                          (execute-conv-fwd-nhwc buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
                                         (else (error "ri-conv-fwd: unknown layout" col-layout))))
-                                  (make-pool-arr pool-idx shape strides dtype))
-                                (else (error "ri-conv-fwd: b not concrete"))))
-                            (else (error "ri-conv-fwd: wt not concrete"))))
-                        (else (error "ri-conv-fwd: src not concrete"))))))
+                                  (make-pool-arr pool-idx shape strides dtype))))
 
                 (ri-conv-bwd-data (pool-idx shape strides dtype g-ref wt-ref col-buf
                                    N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
                   (time-instr 'ri-conv-bwd-data
-                    (let ((g (deref g-ref)) (wt (deref wt-ref))
-                          (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism g
-                        (concrete-array (g-d g-shape _ _ _ _ _)
-                          (cases array-morphism wt
-                            (concrete-array (wt-d _ _ _ _ _ _)
+                    (let* ((g  (deref g-ref)) (wt (deref wt-ref))
+                           (buf (vector-ref pool-bufs pool-idx))
+                           (g-shape (cases array-morphism g
+                                      (concrete-array (_ s _ _ _ _ _) s)
+                                      (else (error "ri-conv-bwd-data: g not concrete"))))
+                           (g-d  (concrete-data/row-major g))
+                           (wt-d (concrete-data/row-major wt)))
                               (if (and (blas-enabled?) (blas-available?))
                                   (case col-layout
                                     ((nchw-classic)
@@ -2346,19 +2421,18 @@
                                     ((nhwc-classic)
                                      (execute-conv-bwd-data-nhwc buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
                                     (else (error "ri-conv-bwd-data: unknown layout" col-layout))))
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-conv-bwd-data: wt not concrete"))))
-                        (else (error "ri-conv-bwd-data: g not concrete"))))))
+                              (make-pool-arr pool-idx shape strides dtype))))
 
                 (ri-conv-bwd-weights (pool-idx shape strides dtype g-ref src-ref col-buf
                                       N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
                   (time-instr 'ri-conv-bwd-weights
-                    (let ((g (deref g-ref)) (src (deref src-ref))
-                          (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism g
-                        (concrete-array (g-d g-shape _ _ _ _ _)
-                          (cases array-morphism src
-                            (concrete-array (src-d _ _ _ _ _ _)
+                    (let* ((g   (deref g-ref)) (src (deref src-ref))
+                           (buf (vector-ref pool-bufs pool-idx))
+                           (g-shape (cases array-morphism g
+                                      (concrete-array (_ s _ _ _ _ _) s)
+                                      (else (error "ri-conv-bwd-weights: g not concrete"))))
+                           (g-d   (concrete-data/row-major g))
+                           (src-d (concrete-data/row-major src)))
                               (if (and (blas-enabled?) (blas-available?))
                                   (case col-layout
                                     ((nchw-classic)
@@ -2372,9 +2446,7 @@
                                     ((nhwc-classic)
                                      (execute-conv-bwd-weights-nhwc buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
                                     (else (error "ri-conv-bwd-weights: unknown layout" col-layout))))
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-conv-bwd-weights: src not concrete"))))
-                        (else (error "ri-conv-bwd-weights: g not concrete"))))))
+                              (make-pool-arr pool-idx shape strides dtype))))
                 ))
              )
         (vector-set! vals i result)))
@@ -2439,13 +2511,20 @@
                    (is-pool?   (> (context-counter ctx) ctr-before))
                    (stored
                     (if is-output?
-                        (if (concrete-row-major? result)
-                            (begin
-                              ;; context-pin-output! only valid in trace mode
-                              (when (and trace-mode? is-pool?)
-                                (context-pin-output! ctx (concrete-alloc-id result)))
-                              result)
-                            (copy-concrete-array result))
+                        (begin
+                          ;; Pin the pool allocation behind an output, whether
+                          ;; this binding allocated it or the output is a
+                          ;; zero-copy view of an earlier binding's buffer (a
+                          ;; view inherits its source's allocation id).  Replay
+                          ;; reads outputs after the whole plan has run, so the
+                          ;; buffer must not be reused within the run.
+                          ;; context-pin-output! is only valid in trace mode.
+                          (when (and trace-mode? (concrete-array? result)
+                                     (>= (concrete-alloc-id result) 0))
+                            (context-pin-output! ctx (concrete-alloc-id result)))
+                          (if (concrete-row-major? result)
+                              result
+                              (copy-concrete-array result)))
                         result)))
               (hash-table-set! values (ssa-binding-name b) stored)
               ;; Record per-binding (concrete-array . is-pool?) for replay-plan compilation
@@ -2507,6 +2586,7 @@
                             (ri-flat-unary       (_ _ _ _ _ _)           'ri-flat-unary)
                             (ri-activation-unary (_ _ _ _ _ _ _)         'ri-activation-unary)
                             (ri-flat-binary      (_ _ _ _ _ _ _)         'ri-flat-binary)
+                            (ri-activation-binary (_ _ _ _ _ _ _ _)      'ri-activation-binary)
                             (ri-flat-bias-broadcast (_ _ _ _ _ _ _ _)   'ri-flat-bias-broadcast)
                             (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _)  'ri-gemm-epilogue)
                             (ri-alias            (_ _ _ _ _)             'ri-alias)

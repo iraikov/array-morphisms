@@ -1131,4 +1131,35 @@
       (lists-approx= dW expected-dW))))
 
 
+(test-group "aliasing regression: GEMM epilogue output slot"
+
+  ;; y = sigmoid(relu(x) @ W) as a forward-only program.  relu's output is
+  ;; last read by the matmul, so the trace may give sigmoid's output the
+  ;; same pool slot.  The replay fuses the matmul and sigmoid into one
+  ;; instruction that writes into sigmoid's slot while still reading
+  ;; relu's output, so the pair must stay unfused when the slots coincide.
+  (test-assert "replayed forward program equals the reference"
+    (let* ((x-mv (input-var '(0.5 -1.0 2.0 -0.3 1.2 0.7
+                              -0.8 0.1 1.5 -2.0 0.9 0.4
+                              1.1 -0.6 -0.2 0.3 2.2 -1.4) '(3 6)))
+           (W-mv (param-var '(0.1 -0.2 0.3 0.4
+                              -0.5 0.6 0.7 -0.8
+                              0.9 1.0 -1.1 1.2
+                              1.3 -1.4 1.5 1.6
+                              -1.7 1.8 1.9 -2.0
+                              2.1 -2.2 0.2 0.5) '(6 4)))
+           (y-mv (am:var-sigmoid (am:var-matmul (am:var-relu x-mv) W-mv)))
+           (prog (morphism-to-ssa y-mv))
+           (reference (concrete->list (car (ssa-realize prog))))
+           (ctx (make-morphism-context)))
+      (ssa-realize/ctx ctx prog)
+      (finalize-context! ctx)
+      (reset-context! ctx)
+      (let ((first  (concrete->list (car (ssa-realize/ctx ctx prog)))))
+        (reset-context! ctx)
+        (let ((second (concrete->list (car (ssa-realize/ctx ctx prog)))))
+          (and (lists-approx= first reference)
+               (lists-approx= second reference)))))))
+
+
 (test-end)

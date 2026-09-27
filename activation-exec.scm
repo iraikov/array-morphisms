@@ -24,6 +24,24 @@
 ;;;     elements.  A kernel must be a pure per-element map, so in and out
 ;;;     may be the same vector.
 ;;;
+;;; A backend can also supply kernels for three other kinds of work that
+;;; the engine otherwise does with Scheme loops:
+;;;
+;;;   * Binary element-wise ops, (op . dtype) -> (size a b out), used by
+;;;     ri-activation-binary for the op names registered with
+;;;     register-binary-op!.  No binary op names are registered by
+;;;     default, so plans compiled without such a backend are unchanged.
+;;;
+;;;   * Reductions of a row-major 2-D array over axis 0 or 1,
+;;;     (rop axis dtype) -> (rows cols src out), where rop is sum, mean,
+;;;     max or min.  A kernel must round exactly as the Scheme fast path
+;;;     of execute-reduction-morphism does.
+;;;
+;;;   * Strided copies, dtype -> (src offset shape strides dst), which copy
+;;;     an array of rank at most 4, described by its shape and element
+;;;     strides (Scheme vectors) and the offset of its first element, into
+;;;     dst in row-major order.
+;;;
 ;;; This registry is separate from the blas-backend record of blas-exec.scm
 ;;; because the set of activation ops is open-ended and every kernel has the
 ;;; same calling convention, whereas blas-backend is a fixed record whose
@@ -51,7 +69,23 @@
    ;; Activation op names
    register-activation-op!
    activation-op-registered?
-   activation-ops)
+   activation-ops
+
+   ;; Binary element-wise kernels and op names
+   activation-backend-add-binary-kernel!
+   lookup-binary-kernel
+   register-binary-op!
+   unregister-binary-op!
+   binary-op-registered?
+   binary-ops
+
+   ;; Reduction kernels
+   activation-backend-add-reduction-kernel!
+   lookup-reduction-kernel
+
+   ;; Strided copy kernels
+   activation-backend-add-copy-kernel!
+   lookup-copy-kernel)
 
   (import scheme (chicken base))
   (import (only srfi-69
@@ -64,15 +98,70 @@
 
   ;; table: hash table (op . dtype) -> kernel.  Keys are compared with
   ;; equal?, so they hash by content rather than by address.
+  ;; binary-table, reduction-table and copy-table hold the binary,
+  ;; reduction and strided-copy kernels in the same way.
   (define-record-type activation-backend
-    (%make-activation-backend name table)
+    (%make-activation-backend name table binary-table reduction-table copy-table)
     activation-backend?
-    (name  activation-backend-name)
-    (table activation-backend-table))
+    (name            activation-backend-name)
+    (table           activation-backend-table)
+    (binary-table    activation-backend-binary-table)
+    (reduction-table activation-backend-reduction-table)
+    (copy-table      activation-backend-copy-table))
 
   (define (make-activation-backend name)
     "Create an activation backend called name (a symbol) with no kernels."
-    (%make-activation-backend name (make-hash-table equal?)))
+    (%make-activation-backend name (make-hash-table equal?) (make-hash-table equal?)
+                              (make-hash-table equal?) (make-hash-table equal?)))
+
+  (define (check-kernel who dtype kernel)
+    (unless (memq dtype '(f32 f64))
+      (error who "unsupported dtype" dtype))
+    (unless (procedure? kernel)
+      (error who "kernel is not a procedure" kernel)))
+
+  (define (activation-backend-add-binary-kernel! bkend op dtype kernel)
+    "Install kernel, a procedure (size a b out) -> void computing
+    out[i] = op(a[i], b[i]) for i below size, as the backend's
+    implementation of the binary op on dtype arrays.  out may be a or b."
+    (check-kernel 'activation-backend-add-binary-kernel! dtype kernel)
+    (hash-table-set! (activation-backend-binary-table bkend) (cons op dtype) kernel))
+
+  (define (lookup-binary-kernel bkend op dtype)
+    "The binary kernel bkend holds for op on dtype arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-binary-table bkend)
+                                 (cons op dtype) #f)))
+
+  (define (activation-backend-add-reduction-kernel! bkend rop axis dtype kernel)
+    "Install kernel, a procedure (rows cols src out) -> void, as the
+    backend's reduction rop (sum, mean, max or min) over axis (0 or 1) of a
+    row-major rows x cols dtype array src.  out receives cols results for
+    axis 0 and rows results for axis 1."
+    (check-kernel 'activation-backend-add-reduction-kernel! dtype kernel)
+    (unless (memq rop '(sum mean max min))
+      (error 'activation-backend-add-reduction-kernel! "unsupported reduction" rop))
+    (unless (memv axis '(0 1))
+      (error 'activation-backend-add-reduction-kernel! "axis must be 0 or 1" axis))
+    (hash-table-set! (activation-backend-reduction-table bkend) (list rop axis dtype) kernel))
+
+  (define (lookup-reduction-kernel bkend rop axis dtype)
+    "The reduction kernel bkend holds for rop over axis on dtype arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-reduction-table bkend)
+                                 (list rop axis dtype) #f)))
+
+  (define (activation-backend-add-copy-kernel! bkend dtype kernel)
+    "Install kernel, a procedure (src offset shape strides dst) -> void,
+    as the backend's strided copy of dtype arrays of rank at most 4 into
+    row-major order."
+    (check-kernel 'activation-backend-add-copy-kernel! dtype kernel)
+    (hash-table-set! (activation-backend-copy-table bkend) dtype kernel))
+
+  (define (lookup-copy-kernel bkend dtype)
+    "The strided copy kernel bkend holds for dtype arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-copy-table bkend) dtype #f)))
 
   (define (activation-backend-add-kernel! bkend op dtype kernel)
     "Install kernel, a procedure (size in out) -> void, as the backend's
@@ -138,5 +227,36 @@
   (define (activation-ops)
     "List of the activation op names."
     *activation-ops*)
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Binary op names
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define *binary-ops* '())
+
+  (define (register-binary-op! op)
+    "Add op (a symbol) to the binary op names.  SSA bindings with this op
+    and two row-major operands of the output's shape are then compiled to
+    ri-activation-binary.  Adding a name twice has no further effect."
+    (unless (symbol? op)
+      (error "register-binary-op!: op must be a symbol" op))
+    (unless (memq op *binary-ops*)
+      (set! *binary-ops* (cons op *binary-ops*))))
+
+  (define (unregister-binary-op! op)
+    "Remove op from the binary op names, so that its bindings compile to
+    ri-flat-binary again."
+    (set! *binary-ops* (let loop ((ops *binary-ops*))
+                         (cond ((null? ops) '())
+                               ((eq? (car ops) op) (cdr ops))
+                               (else (cons (car ops) (loop (cdr ops))))))))
+
+  (define (binary-op-registered? op)
+    "True when op is one of the binary op names."
+    (and (memq op *binary-ops*) #t))
+
+  (define (binary-ops)
+    "List of the binary op names."
+    *binary-ops*)
 
 ) ;; end module array-morphisms-activation-exec

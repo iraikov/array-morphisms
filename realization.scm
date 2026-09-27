@@ -53,6 +53,7 @@
    ;; Flat-loop fast-path kernels (zero allocation per element; called by SSA replay plan)
    execute-flat-unary-compute
    execute-activation-unary-compute
+   execute-activation-binary-compute
    execute-flat-binary-compute
    execute-flat-bias-broadcast-compute
    execute-flat-unary-compute-inplace!
@@ -65,6 +66,7 @@
    execute-im2col-nhwc-mr
    execute-im2col-nhwc-classic
    execute-col2im-unbatched
+   concrete-data/row-major
    execute-col2im-batched
    execute-col2im-batched-mr
    execute-col2im-nhwc-mr
@@ -1277,6 +1279,20 @@
           (kernel size data output-buffer)
           (execute-flat-unary-compute combiner data src-dtype output-buffer size dtype))))
 
+  ;; Computes output[i] = op(data1[i], data2[i]) with the active
+  ;; backend's binary kernel for op when both inputs and the output have
+  ;; the same dtype, f32 or f64, and with combiner otherwise.
+  (define (execute-activation-binary-compute op combiner data1 src-dtype1 data2 src-dtype2
+                                             output-buffer size dtype)
+    (let ((kernel (and (eq? src-dtype1 dtype)
+                       (eq? src-dtype2 dtype)
+                       (memq dtype '(f32 f64))
+                       (lookup-binary-kernel (active-activation-backend) op dtype))))
+      (if kernel
+          (kernel size data1 data2 output-buffer)
+          (execute-flat-binary-compute combiner data1 src-dtype1 data2 src-dtype2
+                                       output-buffer size dtype))))
+
   ;; src-dtype1/src-dtype2 are the input dtypes; dtype is the output dtype.
   ;; See execute-flat-unary-compute above for why the f32/f32/f32 and
   ;; f64/f64/f64 fast paths exist.
@@ -1714,7 +1730,8 @@
 
       (cases array-morphism col-morphism
              (concrete-array
-              (col-data col-shape col-strides col-offset col-dtype _ _)
+              (_ col-shape col-strides col-offset col-dtype _ _)
+              (let ((col-data (concrete-data/row-major col-morphism)))
               (case col-layout
                 ((nchw-standard)
                  (execute-col2im-unbatched output-buffer shape col-data col-shape
@@ -1725,9 +1742,48 @@
                 ((nhwc-classic)
                  (execute-col2im-nhwc-classic output-buffer shape col-data col-shape
                                               KH KW SH SW PH PW dtype))
-                (else (error "col2im: unknown col-layout" col-layout))))
+                (else (error "col2im: unknown col-layout" col-layout)))))
 
              (else (error "col2im operand must be concrete array")))))
+
+;; Returns the elements of the concrete array ARR as a vector in
+;; contiguous row-major order.  The array's own data vector is returned
+;; when it is already laid out that way; a strided view (for example a
+;; zero-copy transpose) is copied into a fresh vector, with the active
+;; backend's strided copy kernel when it has one.  Kernels that read an
+;; operand as a plain row-major block (im2col, col2im and the fused
+;; convolutions) pass it through this first.
+(define (concrete-data/row-major arr)
+  (cases array-morphism arr
+    (concrete-array (data shape strides offset dtype alloc-id batch-axis)
+      (if (and (= offset 0) (equal? strides (compute-strides shape)))
+          data
+          (let ((kernel (and (<= (vector-length shape) 4)
+                             (lookup-copy-kernel (active-activation-backend) dtype))))
+            (if kernel
+                (let ((out (allocate-typed-vector dtype (shape-size shape))))
+                  (kernel data offset shape strides out)
+                  out)
+          (let* ((rank (vector-length shape))
+                 (n    (shape-size shape))
+                 (out  (allocate-typed-vector dtype n))
+                 (idx  (make-vector rank 0)))
+            ;; Odometer over the multi-index, tracking the physical offset.
+            (let loop ((i 0) (phys offset))
+              (when (< i n)
+                (typed-vector-set! out dtype i (typed-vector-ref data dtype phys))
+                (let carry ((k (- rank 1)) (phys phys))
+                  (if (< k 0)
+                      (loop (+ i 1) phys)
+                      (let ((v (+ 1 (vector-ref idx k))))
+                        (if (< v (vector-ref shape k))
+                            (begin (vector-set! idx k v)
+                                   (loop (+ i 1) (+ phys (vector-ref strides k))))
+                            (begin (vector-set! idx k 0)
+                                   (carry (- k 1)
+                                          (- phys (* (- v 1) (vector-ref strides k)))))))))))
+            out)))))
+    (else (error "concrete-data/row-major: not a concrete array" arr))))
 
 (define (execute-col2im-unbatched output-buffer output-shape
                                   col-data col-shape
@@ -2640,6 +2696,18 @@
            (src-size (shape-size src-shape))
            (src-rank (vector-length src-shape)))
 
+      ;; Runs the active backend's reduction kernel for op over axis of the
+      ;; row-major 2-D source, if there is one; returns #t when it did.
+      (define (kernel-reduce-2d! axis)
+        (let ((kernel (and (eq? src-dtype out-dtype)
+                           (memq src-dtype '(f32 f64))
+                           (lookup-reduction-kernel (active-activation-backend)
+                                                    op axis src-dtype))))
+          (and kernel
+               (begin (kernel (vector-ref src-shape 0) (vector-ref src-shape 1)
+                              src-data output-buffer)
+                      #t))))
+
       ;; Fast path: 2D row-major source with a single axis reduced.
       ;; Avoids per-element linear-to-multi-index and multi-to-linear-index calls.
       (define (row-major-2d?)
@@ -2868,13 +2936,13 @@
         ((and (row-major-2d?)
               (equal? reduce-axes '(0))
               (memq op '(sum mean max min)))
-         (fast-reduce-2d-axis0!))
+         (or (kernel-reduce-2d! 0) (fast-reduce-2d-axis0!)))
 
         ;; Fast path: 2D row-major, reduce axis 1
         ((and (row-major-2d?)
               (equal? reduce-axes '(1))
               (memq op '(sum mean max min)))
-         (fast-reduce-2d-axis1!))
+         (or (kernel-reduce-2d! 1) (fast-reduce-2d-axis1!)))
 
         (else
          ;; General path: initialise output then accumulate over all source positions.

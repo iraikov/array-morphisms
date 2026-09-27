@@ -413,5 +413,92 @@
         (register-activation-backend! #f)
         (car results)))))
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 5 - Binary, reduction and copy kernels
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A backend whose only kernel is a counting f64 binary mul.
+(define (make-mul-backend counts)
+  (let ((be (make-activation-backend 'mul-only)))
+    (activation-backend-add-binary-kernel!
+     be 'mul 'f64
+     (lambda (n a b out)
+       (set-cdr! counts (+ 1 (cdr counts)))
+       (do ((i 0 (+ i 1))) ((= i n))
+         (f64vector-set! out i (* (f64vector-ref a i) (f64vector-ref b i))))))
+    be))
+
+(define (mul-loss)
+  (let ((xv (param-var '(1.0 -2.0 3.0 0.5) '(4) 'f64))
+        (yv (param-var '(2.0 4.0 -1.0 8.0) '(4) 'f64)))
+    (trace-and-replay (am:var-mean (am:var* xv yv)) (list xv yv))))
+
+(test-group "binary, reduction and copy kernels"
+  (register-activation-backend! #f)
+
+  (test-assert "no binary op names are registered by default"
+    (not (binary-op-registered? 'mul)))
+
+  (test "an unregistered mul compiles to ri-flat-binary"
+    0
+    (let-values (((joint _) (mul-loss)))
+      (plan-count joint 'ri-activation-binary)))
+
+  (register-binary-op! 'mul)
+
+  (test-assert "a registered mul compiles to ri-activation-binary"
+    (let-values (((joint _) (mul-loss)))
+      (> (plan-count joint 'ri-activation-binary) 0)))
+
+  (test "without a backend, ri-activation-binary gives the combiner's results"
+    (let-values (((_ results) (begin (unregister-binary-op! 'mul) (mul-loss))))
+      results)
+    (begin (register-binary-op! 'mul)
+           (let-values (((_ results) (mul-loss))) results)))
+
+  (test-assert "the backend's binary kernel is called and gives the same results"
+    (let ((counts (cons 'mul 0)))
+      (let-values (((_ without) (mul-loss)))
+        (register-activation-backend! (make-mul-backend counts))
+        (let-values (((_ with) (mul-loss)))
+          (register-activation-backend! #f)
+          (and (> (cdr counts) 0) (equal? without with))))))
+
+  (unregister-binary-op! 'mul)
+
+  (test-assert "unregister-binary-op! removes the name"
+    (not (binary-op-registered? 'mul)))
+
+  (test "a reduction kernel replaces the fast path when registered"
+    '((4.0 6.0) (42.0 42.0))
+    (let* ((src (f64vector 1.0 2.0 3.0 4.0))
+           (run (lambda ()
+                  (let ((out (make-f64vector 2 0.0)))
+                    (execute-reduction-morphism 'sum out (vector 2) src (vector 2 2)
+                                                (vector 2 1) 0 '(0) #f #f 'f64 'f64)
+                    (f64vector->list out))))
+           (be (make-activation-backend 'marker)))
+      (activation-backend-add-reduction-kernel!
+       be 'sum 0 'f64 (lambda (rows cols src out)
+                        (do ((i 0 (+ i 1))) ((= i cols)) (f64vector-set! out i 42.0))))
+      (let ((without (run)))
+        (register-activation-backend! be)
+        (let ((with (run)))
+          (register-activation-backend! #f)
+          (list without with)))))
+
+  (test "a copy kernel is used for strided views when registered"
+    '((1.0 3.0 2.0 4.0) (7.0 7.0 7.0 7.0))
+    (let* ((view (concrete-array (f64vector 1.0 2.0 3.0 4.0) (vector 2 2) (vector 1 2) 0 'f64 -1 -1))
+           (be (make-activation-backend 'marker)))
+      (activation-backend-add-copy-kernel!
+       be 'f64 (lambda (src off shape strides dst)
+                 (do ((i 0 (+ i 1))) ((= i 4)) (f64vector-set! dst i 7.0))))
+      (let ((without (f64vector->list (concrete-data/row-major view))))
+        (register-activation-backend! be)
+        (let ((with (f64vector->list (concrete-data/row-major view))))
+          (register-activation-backend! #f)
+          (list without with))))))
+
 (register-activation-backend! #f)
 (test-exit)
