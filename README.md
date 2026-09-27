@@ -10,6 +10,7 @@ A unified backend for numerical computing in Chicken Scheme, combining fusion-ba
 - **Zero-Copy Views**: Structural operations (reshape, transpose, slice) via MoA affine index functions
 - **Memory Reuse**: Automatic buffer planning with graph coloring for optimal allocation
 - **BLAS Integration**: Transparent dispatch to optimized linear algebra kernels
+- **Element-wise Kernel Backends**: Pluggable whole-array kernels for activations, binary arithmetic, reductions and copies, with results identical to the Scheme code they replace
 - **Type Safety**: Multiple element types (f64, f32, s64, s32, u32, u64)
 - **Category-Theoretic Foundation**: Array morphisms as structure-preserving transformations
 
@@ -236,13 +237,14 @@ Type promotion rules:
 ## BLAS Backends
 
 Matmul, matvec, dot, axpy, and conv2d are dispatched through a pluggable `blas-backend`
-(`array-morphisms-blas-exec`). Three tiers are available:
+(`array-morphisms-blas-exec`). Four tiers are available:
 
 | Tier | Package | Dependencies | Default? |
 |---|---|---|---|
 | Pure Scheme | built in | none | fallback only |
 | microBLAS | built in (`array-morphisms-micro-blas-backend`) | none (vendored, header-only) | yes, auto-registered |
 | System BLAS | separate egg: [`array-morphisms-blas`](https://github.com/iraikov/array-morphisms-blas) | the `blas` egg + a system BLAS library | opt-in |
+| crunch | separate egg: `array-morphisms-crunch` (`make-crunch-blas-backend`) | the `crunch` egg (CHICKEN 6) | opt-in |
 
 The dependency-free microBLAS backend is registered automatically at load time if nothing else
 has registered a backend first, so `array-morphisms` alone never requires a system BLAS library.
@@ -253,6 +255,52 @@ explicitly (it overrides the default):
 (import array-morphisms-blas-egg-backend)
 (register-blas-backend! (make-blas-egg-backend))
 ```
+
+The crunch tier compiles its GEMM and convolution kernels from Scheme to C
+with CHICKEN 6's crunch compiler and splits large GEMMs across threads. It
+needs no C library beyond libm and pthreads.
+
+## Element-wise Kernel Backends
+
+Element-wise operations, reductions and strided copies can be handed to a
+pluggable *activation backend* (`array-morphisms-activation-exec`), which
+is registered separately from the BLAS backend. A backend holds whole-array
+kernels, one per op and dtype (f32 or f64), for:
+
+- the activations `relu`, `sigmoid` and `tanh`, and the derivative ops
+  `relu-deriv`, `sigmoid-deriv` and `tanh-deriv` that the backward pass emits;
+- the binary ops `add`, `sub`, `mul` and `div`;
+- reductions of row-major 2-D arrays over axis 0 or 1;
+- copies of strided views into row-major order.
+
+When an SSA replay plan is compiled, bindings with the unary and binary ops
+become `ri-activation-unary` or `ri-activation-binary` instructions, which
+use the backend's kernel for their op and dtype at execution time.
+Reductions and strided copies use their kernels wherever arrays are
+realized, not only during replay. When no backend is registered, no kernel
+exists for that op and dtype, or the operand and output dtypes differ, the
+same Scheme code runs as before.
+The kernels compute exactly what that Scheme code computes, so registering
+a backend changes speed, not results. Bindings produced by the element-wise
+fusion pass carry a composed function and never use a kernel.
+
+No activation backend is registered by default. The `array-morphisms-crunch`
+egg provides two backends; the threaded one splits large arrays across
+threads:
+
+```scheme
+(import array-morphisms-activation-exec
+        array-morphisms-crunch-activations)
+(register-activation-backend! (make-crunch-threaded-activation-backend))
+```
+
+The activation op names are registered by default. The binary op names are
+registered by the backend constructors, so until then `add`, `sub`, `mul`
+and `div` compile to the ordinary `ri-flat-binary`. Other names can be
+registered with `register-activation-op!` and `register-binary-op!`.
+Registering a name only selects the instruction. For a new activation to
+appear in differentiable SSA graphs it also needs a `morph-<op>`
+constructor, a VJP rule in `ssa-vjp` and a case in `rebuild-morphism`.
 
 ## Examples
 
@@ -308,8 +356,10 @@ explicitly (it overrides the default):
 ## Requirements
 
 - CHICKEN Scheme 6.0+
-- Dependencies: datatype, matchable, srfi-1, srfi-4, srfi-69
-- Optional: BLAS library for accelerated linear algebra
+- Dependencies: datatype, matchable, random-mtzig, srfi-1, srfi-4, srfi-69
+- Optional companion eggs:
+  - `array-morphisms-blas`: system-BLAS backend (needs a BLAS library)
+  - `array-morphisms-crunch`: crunch-compiled BLAS, convolution and element-wise kernels (needs the `crunch` egg)
 
 ## API Reference
 
@@ -322,6 +372,12 @@ Key modules:
 - `array-morphisms-realization` - Materialization and execution
 - `array-morphisms-context` - Memory reuse contexts
 - `array-morphisms-batch-ops` - Batch operations and combinators
+- `array-morphisms-blas-exec` - BLAS backend records, registration and dispatch
+- `array-morphisms-micro-blas-backend` - Default dependency-free BLAS backend
+- `array-morphisms-activation-exec` - Element-wise kernel backend records and registration
+- `array-morphisms-grad` - Reverse-mode automatic differentiation over morphisms
+- `array-morphisms-grad-check` - Numerical gradient checking
+- `array-morphisms-ssa` - SSA compilation of training graphs, VJP and replay
 
 ## License
 
