@@ -79,6 +79,10 @@
    binary-op-registered?
    binary-ops
 
+   ;; Broadcast binary kernels
+   activation-backend-add-broadcast-kernel!
+   lookup-broadcast-kernel
+
    ;; Reduction kernels
    activation-backend-add-reduction-kernel!
    lookup-reduction-kernel
@@ -100,19 +104,23 @@
   ;; equal?, so they hash by content rather than by address.
   ;; binary-table, reduction-table and copy-table hold the binary,
   ;; reduction and strided-copy kernels in the same way.
+  ;; broadcast-table holds the broadcast binary kernels.
   (define-record-type activation-backend
-    (%make-activation-backend name table binary-table reduction-table copy-table)
+    (%make-activation-backend name table binary-table reduction-table copy-table
+                              broadcast-table)
     activation-backend?
     (name            activation-backend-name)
     (table           activation-backend-table)
     (binary-table    activation-backend-binary-table)
     (reduction-table activation-backend-reduction-table)
-    (copy-table      activation-backend-copy-table))
+    (copy-table      activation-backend-copy-table)
+    (broadcast-table activation-backend-broadcast-table))
 
   (define (make-activation-backend name)
     "Create an activation backend called name (a symbol) with no kernels."
     (%make-activation-backend name (make-hash-table equal?) (make-hash-table equal?)
-                              (make-hash-table equal?) (make-hash-table equal?)))
+                              (make-hash-table equal?) (make-hash-table equal?)
+                              (make-hash-table equal?)))
 
   (define (check-kernel who dtype kernel)
     (unless (memq dtype '(f32 f64))
@@ -121,7 +129,7 @@
       (error who "kernel is not a procedure" kernel)))
 
   (define (activation-backend-add-binary-kernel! bkend op dtype kernel)
-    "Install kernel, a procedure (size a b out) -> void computing
+    "Installs activation kernel, a procedure (size a b out) -> void computing
     out[i] = op(a[i], b[i]) for i below size, as the backend's
     implementation of the binary op on dtype arrays.  out may be a or b."
     (check-kernel 'activation-backend-add-binary-kernel! dtype kernel)
@@ -133,8 +141,27 @@
          (hash-table-ref/default (activation-backend-binary-table bkend)
                                  (cons op dtype) #f)))
 
+  (define (activation-backend-add-broadcast-kernel! bkend op dtype kernel)
+    "Installs broadcast kernel, a procedure (rows cols a mode-a b mode-b out) -> void,
+    as the backend's broadcast binary op (add, sub, mul or div) on dtype
+    arrays.  out is a row-major rows x cols array receiving
+    out[i, j] = op(a[.], b[.]); the mode of an operand says how it is
+    indexed: 0, a rows x cols array (index i*cols + j); 1, one value per
+    row (index i); 2, one value per column (index j); 3, a single value
+    (index 0).  out is distinct from a and b."
+    (check-kernel 'activation-backend-add-broadcast-kernel! dtype kernel)
+    (unless (memq op '(add sub mul div))
+      (error 'activation-backend-add-broadcast-kernel! "unsupported op" op))
+    (hash-table-set! (activation-backend-broadcast-table bkend) (cons op dtype) kernel))
+
+  (define (lookup-broadcast-kernel bkend op dtype)
+    "The broadcast binary kernel bkend holds for op on dtype arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-broadcast-table bkend)
+                                 (cons op dtype) #f)))
+
   (define (activation-backend-add-reduction-kernel! bkend rop axis dtype kernel)
-    "Install kernel, a procedure (rows cols src out) -> void, as the
+    "Installs reduction kernel, a procedure (rows cols src out) -> void, as the
     backend's reduction rop (sum, mean, max or min) over axis (0 or 1) of a
     row-major rows x cols dtype array src.  out receives cols results for
     axis 0 and rows results for axis 1."
@@ -152,7 +179,7 @@
                                  (list rop axis dtype) #f)))
 
   (define (activation-backend-add-copy-kernel! bkend dtype kernel)
-    "Install kernel, a procedure (src offset shape strides dst) -> void,
+    "Install copy kernel, a procedure (src offset shape strides dst) -> void,
     as the backend's strided copy of dtype arrays of rank at most 4 into
     row-major order."
     (check-kernel 'activation-backend-add-copy-kernel! dtype kernel)
@@ -164,7 +191,7 @@
          (hash-table-ref/default (activation-backend-copy-table bkend) dtype #f)))
 
   (define (activation-backend-add-kernel! bkend op dtype kernel)
-    "Install kernel, a procedure (size in out) -> void, as the backend's
+    "Installs kernel, a procedure (size in out) -> void, as the backend's
     implementation of op for arrays of dtype ('f32 or 'f64).  A later call
     for the same op and dtype replaces the earlier kernel."
     (unless (memq dtype '(f32 f64))

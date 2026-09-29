@@ -250,9 +250,11 @@
    Returns:
      compute-index-fn record"
   
+  ;; The transformer itself is the combiner, so that replay can
+  ;; recognize the plain ops (for example exp) by identity.
   (make-compute-index-fn 
    (list (lambda (idx) idx))  ; Identity index function
-   (lambda (x) (transformer x))
+   transformer
    '()))
 
 (define (get-unary-transformer operation)

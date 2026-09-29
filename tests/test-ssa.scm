@@ -13,21 +13,21 @@
 ;;;        - Multi-step replay stability
 ;;;
 
-(import scheme (chicken base))
-(import test)
-(import (only srfi-1 iota every map filter filter-map take drop))
-(import (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!))
-(import srfi-69)
-(import datatype)
-(import array-morphisms-core)
-(import array-morphisms-index-fn)
-(import array-morphisms-basic-ops)
-(import array-morphisms-structural-ops)
-(import array-morphisms-blas-exec)
-(import array-morphisms-realization)
-(import array-morphisms-context)
-(import (prefix array-morphisms-grad am:))
-(import array-morphisms-ssa)
+(import scheme (chicken base)
+        test
+        (only srfi-1 iota every map filter filter-map take drop)
+        (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!)
+        srfi-69
+        datatype
+        array-morphisms-core
+        array-morphisms-index-fn
+        array-morphisms-basic-ops
+        array-morphisms-structural-ops
+        array-morphisms-blas-exec
+        array-morphisms-realization
+        array-morphisms-context
+        (prefix array-morphisms-grad am:)
+        array-morphisms-ssa)
 
 
 ;;;; ============================================================
@@ -1161,5 +1161,43 @@
           (and (lists-approx= first reference)
                (lists-approx= second reference)))))))
 
+
+;;;; ============================================================
+;;;; Broadcast replay: ri-flat-broadcast
+;;;;
+;;;; Row broadcasts ([M,N] op [M,1]) and scalar broadcasts ([M,N] op [1])
+;;;; compile to ri-flat-broadcast.  Replay must reproduce the gradients of
+;;;; the trace run, which evaluates every binding through realize.
+;;;; ============================================================
+
+(test-group "broadcast replay: ri-flat-broadcast"
+  (let* ((ctx  (make-morphism-context))
+         (X-mv (param-var '(0.5 -1.0 2.0 0.25 1.5 -0.5 3.0 1.0 -2.0 0.75 0.1 -0.3) '(3 4)))
+         (g-mv (param-var '(1.0 0.5 -1.5 2.0) '(4)))
+         (eps  (input-var '(1e-5) '(1)))
+         (half (input-var '(0.5) '(1)))
+         ;; RMSNorm rows of X, scale by g, add 0.5 * X, then mean of squares
+         (ms   (am:var-mean (am:var* X-mv X-mv) '(1) #t))            ; [3,1]
+         (rms  (am:var-sqrt (am:var+ ms eps)))
+         (Y    (am:var+ (am:var* (am:var/ X-mv rms) g-mv) (am:var* half X-mv)))
+         (loss (am:var-mean (am:var* Y Y))))
+    (let-values (((joint trace-results)
+                  (compile-and-realize/ctx ctx loss (list X-mv g-mv))))
+      (let ((ref (map concrete->list trace-results)))
+        (finalize-context! ctx)
+        (reset-context! ctx)
+        (let ((first (map concrete->list (ssa-realize/ctx ctx joint))))
+          (test-assert "the replay plan uses ri-flat-broadcast"
+            (let ((counts (cdr (assq 'counts (replay-plan-stats joint)))))
+              (> (or (let ((e (assq 'ri-flat-broadcast counts))) (and e (cdr e))) 0) 0)))
+          (test-assert "replay reproduces the trace loss and gradients"
+            (every lists-approx= first ref))
+          (test-assert "5 further replay steps are identical"
+            (let loop ((i 0))
+              (or (= i 5)
+                  (begin
+                    (reset-context! ctx)
+                    (and (every lists-approx= (map concrete->list (ssa-realize/ctx ctx joint)) ref)
+                         (loop (+ i 1))))))))))))
 
 (test-end)

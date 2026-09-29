@@ -87,29 +87,31 @@
    execute-conv-bwd-weights-nhwc-blas
    )
 
-  (import scheme (scheme base) (chicken base) (chicken module))
-  (import (only srfi-1 make-list fold iota every zip drop-right take last drop append-map filter-map filter count fold-right find))
-  (import (only srfi-4 f32vector f64vector s32vector s64vector u32vector u64vector
-                       f32vector-length f64vector-length s32vector-length
-                       s64vector-length u32vector-length u64vector-length
-                       f32vector-ref f64vector-ref s32vector-ref s64vector-ref
-                       u32vector-ref u64vector-ref
-                       f32vector-set! f64vector-set! s32vector-set! s64vector-set!
-                       u32vector-set! u64vector-set!))
-  (import datatype matchable)
+  (import scheme (scheme base) (chicken base) (chicken module)
+          (only (chicken fixnum) fx+ fx* fx= fx/)
+          (only (chicken flonum) fp+ fp- fp* fp/ fpexp fpsqrt)
+          (only srfi-1 make-list fold iota every zip drop-right take last drop append-map filter-map filter count fold-right find)
+          (only srfi-4 f32vector f64vector s32vector s64vector u32vector u64vector
+                f32vector-length f64vector-length s32vector-length
+                s64vector-length u32vector-length u64vector-length
+                f32vector-ref f64vector-ref s32vector-ref s64vector-ref
+                u32vector-ref u64vector-ref
+                f32vector-set! f64vector-set! s32vector-set! s64vector-set!
+                u32vector-set! u64vector-set!)
+          datatype matchable)
 
   ;; Mutable-cell and stack utilities (plain define files, kept private
   ;; to this module).
   (include "box.scm")
   (include "stack.scm")
 
-  (import array-morphisms-core)
-  (import array-morphisms-index-fn)
-  (import array-morphisms-structural-ops)
-  (import array-morphisms-blas-compat)
-  (import array-morphisms-blas-exec)
-  (import array-morphisms-activation-exec)
-  (import array-morphisms-micro-blas-backend)
+  (import array-morphisms-core
+          array-morphisms-index-fn
+          array-morphisms-structural-ops
+          array-morphisms-blas-compat
+          array-morphisms-blas-exec
+          array-morphisms-activation-exec
+          array-morphisms-micro-blas-backend)
 
   ;; Default-backend bootstrap: register the dependency-free microBLAS
   ;; backend unless something (e.g. the system-BLAS egg backend) has
@@ -1246,8 +1248,82 @@
   ;; per-element dtype dispatch (typed-vector-ref does a fresh `case` on
   ;; every call otherwise).  Mixed/promoted/integer dtypes fall back to the
   ;; original generic path.
+  ;; Element loops specialized for the combiners of the plain arithmetic
+  ;; ops.  A binding that is not fused carries the procedure +, -, * or /
+  ;; itself as its combiner (see get-binary-combiner), and exp or sqrt for
+  ;; those unary ops, so eq? identifies it; the loops then use flonum
+  ;; arithmetic instead of a generic call per element.  Other combiners,
+  ;; including the composed ones of fused bindings, return #f here and
+  ;; keep the generic loops.
+  (define (flat-binary-fast! combiner data1 data2 out size dtype)
+    "out[i] = combiner(data1[i], data2[i]) for + - * /; #f otherwise."
+    (define-syntax run
+      (syntax-rules ()
+        ((_ ref set! op)
+         (begin (do ((i 0 (fx+ i 1))) ((fx= i size))
+                  (set! out i (op (ref data1 i) (ref data2 i))))
+                #t))))
+    (define-syntax by-op
+      (syntax-rules ()
+        ((_ ref set!)
+         (cond ((eq? combiner +) (run ref set! fp+))
+               ((eq? combiner -) (run ref set! fp-))
+               ((eq? combiner *) (run ref set! fp*))
+               ((eq? combiner /) (run ref set! fp/))
+               (else #f)))))
+    (case dtype
+      ((f32) (by-op f32vector-ref f32vector-set!))
+      ((f64) (by-op f64vector-ref f64vector-set!))
+      (else #f)))
+
+  (define (flat-bias-fast! combiner data1 bias out size N dtype)
+    "out[r*N + c] = combiner(data1[r*N + c], bias[c]) for + - * /; #f
+     otherwise.  DATA1 may be OUT (in-place)."
+    (let ((M (fx/ size N)))
+      (define-syntax run
+        (syntax-rules ()
+          ((_ ref set! op)
+           (begin (do ((r 0 (fx+ r 1))) ((fx= r M))
+                    (let ((base (fx* r N)))
+                      (do ((c 0 (fx+ c 1))) ((fx= c N))
+                        (let ((i (fx+ base c)))
+                          (set! out i (op (ref data1 i) (ref bias c)))))))
+                  #t))))
+      (define-syntax by-op
+        (syntax-rules ()
+          ((_ ref set!)
+           (cond ((eq? combiner +) (run ref set! fp+))
+                 ((eq? combiner -) (run ref set! fp-))
+                 ((eq? combiner *) (run ref set! fp*))
+                 ((eq? combiner /) (run ref set! fp/))
+                 (else #f)))))
+      (case dtype
+        ((f32) (by-op f32vector-ref f32vector-set!))
+        ((f64) (by-op f64vector-ref f64vector-set!))
+        (else #f))))
+
+  (define (flat-unary-fast! combiner data out size dtype)
+    "out[i] = combiner(data[i]) for exp and sqrt; #f otherwise."
+    (define-syntax run
+      (syntax-rules ()
+        ((_ ref set! op)
+         (begin (do ((i 0 (fx+ i 1))) ((fx= i size))
+                  (set! out i (op (ref data i))))
+                #t))))
+    (define-syntax by-op
+      (syntax-rules ()
+        ((_ ref set!)
+         (cond ((eq? combiner exp) (run ref set! fpexp))
+               ((eq? combiner sqrt) (run ref set! fpsqrt))
+               (else #f)))))
+    (case dtype
+      ((f32) (by-op f32vector-ref f32vector-set!))
+      ((f64) (by-op f64vector-ref f64vector-set!))
+      (else #f)))
+
   (define (execute-flat-unary-compute combiner data src-dtype output-buffer size dtype)
     (cond
+      ((and (eq? src-dtype dtype) (flat-unary-fast! combiner data output-buffer size dtype)))
       ((and (eq? src-dtype 'f32) (eq? dtype 'f32))
        (do ((i 0 (+ i 1))) ((= i size))
          (f32vector-set! output-buffer i (combiner (f32vector-ref data i)))))
@@ -1298,6 +1374,8 @@
   ;; f64/f64/f64 fast paths exist.
   (define (execute-flat-binary-compute combiner data1 src-dtype1 data2 src-dtype2 output-buffer size dtype)
     (cond
+      ((and (eq? src-dtype1 dtype) (eq? src-dtype2 dtype)
+            (flat-binary-fast! combiner data1 data2 output-buffer size dtype)))
       ((and (eq? src-dtype1 'f32) (eq? src-dtype2 'f32) (eq? dtype 'f32))
        (do ((i 0 (+ i 1))) ((= i size))
          (f32vector-set! output-buffer i (exact->inexact (combiner (f32vector-ref data1 i) (f32vector-ref data2 i))))))
@@ -1322,6 +1400,7 @@
 
   (define (execute-flat-bias-broadcast-compute combiner data1 data2 output-buffer size N dtype)
     ;; Use outer (row) + inner (col) loops to avoid (modulo i N) per element.
+    (unless (flat-bias-fast! combiner data1 data2 output-buffer size N dtype)
     (let ((M (quotient size N)))
       (case dtype
         ((f64) (do ((row 0 (+ row 1))) ((= row M))
@@ -1348,7 +1427,7 @@
                      (let ((i (+ base col)))
                        (s64vector-set! output-buffer i
                          (inexact->exact (truncate (combiner (s64vector-ref data1 i) (s64vector-ref data2 col))))))))))
-        (else (error "execute-flat-bias-broadcast-compute: unsupported dtype" dtype)))))
+        (else (error "execute-flat-bias-broadcast-compute: unsupported dtype" dtype))))))
 
   (define (execute-flat-unary-compute-inplace! combiner buf size dtype)
     (case dtype
@@ -1360,6 +1439,7 @@
 
   (define (execute-flat-bias-broadcast-inplace! combiner buf bias-data size N dtype)
     ;; Use outer (row) + inner (col) loops to avoid (modulo i N) per element.
+    (unless (flat-bias-fast! combiner buf bias-data buf size N dtype)
     (let ((M (quotient size N)))
       (case dtype
         ((f64) (do ((row 0 (+ row 1))) ((= row M))
@@ -1372,7 +1452,7 @@
                    (do ((col 0 (+ col 1))) ((= col N))
                      (let ((i (+ base col)))
                        (f32vector-set! buf i (combiner (f32vector-ref buf i) (f32vector-ref bias-data col))))))))
-        (else (error "execute-flat-bias-broadcast-inplace!: unsupported dtype" dtype)))))
+        (else (error "execute-flat-bias-broadcast-inplace!: unsupported dtype" dtype))))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Fast im2col kernels (dtype-specialized, zero per-element allocation)
