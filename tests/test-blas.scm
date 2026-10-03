@@ -13,6 +13,7 @@
 ;;;   Group 8  - Morphism constructors      (Phase 2)
 ;;;   Group 9  - Execute-or-fallback dispatch(Phase 2)
 ;;;   Group 10 - Configuration              (Phase 2)
+;;;   Group 11 - Prepared GEMM plans and the layout predicate rewrite
 ;;;
 ;;; All tests pass without a BLAS library; the pure Scheme fallback is
 ;;; exercised throughout.  BLAS-specific behaviour (Group 9 "with BLAS")
@@ -30,6 +31,7 @@
 (import array-morphisms-realization)
 (import array-morphisms-blas-compat)
 (import array-morphisms-blas-exec)
+(import srfi-4 (only (chicken format) sprintf))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Test Utilities
@@ -1096,6 +1098,142 @@
       (concrete-values-approx? res '((6 8 1) (8 10 2)))))
 
 ) ;; end group "Phase 2 - Strided GEMM"
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 11 - Prepared GEMM plans
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A backend whose GEMM kernels are Scheme loops that count their calls,
+;; so that tests can see which path a product took.
+(define (make-counting-backend name)
+  (let* ((calls 0)
+         (ref (lambda (v i) (if (f32vector? v) (f32vector-ref v i) (f64vector-ref v i))))
+         (set (lambda (v i x) (if (f32vector? v) (f32vector-set! v i x) (f64vector-set! v i x))))
+         (gemm (lambda (M N K alpha A B beta C)
+                 (set! calls (+ calls 1))
+                 (do ((i 0 (+ i 1))) ((= i M))
+                   (do ((j 0 (+ j 1))) ((= j N))
+                     (let loop ((k 0) (acc 0.0))
+                       (if (= k K)
+                           (set C (+ (* i N) j) (+ (* alpha acc) (* beta (ref C (+ (* i N) j)))))
+                           (loop (+ k 1) (+ acc (* (ref A (+ (* i K) k)) (ref B (+ (* k N) j)))))))))))
+         (gemm-strided
+          (lambda (M N K alpha A lda transa B ldb transb beta C)
+            (set! calls (+ calls 1))
+            (do ((i 0 (+ i 1))) ((= i M))
+              (do ((j 0 (+ j 1))) ((= j N))
+                (let loop ((k 0) (acc 0.0))
+                  (if (= k K)
+                      (set C (+ (* i N) j) (+ (* alpha acc) (* beta (ref C (+ (* i N) j)))))
+                      (loop (+ k 1)
+                            (+ acc (* (ref A (if (eq? transa 'trans) (+ (* k lda) i) (+ (* i lda) k)))
+                                      (ref B (if (eq? transb 'trans) (+ (* j ldb) k) (+ (* k ldb) j))))))))))))
+         (be (make-blas-backend name gemm gemm gemm-strided gemm-strided
+                                #f #f #f #f #f #f #f #f #f #f #f #f)))
+    (values be (lambda () calls))))
+
+(define (spread-matrix rows cols dtype f)
+  (let ((v (if (eq? dtype 'f32) (make-f32vector (* rows cols)) (make-f64vector (* rows cols)))))
+    (do ((i 0 (+ i 1))) ((= i (* rows cols)))
+      (if (f32vector? v) (f32vector-set! v i (f i)) (f64vector-set! v i (f i))))
+    (make-morphism v (vector rows cols) dtype)))
+
+(define (result-vector dtype n)
+  (if (eq? dtype 'f32) (make-f32vector n 0.0) (make-f64vector n 0.0)))
+
+(define (vector-values v) (if (f32vector? v) (f32vector->list v) (f64vector->list v)))
+
+;; Runs thunk with backend be active and BLAS enabled, then restores the
+;; previous backend.
+(define (with-backend be thunk)
+  (let ((saved *active-backend*))
+    (register-blas-backend! be)
+    (enable-blas!)
+    (let ((r (thunk)))
+      (set! *active-backend* saved)
+      r)))
+
+(test-group "Phase 2 - Prepared GEMM plans"
+  (for-each
+   (lambda (dtype)
+     (let ((A  (spread-matrix 8 5 dtype (lambda (i) (- (* 0.25 i) 3.0))))
+           (B  (spread-matrix 5 8 dtype (lambda (i) (* 0.5 (sin (* 1.0 i))))))
+           (A2 (spread-matrix 8 5 dtype (lambda (i) (* 0.1 i))))
+           (B2 (spread-matrix 5 8 dtype (lambda (i) (- 1.0 (* 0.05 i))))))
+       (let-values (((be calls) (make-counting-backend 'counting)))
+         (with-backend be
+          (lambda ()
+            (let ((plan (prepare-blas-gemm/into A B)))
+              (test-assert (sprintf "~A: prepare-blas-gemm/into returns a gemm-plan" dtype)
+                (gemm-plan? plan))
+              (test-assert (sprintf "~A: plan result equals execute-blas-gemm/into!" dtype)
+                (let ((r1 (result-vector dtype 64)) (r2 (result-vector dtype 64)))
+                  (execute-gemm-plan/into! plan A B r1)
+                  (execute-blas-gemm/into! A B r2)
+                  (equal? (vector-values r1) (vector-values r2))))
+              (test-assert (sprintf "~A: plan reused for other arrays of the same layout" dtype)
+                (let ((r1 (result-vector dtype 64)) (r2 (result-vector dtype 64)))
+                  (execute-gemm-plan/into! plan A2 B2 r1)
+                  (execute-blas-gemm/into! A2 B2 r2)
+                  (equal? (vector-values r1) (vector-values r2))))
+              (test (sprintf "~A: plan calls the backend kernel" dtype)
+                1 (let ((before (calls)))
+                    (execute-gemm-plan/into! plan A B (result-vector dtype 64))
+                    (- (calls) before)))
+              (test (sprintf "~A: plan with BLAS disabled uses the Scheme fallback" dtype)
+                0 (let ((before (calls)) (r1 (result-vector dtype 64)))
+                    (disable-blas!)
+                    (execute-gemm-plan/into! plan A B r1)
+                    (enable-blas!)
+                    (- (calls) before)))
+              (test-assert (sprintf "~A: plan after a backend change uses the new backend" dtype)
+                (let-values (((be2 calls2) (make-counting-backend 'other)))
+                  (let ((r1 (result-vector dtype 64)) (r2 (result-vector dtype 64)))
+                    (with-backend be2
+                     (lambda ()
+                       (execute-gemm-plan/into! plan A B r1)
+                       (execute-blas-gemm/into! A B r2)))
+                    (and (= (calls2) 2)
+                         (equal? (vector-values r1) (vector-values r2))))))
+              (test-assert (sprintf "~A: below the size threshold the plan has no kernel" dtype)
+                (let* ((a (spread-matrix 2 2 dtype (lambda (i) (* 1.0 i))))
+                       (small (prepare-blas-gemm/into a a))
+                       (r1 (result-vector dtype 4)) (r2 (result-vector dtype 4))
+                       (before (calls)))
+                  (execute-gemm-plan/into! small a a r1)
+                  (execute-blas-gemm/into! a a r2)
+                  (and (= (calls) before)
+                       (equal? (vector-values r1) (vector-values r2)))))
+              (test-assert (sprintf "~A: strided plan for a transposed operand" dtype)
+                (let* ((Bt (realize (morph-transpose (spread-matrix 8 5 dtype (lambda (i) (* 0.3 i)))))))
+                  (let ((plan-t (prepare-blas-gemm-strided/into A Bt))
+                        (r1 (result-vector dtype 64)) (r2 (result-vector dtype 64))
+                        (before (calls)))
+                    (execute-gemm-plan/into! plan-t A Bt r1)
+                    (execute-blas-gemm-strided/into! A Bt r2)
+                    (and (= (calls) (+ before 2))
+                         (equal? (vector-values r1) (vector-values r2))))))))))))
+   '(f64 f32)))
+
+(test-group "Phase 1 - contiguous-row-major? without stride vectors"
+  (test-assert "3-D row-major array"
+    (contiguous-row-major? (morph-from-list (make-list 24 1.0) #(2 3 4) 'f64)))
+  (test-assert "1-D array"
+    (contiguous-row-major? (morph-from-list '(1.0 2.0 3.0) #(3) 'f64)))
+  (test-assert "scalar (rank 0) array"
+    (contiguous-row-major? (concrete-array (f64vector 1.0) #() #() 0 'f64 -1 -1)))
+  (test-assert "transposed view is not row-major"
+    (not (contiguous-row-major?
+          (realize (morph-transpose (morph-from-list (make-list 6 1.0) #(2 3) 'f64))))))
+  (test-assert "an offset view is not row-major"
+    (not (contiguous-row-major?
+          (concrete-array (f64vector 1.0 2.0 3.0) #(2) #(1) 1 'f64 -1 -1))))
+  (test-assert "a view with a row gap is not row-major"
+    (not (contiguous-row-major?
+          (concrete-array (make-f64vector 8 0.0) #(2 3) #(4 1) 0 'f64 -1 -1))))
+  (test-assert "a zero extent gives the strides compute-strides gives"
+    (contiguous-row-major?
+     (concrete-array (make-f64vector 0) #(0 3) (compute-strides #(0 3)) 0 'f64 -1 -1))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Run All Tests

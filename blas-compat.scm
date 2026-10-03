@@ -47,18 +47,18 @@
       offset  = 0
       strides = compute-strides(shape)   (no gaps, no padding)
 
+    The expected strides are formed from the last axis backwards while
+    they are compared, so no stride vector is built.
     Abstract morphisms always return #f."
     (cases array-morphism m
       (concrete-array (data shape strides offset dtype alloc-id batch-axis)
         (and (= offset 0)
-             (let* ((expected (compute-strides shape))
-                    (rank     (vector-length strides)))
-               (let loop ((i 0))
-                 (cond
-                   ((= i rank)                                  #t)
-                   ((= (vector-ref strides i)
-                       (vector-ref expected i))                 (loop (+ i 1)))
-                   (else                                        #f))))))
+             (let loop ((i (- (vector-length strides) 1)) (expected 1))
+               (cond
+                 ((< i 0)                                       #t)
+                 ((= (vector-ref strides i) expected)
+                  (loop (- i 1) (* expected (vector-ref shape i))))
+                 (else                                          #f)))))
       (else #f)))
 
   (define (contiguous-column-major? m)
@@ -94,21 +94,23 @@
       - Both are 2-D matrices
       - Same dtype, which must be f32 or f64
       - Both have contiguous row-major layout
-      - Inner K dimension matches: shape(m1)[1] = shape(m2)[0]"
-    (and (concrete-array? m1)
-         (concrete-array? m2)
-         (= 2 (morph-rank m1))
-         (= 2 (morph-rank m2))
-         (let ((d1 (get-morphism-dtype m1))
-               (d2 (get-morphism-dtype m2)))
-           (and (memq d1 '(f32 f64))
-                (eq? d1 d2)))
-         (contiguous-row-major? m1)
-         (contiguous-row-major? m2)
-         (let ((s1 (get-morphism-shape m1))
-               (s2 (get-morphism-shape m2)))
-           (= (vector-ref s1 1)
-              (vector-ref s2 0)))))
+      - Inner K dimension matches: shape(m1)[1] = shape(m2)[0]
+
+    The fields of each array are read once, in a single cases form."
+    (cases array-morphism m1
+      (concrete-array (data1 shape1 strides1 offset1 dtype1 alloc-id1 batch-axis1)
+        (cases array-morphism m2
+          (concrete-array (data2 shape2 strides2 offset2 dtype2 alloc-id2 batch-axis2)
+            (and (= 2 (vector-length shape1))
+                 (= 2 (vector-length shape2))
+                 (memq dtype1 '(f32 f64))
+                 (eq? dtype1 dtype2)
+                 (contiguous-row-major? m1)
+                 (contiguous-row-major? m2)
+                 (= (vector-ref shape1 1)
+                    (vector-ref shape2 0))))
+          (else #f)))
+      (else #f)))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; GEMV: Matrix-Vector Compatibility

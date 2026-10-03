@@ -260,6 +260,24 @@ The crunch tier compiles its GEMM and convolution kernels from Scheme to C
 with CHICKEN 6's crunch compiler and splits large GEMMs across threads. It
 needs no C library beyond libm and pthreads.
 
+### Prepared GEMM
+
+`execute-blas-gemm/into!` and `execute-blas-gemm-strided/into!` check their
+operands (dtype, rank, layout, size threshold) on every call. Code that
+multiplies arrays of the same shapes, strides and dtype many times can do
+those checks once:
+
+```scheme
+(define plan (prepare-blas-gemm/into A B))   ; or prepare-blas-gemm-strided/into
+(execute-gemm-plan/into! plan A B result-data)
+```
+
+A plan records the backend kernel to call and its arguments. It is used
+only while BLAS is enabled and the backend it was made for is still
+registered; otherwise `execute-gemm-plan/into!` falls back to the
+corresponding `execute-blas-*` procedure. Compiled SSA replay plans prepare
+their GEMM instructions this way when they are compiled.
+
 ## Element-wise Kernel Backends
 
 Element-wise operations, reductions and strided copies can be handed to a

@@ -114,6 +114,12 @@
    execute-blas-gemm-strided/into!
    execute-blas-gemm-strided
 
+   ;; Prepared GEMM: operand checks done once, for repeated products
+   gemm-plan?
+   prepare-blas-gemm/into
+   prepare-blas-gemm-strided/into
+   execute-gemm-plan/into!
+
    ;; Re-exported from blas-compat for convenience
    array->gemm-blas-params)
 
@@ -227,7 +233,10 @@
     Checks product of all dimensions rather than per-dimension size, so that
     non-square matrices like (10 x 8) with 80 total elements correctly
     trigger BLAS rather than being rejected because 10 < threshold."
-    (>= (apply * (vector->list shape)) *blas-size-threshold*))
+    (let loop ((i 0) (n 1))
+      (if (= i (vector-length shape))
+          (>= n *blas-size-threshold*)
+          (loop (+ i 1) (* n (vector-ref shape i))))))
 
   (define (%select-kernel backend dtype f64-accessor f32-accessor)
     "Extract the dtype-specialised kernel from backend.
@@ -727,6 +736,106 @@
                  *blas-size-threshold*))
         (%blas-gemm-strided/into! A B result-data)
         (%scheme-gemm/into! A B result-data)))
+
+;; -- Prepared GEMM ---------------------------------------------------------
+  ;; execute-blas-gemm/into! and execute-blas-gemm-strided/into! check their
+  ;; operands on every call.  A caller that multiplies arrays of the same
+  ;; shape, strides and dtype many times, such as a compiled replay plan,
+  ;; can instead check them once with prepare-blas-gemm/into or
+  ;; prepare-blas-gemm-strided/into and then run each product with
+  ;; execute-gemm-plan/into!.
+  ;;
+  ;; A plan records the decision the corresponding execute-blas-* procedure
+  ;; would make for operands of that layout: the backend and kernel to use,
+  ;; with the dimensions and, for the strided kernel, the Trans flags and
+  ;; leading dimensions.  When that decision was not to use a backend
+  ;; kernel, the kernel field is #f.  A plan is used only while BLAS is
+  ;; enabled and the backend it was made for is still the active one;
+  ;; otherwise execute-gemm-plan/into! falls back to the execute-blas-*
+  ;; procedure, which checks the operands again.  Either way the result is
+  ;; the one that procedure would compute.
+
+  (define-record gemm-plan
+    backend   ; the blas-backend the plan was made for, or #f
+    kernel    ; gemm or gemm-strided kernel of that backend, or #f
+    strided?  ; #t when made by prepare-blas-gemm-strided/into
+    M N K
+    lda transa ldb transb)   ; strided kernel arguments; unused otherwise
+
+  (define (prepare-blas-gemm/into A B)
+    "Check A and B once for execute-gemm-plan/into!.  Returns a gemm-plan
+    that computes what (execute-blas-gemm/into! A B result-data) computes,
+    for A and B and for any later arrays with the same shapes, strides and
+    dtype."
+    (let ((kernel
+           (and *blas-enabled*
+                *active-backend*
+                (blas-compatible-matmul? A B)
+                (>= (* (vector-ref (get-morphism-shape A) 0)
+                       (vector-ref (get-morphism-shape B) 1))
+                    *blas-size-threshold*)
+                (%select-kernel *active-backend* (get-morphism-dtype A)
+                                blas-backend-gemm-f64
+                                blas-backend-gemm-f32))))
+      (if kernel
+          (let ((sA (get-morphism-shape A))
+                (sB (get-morphism-shape B)))
+            (make-gemm-plan *active-backend* kernel #f
+                            (vector-ref sA 0) (vector-ref sB 1) (vector-ref sA 1)
+                            0 'no-trans 0 'no-trans))
+          (make-gemm-plan *active-backend* #f #f 0 0 0 0 'no-trans 0 'no-trans))))
+
+  (define (prepare-blas-gemm-strided/into A B)
+    "Check A and B once for execute-gemm-plan/into!.  Returns a gemm-plan
+    that computes what (execute-blas-gemm-strided/into! A B result-data)
+    computes, for A and B and for any later arrays with the same shapes,
+    strides and dtype."
+    (let* ((params-A (array->gemm-blas-params A))
+           (params-B (array->gemm-blas-params B))
+           (kernel
+            (and *blas-enabled*
+                 *active-backend*
+                 (>= (* (vector-ref (get-morphism-shape A) 0)
+                        (vector-ref (get-morphism-shape B) 1))
+                     *blas-size-threshold*)
+                 params-A params-B
+                 (concrete-array? A) (concrete-array? B)
+                 (%select-kernel *active-backend* (get-morphism-dtype A)
+                                 blas-backend-gemm-strided-f64
+                                 blas-backend-gemm-strided-f32))))
+      (if kernel
+          (let ((sA (get-morphism-shape A))
+                (sB (get-morphism-shape B)))
+            (make-gemm-plan *active-backend* kernel #t
+                            (vector-ref sA 0) (vector-ref sB 1) (vector-ref sA 1)
+                            (caddr params-A) (cadr params-A)
+                            (caddr params-B) (cadr params-B)))
+          (make-gemm-plan *active-backend* #f #t 0 0 0 0 'no-trans 0 'no-trans))))
+
+  (define (execute-gemm-plan/into! plan A B result-data)
+    "Multiply A by B into result-data as prepared by plan.  A and B must
+    have the shapes, strides and dtype of the arrays the plan was made for;
+    they are not checked again."
+    (let ((kernel (gemm-plan-kernel plan)))
+      (if (and kernel
+               *blas-enabled*
+               (eq? *active-backend* (gemm-plan-backend plan)))
+          (cases array-morphism A
+            (concrete-array (data-A _ _ _ _ _ _)
+              (cases array-morphism B
+                (concrete-array (data-B _ _ _ _ _ _)
+                  (if (gemm-plan-strided? plan)
+                      (kernel (gemm-plan-M plan) (gemm-plan-N plan) (gemm-plan-K plan) 1.0
+                              data-A (gemm-plan-lda plan) (gemm-plan-transa plan)
+                              data-B (gemm-plan-ldb plan) (gemm-plan-transb plan)
+                              0.0 result-data)
+                      (kernel (gemm-plan-M plan) (gemm-plan-N plan) (gemm-plan-K plan) 1.0
+                              data-A data-B 0.0 result-data)))
+                (else (error "execute-gemm-plan/into!: B must be a concrete array" B))))
+            (else (error "execute-gemm-plan/into!: A must be a concrete array" A)))
+          (if (gemm-plan-strided? plan)
+              (execute-blas-gemm-strided/into! A B result-data)
+              (execute-blas-gemm/into! A B result-data)))))
 
   (define (execute-blas-gemm-strided A B)
     "Execute strided matrix-matrix multiply; returns a fresh concrete-array.

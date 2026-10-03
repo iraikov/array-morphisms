@@ -186,14 +186,17 @@
 ;; One pre-compiled instruction per SSA binding.
 (define-datatype replay-instruction replay-instruction?
 
-  ;; Row-major matmul: strides pre-computed at compile time.
+  ;; Row-major matmul: strides pre-computed at compile time.  The operands
+  ;; are checked at compile time; plan holds the result (see
+  ;; prepare-blas-gemm/into in blas-exec.scm).
   (ri-gemm
     (out-pool-idx integer?)
     (out-shape    vector?)
     (out-strides  vector?)
     (out-dtype    symbol?)
     (in-A         replay-ref?)
-    (in-B         replay-ref?))
+    (in-B         replay-ref?)
+    (plan         gemm-plan?))
 
   ;; Strided matmul (at least one input is a transposed zero-copy view).
   (ri-gemm-strided
@@ -202,7 +205,8 @@
     (out-strides  vector?)
     (out-dtype    symbol?)
     (in-A         replay-ref?)
-    (in-B         replay-ref?))
+    (in-B         replay-ref?)
+    (plan         gemm-plan?))
 
   ;; Element-wise / general index-fn op: strides pre-computed at compile time.
   (ri-index
@@ -343,7 +347,8 @@
     (epilogue-kind symbol?)
     (epilogue-comb procedure?)
     (epilogue-N    integer?)
-    (bias-ref      replay-ref?))
+    (bias-ref      replay-ref?)
+    (plan          gemm-plan?))
 
   ;; Alias for the epilogue binding position after ri-gemm-epilogue.
   ;; Advances alloc-ctr to stay in sync with trace-time pool allocation.
@@ -1834,14 +1839,17 @@
        (let* ((A-tr      (trace-arr-of (car  (ssa-binding-inputs b))))
               (B-tr      (trace-arr-of (cadr (ssa-binding-inputs b))))
               (blas-info (blas-compatible-operation? (morph-matmul A-tr B-tr))))
+         ;; The operand checks of the BLAS dispatch are done here, once,
+         ;; on the trace-time inputs, which have the shapes, strides and
+         ;; dtypes of the replay-time inputs.
          (if blas-info
              (case (car blas-info)
-               ((gemm)         (ri-gemm pool-idx shape strides dtype
-                                        (car in-refs) (cadr in-refs)))
                ((gemm-strided) (ri-gemm-strided pool-idx shape strides dtype
-                                                (car in-refs) (cadr in-refs)))
+                                                (car in-refs) (cadr in-refs)
+                                                (prepare-blas-gemm-strided/into A-tr B-tr)))
                (else           (ri-gemm pool-idx shape strides dtype
-                                        (car in-refs) (cadr in-refs))))
+                                        (car in-refs) (cadr in-refs)
+                                        (prepare-blas-gemm/into A-tr B-tr))))
              ;; Not compatible (shapes mismatch etc.) -- shouldn't reach here in practice.
              (error "compile-one-instruction: matmul not BLAS-compatible" (ssa-binding-name b)))))
 
@@ -2166,6 +2174,14 @@
                  (let ((aid (concrete-alloc-id (car info))))
                    (and (>= aid 0) (context-alloc->pool-idx ctx aid))))))
         (else #f)))
+    ;; Trace-time array of binding input v: the recorded result of the
+    ;; binding it refers to, or the constant itself.
+    (define (trace-input-arr v)
+      (cases ssa-value v
+        (binding-ref (bid)
+          (car (or (morph-env-lookup trace-info bid)
+                   (error "compile-replay-plan: no trace-info for input" bid))))
+        (const-ref (cid) (hash-table-ref constants cid))))
     (define gemm-epilogue-eb (make-env-builder))  ;; g.name -> ri-gemm-epilogue
     (define epilogue-gemm-eb (make-env-builder))  ;; e.name -> g's position index
     (let lp ((bs bindings) (i 0))
@@ -2201,7 +2217,13 @@
                                     (ssa-binding-inputs g)))
                    (g-shape    (ssa-binding-shape g))
                    (g-strides  (compute-strides g-shape))
-                   (g-dtype    (ssa-binding-dtype g)))
+                   (g-dtype    (ssa-binding-dtype g))
+                   ;; The fused GEMM runs through execute-blas-gemm-strided/into!;
+                   ;; its operand checks are done once here, on the trace-time inputs.
+                   (g-plan     (let ((ins (ssa-binding-inputs g)))
+                                 (prepare-blas-gemm-strided/into
+                                  (trace-input-arr (car ins))
+                                  (trace-input-arr (cadr ins))))))
               ;; The fused instruction writes the product straight into e's
               ;; slot while it still reads g's inputs.  The trace allocated
               ;; e's slot only after g had run, so it may be the slot of one
@@ -2212,7 +2234,7 @@
                   (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
                     (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
                                       (car g-in-refs) (cadr g-in-refs)
-                                      'unary e-comb 0 (rr-val 0)))
+                                      'unary e-comb 0 (rr-val 0) g-plan))
                   (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
                 ;; An activation directly after its GEMM stays a combiner
                 ;; epilogue applied in place to the GEMM output.
@@ -2220,13 +2242,13 @@
                   (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
                     (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
                                       (car g-in-refs) (cadr g-in-refs)
-                                      'unary e-comb 0 (rr-val 0)))
+                                      'unary e-comb 0 (rr-val 0) g-plan))
                   (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
                 (ri-flat-bias-broadcast (_ _ _ _ e-comb N _ e-in-B)
                   (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
                     (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
                                       (car g-in-refs) (cadr g-in-refs)
-                                      'bias-broadcast e-comb N e-in-B))
+                                      'bias-broadcast e-comb N e-in-B g-plan))
                   (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
                 (else #f))))))
         (lp (cdr bs) (+ i 1))))
@@ -2369,16 +2391,16 @@
               (cases replay-instruction instr
 
 
-                (ri-gemm (pool-idx shape strides dtype A-ref B-ref)
+                (ri-gemm (pool-idx shape strides dtype A-ref B-ref plan)
                   (time-instr 'ri-gemm
                     (let ((buf (vector-ref pool-bufs pool-idx)))
-                      (execute-blas-gemm/into! (deref A-ref) (deref B-ref) buf)
+                      (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
                       (make-pool-arr pool-idx shape strides dtype))))
 
-                (ri-gemm-strided (pool-idx shape strides dtype A-ref B-ref)
+                (ri-gemm-strided (pool-idx shape strides dtype A-ref B-ref plan)
                   (time-instr 'ri-gemm-strided
                     (let ((buf (vector-ref pool-bufs pool-idx)))
-                      (execute-blas-gemm-strided/into! (deref A-ref) (deref B-ref) buf)
+                      (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
                       (make-pool-arr pool-idx shape strides dtype))))
 
                 (ri-index (pool-idx shape strides dtype index-fn in-refs)
@@ -2526,11 +2548,11 @@
                         (else (error "ri-flat-broadcast: A not concrete" A))))))
 
                 (ri-gemm-epilogue (pool-idx shape strides dtype A-ref B-ref
-                                   epilogue-kind epilogue-comb epilogue-N bias-ref)
+                                   epilogue-kind epilogue-comb epilogue-N bias-ref plan)
                   (time-instr 'ri-gemm-epilogue
                     (let* ((buf (vector-ref pool-bufs pool-idx))
                            (sz  (shape-size shape)))
-                      (execute-blas-gemm-strided/into! (deref A-ref) (deref B-ref) buf)
+                      (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
                       (case epilogue-kind
                         ((unary)
                          (execute-flat-unary-compute-inplace! epilogue-comb buf sz dtype))
@@ -2791,8 +2813,8 @@
             (do ((i 0 (+ i 1))) ((= i (vector-length plan)))
               (let* ((instr (vector-ref plan i))
                      (tag (cases replay-instruction instr
-                            (ri-gemm             (_ _ _ _ _ _)           'ri-gemm)
-                            (ri-gemm-strided     (_ _ _ _ _ _)           'ri-gemm-strided)
+                            (ri-gemm             (_ _ _ _ _ _ _)         'ri-gemm)
+                            (ri-gemm-strided     (_ _ _ _ _ _ _)         'ri-gemm-strided)
                             (ri-index            (_ shape _ _ _ _)
                                                  (begin
                                                    (stack-push! index-shapes (cons i shape))
@@ -2809,7 +2831,7 @@
                             (ri-flat-bias-broadcast (_ _ _ _ _ _ _ _)   'ri-flat-bias-broadcast)
                             (ri-flat-broadcast   (_ _ _ _ _ _ _ _ _ _ _) 'ri-flat-broadcast)
                             (ri-flat-ternary     (_ _ _ _ _ _ _ _)       'ri-flat-ternary)
-                            (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _)  'ri-gemm-epilogue)
+                            (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _ _) 'ri-gemm-epilogue)
                             (ri-alias            (_ _ _ _ _)             'ri-alias)
                             (ri-im2col           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-im2col)
                             (ri-col2im           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _)     'ri-col2im)
