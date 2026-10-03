@@ -12,6 +12,8 @@
 
 (include-relative "test-core.scm")
 (include-relative "test-index-fn.scm")
+(include-relative "test-scalar-ops.scm")
+(include-relative "test-segop.scm")
 (include-relative "test-basic-ops.scm")
 (include-relative "test-batch-ops.scm")
 (include-relative "test-blas.scm")

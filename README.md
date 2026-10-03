@@ -210,6 +210,15 @@ Type promotion rules:
 - Transcendental functions promote integers to floating point
 - Reductions preserve dtype (mean promotes to float)
 
+`(morph-cast m dtype)` converts an array to another dtype element by
+element: a conversion to `'f32` rounds to single precision, and a
+conversion to an integer dtype truncates.
+
+In a compiled SSA training graph, each parameter's gradient has the
+parameter's dtype. When an `'f32` parameter meets `'f64` values, the
+backward pass computes in `'f64` as promotion requires, and the gradient
+is cast back to `'f32` at the end.
+
 ## Performance Tips
 
 1. **Laziness is your friend** - Build expression trees, materialize once
@@ -291,16 +300,18 @@ kernels, one per op and dtype (f32 or f64), for:
 - reductions of row-major 2-D arrays over axis 0 or 1;
 - copies of strided views into row-major order.
 
-When an SSA replay plan is compiled, bindings with the unary and binary ops
-become `ri-activation-unary` or `ri-activation-binary` instructions, which
-use the backend's kernel for their op and dtype at execution time.
+When an SSA replay plan is compiled, each element-wise binding is lowered
+to a segop (see below). A binding that applies one of these ops directly to
+row-major operands of the output's shape gets the `segop/activation-unary`
+or `segop/activation-binary` executor, which uses the backend's kernel for
+its op and dtype at execution time.
 Reductions and strided copies use their kernels wherever arrays are
 realized, not only during replay. When no backend is registered, no kernel
 exists for that op and dtype, or the operand and output dtypes differ, the
 same Scheme code runs as before.
 The kernels compute exactly what that Scheme code computes, so registering
 a backend changes speed, not results. Bindings produced by the element-wise
-fusion pass carry a composed function and never use a kernel.
+fusion pass have a composed body and never use a kernel.
 
 No activation backend is registered by default. The `array-morphisms-crunch`
 egg provides two backends; the threaded one splits large arrays across
@@ -314,11 +325,70 @@ threads:
 
 The activation op names are registered by default. The binary op names are
 registered by the backend constructors, so until then `add`, `sub`, `mul`
-and `div` compile to the ordinary `ri-flat-binary`. Other names can be
+and `div` use the ordinary `segop/flat-binary` executor. Other names can be
 registered with `register-activation-op!` and `register-binary-op!`.
-Registering a name only selects the instruction. For a new activation to
-appear in differentiable SSA graphs it also needs a `morph-<op>`
+Registering a name only selects the executor, and only for ops that have an
+entry in the scalar-op table. For a new activation to appear in
+differentiable SSA graphs it also needs a table entry, a `morph-<op>`
 constructor, a VJP rule in `ssa-vjp` and a case in `rebuild-morphism`.
+
+## Segmented Operations
+
+Between the SSA program and its replay plan, element-wise bindings are
+represented as *segmented operations* (segops,
+`array-morphisms-segop`). A segop has:
+
+- an iteration space, a vector of extents;
+- operands, each an array with its layout (dtype, shape, strides, offset)
+  and an *index map* from iteration coordinates to the array's index;
+- a *body*, a symbolic expression computing one output element, such as
+  `(relu (in 0))` or `(add (mul (in 0) (in 1)) (in 2))`;
+- the Scheme function it was lowered from, used to execute it on the host.
+
+There are three kinds: `seg-map` (element-wise maps, possibly with several
+outputs), `seg-red` (reductions, with a combine spec giving the operator,
+neutral element, accumulator precision and summation order) and `seg-lib`
+(named library operations such as convolutions). Index maps cover
+identities, broadcasts, transposes, slices, reshapes (with `floordiv` and
+`mod`) and padded reads (with a guard and a fill value). Because bodies and
+maps are data, a code generator can read them, which the Scheme functions
+inside the older instructions did not allow.
+
+The ops a body can name come from the *scalar-op table*
+(`scalar-ops-table.scm`, module `array-morphisms-scalar-ops-table`). Each
+entry gives an op's parameters and formula. The combiners of
+`array-morphisms-basic-ops` are generated from the same entries
+(`array-morphisms-scalar-ops`), and `array-morphisms-crunch` reads the
+table at compile time to generate its kernels, so all of them compute the
+same formula.
+
+`segop-interpret` executes any `seg-map` or `seg-red` directly from its
+definition. It is slow and is meant for testing.
+
+When a replay plan is compiled, each element-wise segop is offered to the
+segop backends in turn; the first that accepts it supplies an executor, and
+the binding becomes an `ri-segop` instruction. The backends in use are the
+value of the parameter `segop-backends`:
+
+```scheme
+(import array-morphisms-segop)
+(segop-backends)                      ; the backends, in the order tried
+(register-segop-backend! b)           ; try b before the others
+(parameterize ((segop-backends (list b)))
+  ...)                                ; use only b within this extent
+```
+
+Two backends are always present. `registry` handles the patterns that use
+the activation backend's kernels, and `scheme` handles the rest with Scheme
+loops. Replay results are the same as those of the instructions they
+replaced, bit for bit. Bindings that neither backend accepts, such as
+element-wise ops over transposed views, still compile to the generic
+`ri-index` instruction.
+
+The timing profile (`replay-timing-results`) and `replay-plan-stats` name
+each segop instruction by its pattern: `segop/activation-unary`,
+`segop/activation-binary`, `segop/flat-unary`, `segop/flat-binary`,
+`segop/bias-broadcast`, `segop/flat-ternary` or `segop/flat-broadcast`.
 
 ## Examples
 
@@ -385,6 +455,9 @@ See [CHICKEN Scheme Wiki](https://wiki.call-cc.org/) for full documentation.
 
 Key modules:
 - `array-morphisms-core` - Core data types and utilities
+- `array-morphisms-scalar-ops-table` - The scalar-op table (op formulas, as data)
+- `array-morphisms-scalar-ops` - Combiners and expressions of the scalar ops
+- `array-morphisms-segop` - Segmented operations: index maps, bodies, interpreter, backends
 - `array-morphisms-basic-ops` - Arithmetic and transcendental operations
 - `array-morphisms-structural-ops` - Reshape, transpose, slice, stack
 - `array-morphisms-realization` - Materialization and execution

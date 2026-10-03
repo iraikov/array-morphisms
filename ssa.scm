@@ -28,10 +28,12 @@
 
   (;; Data-type predicates/accessors
    ssa-value?
+   binding-ref const-ref
    ssa-binding-ref? ssa-const-ref?
    ssa-value-id
 
    ;; SSA records
+   make-ssa-binding
    ssa-binding?
    ssa-binding-name ssa-binding-op ssa-binding-inputs
    ssa-binding-shape ssa-binding-dtype ssa-binding-meta
@@ -57,8 +59,7 @@
    rr-val rr-const
    replay-instruction replay-instruction?
    ri-gemm ri-gemm-strided ri-index ri-reduce ri-view
-   ri-flat-unary ri-flat-binary ri-flat-bias-broadcast ri-flat-broadcast ri-flat-ternary
-   ri-activation-unary ri-activation-binary
+   ri-segop
    ri-gemm-epilogue ri-alias
    ri-im2col ri-col2im
    ri-conv-fwd ri-conv-bwd-data ri-conv-bwd-weights
@@ -67,6 +68,9 @@
    ssa-compute-use-counts
    ssa-fusion-eligible?
    ssa-element-wise-fusion-pass
+
+   ;; Segop lowering
+   binding-scalar-body
 
    ;; Replay plan compilation and execution
    compile-replay-plan
@@ -112,6 +116,8 @@
           array-morphisms-realization
           array-morphisms-context
           array-morphisms-morph-env
+          array-morphisms-scalar-ops
+          array-morphisms-segop
           (prefix array-morphisms-grad am:))
           
 
@@ -235,101 +241,18 @@
     (view-fn  procedure?)
     (in-ref   replay-ref?))
 
-  ;; Element-wise unary: output[i] = combiner(A[i])
-  ;; Emitted when: 1 operand, operand and output both row-major with same shape.
-  (ri-flat-unary
+  ;; Element-wise op lowered to a segop (see segop-lower.scm).  executor
+  ;; computes the output into the pool buffer out-pool-idx; segop is the
+  ;; seg-map it was selected for, and tag names the backend pattern, for
+  ;; timing profiles and replay-plan-stats.
+  (ri-segop
     (out-pool-idx integer?)
     (out-shape    vector?)
     (out-strides  vector?)
     (out-dtype    symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?))
-
-  ;; Element-wise activation: output[i] = op(A[i]), where op is one of the
-  ;; activation op names of array-morphisms-activation-exec.
-  ;; Emitted under the same layout conditions as ri-flat-unary.  At
-  ;; execution time the active activation backend's kernel for op, if any,
-  ;; replaces the per-element combiner loop; combiner is the fallback and
-  ;; computes the same values.
-  (ri-activation-unary
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (op           symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?))
-
-  ;; Element-wise binary same-shape: output[i] = combiner(A[i], B[i])
-  ;; Emitted when: 2 operands, all row-major with identical shape.
-  (ri-flat-binary
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?))
-
-  ;; Element-wise binary op: output[i] = op(A[i], B[i]), where op is one of
-  ;; the binary op names of array-morphisms-activation-exec.  Emitted under
-  ;; the same layout conditions as ri-flat-binary.  At execution time the
-  ;; active backend's binary kernel for op, if any, replaces the
-  ;; per-element combiner loop; combiner is the fallback.
-  (ri-activation-binary
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (op           symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?))
-
-  ;; Bias broadcast: output[i] = combiner(A[i], B[i mod N])
-  ;; Emitted when: A row-major = output shape; B row-major shape [N] = last dim of output.
-  ;; N baked in at compile time.
-  (ri-flat-bias-broadcast
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (combiner     procedure?)
-    (bias-N       integer?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?))
-
-  ;; General broadcast of a binary op on an output viewed as [M, N]
-  ;; (N the last dimension): output[i, j] = combiner(A[i*rsA + j*csA],
-  ;; B[i*rsB + j*csB]).  Each operand is row-major and either has the
-  ;; output's shape (rs N, cs 1), broadcasts along the last axis ([..., 1]:
-  ;; rs 1, cs 0), along the leading axes ([N]: rs 0, cs 1), or is a
-  ;; single element (rs 0, cs 0).  Covers the row broadcasts of
-  ;; normalizations and softmax and the scalar constants of activations.
-  (ri-flat-broadcast
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (combiner     procedure?)
-    (op-kind      symbol?)      ; add sub mul div pow, or generic
-    (rows         integer?)
-    (cols         integer?)
-    (steps        vector?)      ; #(rsA csA rsB csB)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?))
-
-  ;; Element-wise op of three same-shape row-major operands (a fused
-  ;; binding): output[i] = combiner(A[i], B[i], C[i]).
-  (ri-flat-ternary
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?)
-    (in-C         replay-ref?))
+    (segop        segop?)
+    (executor     procedure?)
+    (tag          symbol?))
 
   ;; GEMM with in-place element-wise epilogue: one buffer, one combined kernel.
   ;; BLAS GEMM writes out-pool-idx buffer C[M,N] = A[M,K]*B[K,N],
@@ -513,7 +436,12 @@
 (define (ssa-fusion-eligible? producer consumer use-counts)
   "True when producer and consumer can be fused by MoA psi-composition.
    Requires: use-count(producer)=1, consumer's first input is producer's output,
-   same shape, both element-wise, both have extractable combiners."
+   same shape and dtype, both element-wise, both have extractable combiners,
+   and input counts that compose-flat-combiners supports (a producer of one
+   or two inputs, a consumer with at most one input besides the producer).
+   The dtype condition keeps the fused result equal to the unfused one,
+   which rounds the producer's value to its dtype before the consumer reads
+   it."
   (let* ((p-name  (ssa-binding-name producer))
          (p-count (hash-table-ref/default use-counts p-name 0))
          (c-in0   (and (pair? (ssa-binding-inputs consumer))
@@ -523,6 +451,9 @@
            (binding-ref (bid) (eq? bid p-name))
            (else #f))
          (equal? (ssa-binding-shape producer) (ssa-binding-shape consumer))
+         (eq? (ssa-binding-dtype producer) (ssa-binding-dtype consumer))
+         (<= 1 (length (ssa-binding-inputs producer)) 2)
+         (<= (length (ssa-binding-inputs consumer)) 2)
          (ssa-binding-elementwise? producer)
          (ssa-binding-elementwise? consumer)
          (ssa-binding-has-combiner? producer)
@@ -540,11 +471,14 @@
          (c-comb  (ssa-binding-combiner consumer))
          (p-nargs (length p-inputs))
          (fused-comb (compose-flat-combiners p-comb p-nargs c-comb (length c-other)))
+         (fused-body (compose-binding-bodies (binding-scalar-body producer p-comb) p-nargs
+                                             (binding-scalar-body consumer c-comb)))
          (base-meta (filter (lambda (kv)
-                                 (not (memq (car kv) '(combiner index-fn fused?))))
+                                 (not (memq (car kv) '(combiner index-fn fused? body))))
                                (ssa-binding-meta consumer)))
          (fused-meta (cons `(combiner . ,fused-comb)
-                           (cons `(fused? . #t) base-meta))))
+                           (cons `(body . ,fused-body)
+                                 (cons `(fused? . #t) base-meta)))))
     (make-ssa-binding (ssa-binding-name consumer)
                       (ssa-binding-op consumer)
                       fused-inputs
@@ -557,9 +491,9 @@
    Greedy left-to-right scan: whenever a producer P has use-count=1 and
    its only consumer C immediately follows, fuse them into one binding F.
    Chains of length > 2 are handled by re-presenting F as the new producer.
-   Safety constraint: fusion is only applied when ALL of producer's inputs
-   have the same shape as the producer's output (flat/non-broadcasting ops),
-   ensuring identity index functions are valid in the fused binding."
+   Safety constraint: fusion is only applied when all inputs of the producer
+   and all other inputs of the consumer have the shape of the output, since
+   the fused binding reads every input through an identity index function."
   (let* ((bindings    (ssa-program-bindings prog))
          (use-counts  (ssa-compute-use-counts bindings))
          ;; Shape lookup: id-sym -> shape vector (bindings + constants)
@@ -573,15 +507,23 @@
     (hash-table-walk (ssa-program-constants prog)
       (lambda (k v) (env-builder-extend! shape-of-eb k (morph-shape v))))
 
+    ;; True when every input in vals has the shape shape.
+    (define (all-of-shape? vals shape)
+      (every (lambda (inp)
+               (let ((id (cases ssa-value inp
+                           (binding-ref (bid) bid)
+                           (const-ref   (cid) cid))))
+                 (equal? (env-builder-lookup shape-of-eb id) shape)))
+             vals))
+
     ;; True when all inputs of b have the same shape as b's output.
     (define (flat-producer? b)
-      (let ((b-shape (ssa-binding-shape b)))
-        (every (lambda (inp)
-                 (let ((id (cases ssa-value inp
-                             (binding-ref (bid) bid)
-                             (const-ref   (cid) cid))))
-                   (equal? (env-builder-lookup shape-of-eb id) b-shape)))
-               (ssa-binding-inputs b))))
+      (all-of-shape? (ssa-binding-inputs b) (ssa-binding-shape b)))
+
+    ;; True when the inputs of consumer c other than the producer's output
+    ;; have the shape of c's output.
+    (define (flat-consumer? c)
+      (all-of-shape? (cdr (ssa-binding-inputs c)) (ssa-binding-shape c)))
 
     (let loop ((bs bindings) (result '()))
       (cond
@@ -598,7 +540,8 @@
         ((and (pair? (cdr bs))
               (not (env-builder-lookup elim-eb (ssa-binding-name (cadr bs))))
               (ssa-fusion-eligible? (car bs) (cadr bs) use-counts)
-              (flat-producer? (car bs)))
+              (flat-producer? (car bs))
+              (flat-consumer? (cadr bs)))
          (let ((fused (fuse-two-ssa-bindings (car bs) (cadr bs))))
            (env-builder-extend! elim-eb (ssa-binding-name (car bs)) #t)
            ;; Update shape-of for the fused binding (inherits consumer's name+shape)
@@ -742,9 +685,33 @@
       (let ((sd (env-builder-lookup binding-sd-eb (ssa-value-id v))))
         (and sd (cdr sd))))
 
-    ;; emit! -- create a new backward SSA binding (O(1) push; reversed at end)
-    (define (emit! op inputs shape dtype meta)
+    ;; The dtype of the morphism rebuild-morphism makes for a binding with
+    ;; op and inputs, by the type rules of the morphism constructors:
+    ;; arithmetic promotes its operand dtypes, the transcendental ops and
+    ;; activations make integers f64, reductions follow
+    ;; infer-reduction-dtype, and structural ops keep their input's dtype.
+    ;; Ops not covered here (cast) keep the dtype the caller gives.
+    (define (emitted-dtype op inputs dtype)
+      (let ((in-dtypes (map val-dtype inputs)))
+        (cond
+         ((not (every values in-dtypes)) dtype)
+         ((memq op '(add sub mul div pow matmul conv2d-bwd-data conv2d-bwd-weights))
+          (fold promote-types (car in-dtypes) (cdr in-dtypes)))
+         ((and (pair? op) (eq? (car op) 'reduce))
+          (infer-reduction-dtype (cadr op) (car in-dtypes)))
+         ((memq op '(reshape transpose col2im map relu-deriv sigmoid-deriv tanh-deriv))
+          (car in-dtypes))
+         ((memq op '(negate abs floor ceiling sqrt exp log sin cos tan relu sigmoid tanh))
+          (infer-unary-dtype op (car in-dtypes)))
+         (else dtype))))
+
+    ;; emit! -- create a new backward SSA binding (O(1) push; reversed at end).
+    ;; The binding's dtype is the one the trace computes for it (see
+    ;; emitted-dtype), whatever dtype the caller passes, so that replay
+    ;; writes each pool buffer in the dtype the trace allocated.
+    (define (emit! op inputs shape dtype-hint meta)
       (let* ((adj-id (gensym 'adj-))
+             (dtype  (emitted-dtype op inputs dtype-hint))
              (b      (make-ssa-binding adj-id op inputs shape dtype meta)))
         (stack-push! bwd-bindings-stack b)
         (env-builder-extend! binding-sd-eb adj-id (cons shape dtype))
@@ -914,7 +881,7 @@
                   (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype)))
                     (accumulate-input-adjoint! x-val dx))
                   (let* ((neg-g (emit! 'negate (list g-val) g-shape dtype
-                                        `((combiner . ,(lambda (x) (- x))))))
+                                        `((combiner . ,(scalar-op-combiner 'negate)))))
                          (dy    (emit-reduce-sum-to! neg-g g-shape y-shape dtype)))
                     (accumulate-input-adjoint! y-val dy))))
 
@@ -950,7 +917,7 @@
                          (neg-dy  (emit! 'mul (list g-val x-over-y2) g-shape dtype
                                           `((combiner . ,*))))
                          (neg-dy2 (emit! 'negate (list neg-dy) g-shape dtype
-                                          `((combiner . ,(lambda (x) (- x))))))
+                                          `((combiner . ,(scalar-op-combiner 'negate)))))
                          (dy      (emit-reduce-sum-to! neg-dy2 g-shape y-shape dtype)))
                     (accumulate-input-adjoint! y-val dy))))
 
@@ -963,7 +930,7 @@
                   (let* ((one-val (emit-scalar-const! 1.0 dtype))
                          (nm1     (emit! 'sub (list n-val one-val)
                                          (val-shape n-val) dtype
-                                         `((combiner . ,(lambda (a b) (- a b))))))
+                                         `((combiner . ,(scalar-op-combiner 'sub)))))
                          (xpow    (emit! 'pow (list x-val nm1) g-shape dtype
                                           `((combiner . ,expt))))
                          (n-xpow  (emit! 'mul (list n-val xpow) g-shape dtype
@@ -978,7 +945,7 @@
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
                        (neg-g   (emit! 'negate (list g-val) g-shape dtype
-                                        `((combiner . ,(lambda (x) (- x))))))
+                                        `((combiner . ,(scalar-op-combiner 'negate)))))
                        (dx      (emit-reduce-sum-to! neg-g g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -1049,7 +1016,7 @@
                        (sin-x   (emit! 'sin (list x-val) x-shape dtype
                                         `((combiner . ,sin))))
                        (neg-sin (emit! 'negate (list sin-x) x-shape dtype
-                                        `((combiner . ,(lambda (x) (- x))))))
+                                        `((combiner . ,(scalar-op-combiner 'negate)))))
                        (dx-raw  (emit! 'mul (list g-val neg-sin) g-shape dtype
                                         `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
@@ -1062,8 +1029,8 @@
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
                        (hx      (emit! 'relu-deriv (list x-val) x-shape dtype
-                                        `((fn . ,(lambda (xv) (if (> xv 0.0) 1.0 0.0)))
-                                          (combiner . ,(lambda (xv) (if (> xv 0.0) 1.0 0.0))))))
+                                        `((fn . ,(scalar-op-combiner 'relu-deriv))
+                                          (combiner . ,(scalar-op-combiner 'relu-deriv)))))
                        (dx-raw  (emit! 'mul (list g-val hx) g-shape dtype
                                         `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
@@ -1075,8 +1042,8 @@
                        (x-shape (val-shape x-val))
                        (fwd-out (binding-ref bid-sym))
                        (deriv   (emit! 'sigmoid-deriv (list fwd-out) g-shape dtype
-                                        `((fn . ,(lambda (sv) (* sv (- 1.0 sv))))
-                                          (combiner . ,(lambda (sv) (* sv (- 1.0 sv)))))))
+                                        `((fn . ,(scalar-op-combiner 'sigmoid-deriv))
+                                          (combiner . ,(scalar-op-combiner 'sigmoid-deriv)))))
                        (dx-raw  (emit! 'mul (list g-val deriv) g-shape dtype
                                         `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
@@ -1088,11 +1055,22 @@
                        (x-shape (val-shape x-val))
                        (fwd-out (binding-ref bid-sym))
                        (deriv   (emit! 'tanh-deriv (list fwd-out) g-shape dtype
-                                        `((fn . ,(lambda (tv) (- 1.0 (* tv tv))))
-                                          (combiner . ,(lambda (tv) (- 1.0 (* tv tv)))))))
+                                        `((fn . ,(scalar-op-combiner 'tanh-deriv))
+                                          (combiner . ,(scalar-op-combiner 'tanh-deriv)))))
                        (dx-raw  (emit! 'mul (list g-val deriv) g-shape dtype
                                         `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
+                  (accumulate-input-adjoint! x-val dx)))
+
+               ;; cast(x) -- dx = g converted back to the dtype of x
+               ((eq? op 'cast)
+                (let* ((x-val   (list-ref inputs 0))
+                       (x-dtype (val-dtype x-val))
+                       (dx      (if (eq? (val-dtype g-val) x-dtype)
+                                    g-val
+                                    (emit! 'cast (list g-val) (val-shape x-val) x-dtype
+                                           `((dtype . ,x-dtype)
+                                             (combiner . ,(cast-combiner x-dtype)))))))
                   (accumulate-input-adjoint! x-val dx)))
 
                ;; matmul(A, B) -- dA = g @ B^T; dB = A^T @ g
@@ -1239,11 +1217,20 @@
            (zero-val    (const-ref zero-cid))
            (loss-out-val (emit! 'add (list loss-binding-val zero-val) loss-shape loss-dtype
                                       `((combiner . ,+))))
-           ;; Collect param grad outputs in order of param-const-vals
+           ;; Collect param grad outputs in order of param-const-vals.  A
+           ;; gradient computed in another dtype than its parameter's (as
+           ;; when an f32 parameter meets f64 values) is cast to the
+           ;; parameter's dtype.
            (grad-vals   (filter-map
                          (lambda (pcv)
-                           (let ((cid-sym (ssa-value-id pcv)))
-                             (env-builder-lookup param-grad-eb cid-sym)))
+                           (let* ((cid-sym (ssa-value-id pcv))
+                                  (g       (env-builder-lookup param-grad-eb cid-sym))
+                                  (p-dtype (val-dtype pcv)))
+                             (if (and g (not (eq? (val-dtype g) p-dtype)))
+                                 (emit! 'cast (list g) (val-shape pcv) p-dtype
+                                        `((dtype . ,p-dtype)
+                                          (combiner . ,(cast-combiner p-dtype))))
+                                 g)))
                          param-const-vals))
            (all-outputs  (cons loss-out-val grad-vals))
            (all-bindings (append fwd-bindings (reverse (stack->list bwd-bindings-stack)))))
@@ -1340,8 +1327,9 @@
       ((eq? op 'relu)    (morph-relu    (car inputs)))
       ((eq? op 'sigmoid) (morph-sigmoid (car inputs)))
       ((eq? op 'tanh)    (morph-tanh-am (car inputs)))
+      ((eq? op 'cast)    (morph-cast (car inputs) (ssa-binding-dtype b)))
        ;; map, and the activation derivative ops, which ssa-vjp emits as maps
-       ;; under their own op names so they can be compiled to ri-activation-unary.
+       ;; under their own op names so that replay can use activation kernels for them.
        ((memq op '(map relu-deriv sigmoid-deriv tanh-deriv))
         (let ((fn (cdr (assq 'fn meta))))
           (morph-map fn (car inputs))))
@@ -1610,40 +1598,10 @@
 ;;; inside compile-one-instruction and never during replay.
 ;;; ============================================================
 
-(define (trace-arr-row-major? m)
-  (cases array-morphism m
-    (concrete-array (_ shape strides offset _ _ _)
-      (and (= offset 0) (equal? strides (compute-strides shape))))
-    (else #f)))
-
 (define (trace-arr-shape m)
   (cases array-morphism m
     (concrete-array (_ shape _ _ _ _ _) shape)
     (else (error "trace-arr-shape: not concrete" m))))
-
-(define (flat-unary-eligible? out-shape in-traces)
-  (and (= (length in-traces) 1)
-       (trace-arr-row-major? (car in-traces))
-       (equal? (trace-arr-shape (car in-traces)) out-shape)))
-
-(define (flat-binary-eligible? out-shape in-traces)
-  (and (= (length in-traces) 2)
-       (trace-arr-row-major? (car  in-traces))
-       (trace-arr-row-major? (cadr in-traces))
-       (equal? (trace-arr-shape (car  in-traces)) out-shape)
-       (equal? (trace-arr-shape (cadr in-traces)) out-shape)))
-
-(define (flat-bias-broadcast-eligible? out-shape in-traces)
-  (and (= (length in-traces) 2)
-       (> (vector-length out-shape) 0)  ; bias-broadcast requires rank >= 1
-       (trace-arr-row-major? (car  in-traces))
-       (trace-arr-row-major? (cadr in-traces))
-       (equal? (trace-arr-shape (car in-traces)) out-shape)
-       (let* ((bias-shape (trace-arr-shape (cadr in-traces)))
-              (rank       (vector-length out-shape))
-              (N          (vector-ref out-shape (- rank 1))))
-         (and (= (vector-length bias-shape) 1)
-              (= (vector-ref bias-shape 0) N)))))
 
 
 ;; The (row-step col-step) pair of an operand of a broadcast binary op
@@ -1670,22 +1628,6 @@
       (list 0 1))
      (else #f))))
 
-;; The #(rsA csA rsB csB) steps of a binary op eligible for
-;; ri-flat-broadcast, or #f.
-(define (flat-broadcast-steps out-shape out-dtype in-traces)
-  (and (= (length in-traces) 2)
-       (> (vector-length out-shape) 0)
-       (memq out-dtype '(f32 f64))
-       (every (lambda (tr)
-                (and (trace-arr-row-major? tr)
-                     (cases array-morphism tr
-                       (concrete-array (_ _ _ _ dt _ _) (eq? dt out-dtype))
-                       (else #f))))
-              in-traces)
-       (let ((a (broadcast-steps out-shape (trace-arr-shape (car in-traces))))
-             (b (broadcast-steps out-shape (trace-arr-shape (cadr in-traces)))))
-         (and a b (list->vector (append a b))))))
-
 ;; Loops over the [M, N] output, storing (F A[..] B[..]) at each
 ;; element.  F is a flonum operator or a procedure; the element reads are
 ;; nested directly in the call so that the compiler can unbox them.
@@ -1698,15 +1640,6 @@
            (set! out (fx+ base j)
                  (f (ref dataA (fx+ a0 (fx* j csA)))
                     (ref dataB (fx+ b0 (fx* j csB)))))))))))
-
-;; The op name of a binding's combiner when it is the plain procedure
-;; of add, sub, mul or div (as for bindings that are not fused), else #f.
-(define (plain-binary-op combiner)
-  (cond ((eq? combiner +) 'add)
-        ((eq? combiner -) 'sub)
-        ((eq? combiner *) 'mul)
-        ((eq? combiner /) 'div)
-        (else #f)))
 
 ;; The operand mode of lookup-broadcast-kernel for the steps at
 ;; position K (0 for A, 2 for B) of a broadcast on N columns: 0 full,
@@ -1749,6 +1682,8 @@
       ((f32) (dispatch f32vector-ref f32vector-set!))
       ((f64) (dispatch f64vector-ref f64vector-set!))
       (else (error "execute-flat-broadcast-compute: unsupported dtype" dtype)))))
+
+(include "segop-lower.scm")
 
 
 ;;; ============================================================
@@ -2063,74 +1998,10 @@
            ((not (compute-index-fn? index-fn))
             (ri-index pool-idx shape strides dtype index-fn in-refs))
 
-           ;; Activation op, unary, row-major, same shape.  Fused bindings are
-           ;; excluded: they keep the consumer's op name but carry a composed
-           ;; combiner, so the op's own kernel would compute the wrong function.
-           ((and (activation-op-registered? op)
-                 (not (assq 'fused? meta))
-                 (flat-unary-eligible? shape in-traces))
-            (ri-activation-unary pool-idx shape strides dtype op
-                                 (compute-index-fn-combiner index-fn)
-                                 (car in-refs)))
-
-           ;; Fast path 1: unary, row-major, same shape
-           ((flat-unary-eligible? shape in-traces)
-            (ri-flat-unary pool-idx shape strides dtype
-                           (compute-index-fn-combiner index-fn)
-                           (car in-refs)))
-
-           ;; Registered binary op, both operands row-major with the
-           ;; output's shape.  Fused bindings are excluded, as for
-           ;; activations.
-           ((and (binary-op-registered? op)
-                 (not (assq 'fused? meta))
-                 (flat-binary-eligible? shape in-traces))
-            (ri-activation-binary pool-idx shape strides dtype op
-                                  (compute-index-fn-combiner index-fn)
-                                  (car in-refs) (cadr in-refs)))
-
-           ;; Fast path 2: binary, both row-major, same shape
-           ((flat-binary-eligible? shape in-traces)
-            (ri-flat-binary pool-idx shape strides dtype
-                            (compute-index-fn-combiner index-fn)
-                            (car in-refs) (cadr in-refs)))
-
-           ;; Fast path 3: bias broadcast [B*N] + [N]
-           ((flat-bias-broadcast-eligible? shape in-traces)
-            (let* ((rank (vector-length shape))
-                   (N    (vector-ref shape (- rank 1))))
-              (ri-flat-bias-broadcast pool-idx shape strides dtype
-                                      (compute-index-fn-combiner index-fn)
-                                      N
-                                      (car in-refs) (cadr in-refs))))
-
-           ;; Fast path 5: three operands, row-major with the output's shape
-           ((and (= (length in-traces) 3)
-                 (memq dtype '(f32 f64))
-                 (every (lambda (tr)
-                          (and (trace-arr-row-major? tr)
-                               (equal? (trace-arr-shape tr) shape)
-                               (cases array-morphism tr
-                                 (concrete-array (_ _ _ _ dt _ _) (eq? dt dtype))
-                                 (else #f))))
-                        in-traces))
-            (ri-flat-ternary pool-idx shape strides dtype
-                             (compute-index-fn-combiner index-fn)
-                             (car in-refs) (cadr in-refs) (caddr in-refs)))
-
-           ;; Fast path 4: binary with a row, column or scalar broadcast
-           ((flat-broadcast-steps shape dtype in-traces)
-            => (lambda (steps)
-                 (let* ((rank (vector-length shape))
-                        (N    (vector-ref shape (- rank 1))))
-                   (ri-flat-broadcast pool-idx shape strides dtype
-                                      (compute-index-fn-combiner index-fn)
-                                      (if (and (memq op '(add sub mul div pow))
-                                               (not (assq 'fused? meta)))
-                                          op
-                                          'generic)
-                                      (quotient (shape-size shape) N) N steps
-                                      (car in-refs) (cadr in-refs)))))
+           ;; Element-wise ops that lower to a segop some backend accepts
+           ((compile-elementwise-segop b (compute-index-fn-combiner index-fn)
+                                       in-traces in-refs pool-idx shape strides dtype)
+            => (lambda (instr) instr))
 
            ;; Generic fallback: compute-index-fn with non-trivial layout
            (else
@@ -2230,26 +2101,24 @@
               ;; of g's inputs; the pair is then left unfused.
               (unless (memv e-pool-idx (filter-map input-pool-idx (ssa-binding-inputs g)))
               (cases replay-instruction e-instr
-                (ri-flat-unary (_ _ _ _ e-comb _)
-                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
-                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
-                                      (car g-in-refs) (cadr g-in-refs)
-                                      'unary e-comb 0 (rr-val 0) g-plan))
-                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
-                ;; An activation directly after its GEMM stays a combiner
-                ;; epilogue applied in place to the GEMM output.
-                (ri-activation-unary (_ _ _ _ _ e-comb _)
-                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
-                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
-                                      (car g-in-refs) (cadr g-in-refs)
-                                      'unary e-comb 0 (rr-val 0) g-plan))
-                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
-                (ri-flat-bias-broadcast (_ _ _ _ e-comb N _ e-in-B)
-                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
-                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
-                                      (car g-in-refs) (cadr g-in-refs)
-                                      'bias-broadcast e-comb N e-in-B g-plan))
-                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
+                (ri-segop (_ e-shape _ _ e-sg _ tag)
+                  (case tag
+                    ((segop/flat-unary segop/activation-unary)
+                     (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
+                       (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
+                                         (car g-in-refs) (cadr g-in-refs)
+                                         'unary (segop-fallback e-sg) 0 (rr-val 0) g-plan))
+                     (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
+                    ((segop/bias-broadcast)
+                     (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
+                       (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
+                                         (car g-in-refs) (cadr g-in-refs)
+                                         'bias-broadcast (segop-fallback e-sg)
+                                         (vector-ref e-shape (- (vector-length e-shape) 1))
+                                         (segop-operand-slot (cadr (segop-inputs e-sg)))
+                                         g-plan))
+                     (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
+                    (else #f)))
                 (else #f))))))
         (lp (cdr bs) (+ i 1))))
 
@@ -2427,125 +2296,10 @@
                   (time-instr 'ri-view
                     (view-fn (deref in-ref))))
 
-                (ri-flat-unary (pool-idx shape strides dtype combiner in-A)
-                  (time-instr 'ri-flat-unary
-                    (let* ((src  (deref in-A))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism src
-                        (concrete-array (data _ _ _ src-dtype _ _)
-                          (execute-flat-unary-compute combiner data src-dtype buf size dtype)
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else (error "ri-flat-unary: source not concrete" src))))))
-
-                (ri-activation-unary (pool-idx shape strides dtype op combiner in-A)
-                  (time-instr 'ri-activation-unary
-                    (let* ((src  (deref in-A))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism src
-                        (concrete-array (data _ _ _ src-dtype _ _)
-                          (execute-activation-unary-compute op combiner data src-dtype
-                                                            buf size dtype)
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else (error "ri-activation-unary: source not concrete" src))))))
-
-                (ri-flat-binary (pool-idx shape strides dtype combiner in-A in-B)
-                  (time-instr 'ri-flat-binary
-                    (let* ((A    (deref in-A))
-                           (B    (deref in-B))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism A
-                        (concrete-array (data1 _ _ _ src-dtype1 _ _)
-                          (cases array-morphism B
-                            (concrete-array (data2 _ _ _ src-dtype2 _ _)
-                              (execute-flat-binary-compute combiner data1 src-dtype1 data2 src-dtype2 buf size dtype)
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-flat-binary: B not concrete" B))))
-                        (else (error "ri-flat-binary: A not concrete" A))))))
-
-                (ri-activation-binary (pool-idx shape strides dtype op combiner in-A in-B)
-                  (time-instr 'ri-activation-binary
-                    (let* ((A    (deref in-A))
-                           (B    (deref in-B))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism A
-                        (concrete-array (data1 _ _ _ src-dtype1 _ _)
-                          (cases array-morphism B
-                            (concrete-array (data2 _ _ _ src-dtype2 _ _)
-                              (execute-activation-binary-compute op combiner data1 src-dtype1
-                                                                 data2 src-dtype2 buf size dtype)
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-activation-binary: B not concrete" B))))
-                        (else (error "ri-activation-binary: A not concrete" A))))))
-
-                (ri-flat-bias-broadcast (pool-idx shape strides dtype combiner N in-A in-B)
-                  (time-instr 'ri-flat-bias-broadcast
-                    (let* ((A    (deref in-A))
-                           (B    (deref in-B))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism A
-                        (concrete-array (data1 _ _ _ _ _ _)
-                          (cases array-morphism B
-                            (concrete-array (data2 _ _ _ _ _ _)
-                              (let ((kernel (and (memq dtype '(f32 f64))
-                                                 (plain-binary-op combiner)
-                                                 (lookup-broadcast-kernel
-                                                  (active-activation-backend)
-                                                  (plain-binary-op combiner) dtype))))
-                                (if (and kernel (> N 0) (> size 0))
-                                    (kernel (quotient size N) N data1 0 data2 2 buf)
-                                    (execute-flat-bias-broadcast-compute combiner data1 data2
-                                                                         buf size N dtype)))
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-flat-bias-broadcast: B not concrete" B))))
-                        (else (error "ri-flat-bias-broadcast: A not concrete" A))))))
-
-                (ri-flat-ternary (pool-idx shape strides dtype combiner in-A in-B in-C)
-                  (time-instr 'ri-flat-ternary
-                    (let ((buf  (vector-ref pool-bufs pool-idx))
-                          (size (shape-size shape))
-                          (data-of (lambda (ref)
-                                     (cases array-morphism (deref ref)
-                                       (concrete-array (d _ _ _ _ _ _) d)
-                                       (else (error "ri-flat-ternary: operand not concrete"))))))
-                      (let ((a (data-of in-A)) (b (data-of in-B)) (c (data-of in-C)))
-                        (case dtype
-                          ((f32) (do ((i 0 (fx+ i 1))) ((fx= i size))
-                                   (f32vector-set! buf i (exact->inexact
-                                                          (combiner (f32vector-ref a i)
-                                                                    (f32vector-ref b i)
-                                                                    (f32vector-ref c i))))))
-                          (else (do ((i 0 (fx+ i 1))) ((fx= i size))
-                                  (f64vector-set! buf i (exact->inexact
-                                                         (combiner (f64vector-ref a i)
-                                                                   (f64vector-ref b i)
-                                                                   (f64vector-ref c i))))))))
-                      (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-flat-broadcast (pool-idx shape strides dtype combiner op-kind M N steps in-A in-B)
-                  (time-instr 'ri-flat-broadcast
-                    (let ((A   (deref in-A))
-                          (B   (deref in-B))
-                          (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism A
-                        (concrete-array (data1 _ _ _ _ _ _)
-                          (cases array-morphism B
-                            (concrete-array (data2 _ _ _ _ _ _)
-                              (let ((kernel (and (memq op-kind '(add sub mul div))
-                                                 (lookup-broadcast-kernel
-                                                  (active-activation-backend) op-kind dtype))))
-                                (if kernel
-                                    (kernel M N data1 (broadcast-mode steps 0 N)
-                                            data2 (broadcast-mode steps 2 N) buf)
-                                    (execute-flat-broadcast-compute combiner op-kind data1 data2
-                                                                    buf M N steps dtype)))
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-flat-broadcast: B not concrete" B))))
-                        (else (error "ri-flat-broadcast: A not concrete" A))))))
+                (ri-segop (pool-idx shape strides dtype sg executor tag)
+                  (time-instr tag
+                    (executor deref (vector-ref pool-bufs pool-idx))
+                    (make-pool-arr pool-idx shape strides dtype)))
 
                 (ri-gemm-epilogue (pool-idx shape strides dtype A-ref B-ref
                                    epilogue-kind epilogue-comb epilogue-N bias-ref plan)
@@ -2824,13 +2578,7 @@
                                                    (stack-push! reduce-specs (list i axes keepdims? shape))
                                                    'ri-reduce))
                             (ri-view             (_ _)                   'ri-view)
-                            (ri-flat-unary       (_ _ _ _ _ _)           'ri-flat-unary)
-                            (ri-activation-unary (_ _ _ _ _ _ _)         'ri-activation-unary)
-                            (ri-flat-binary      (_ _ _ _ _ _ _)         'ri-flat-binary)
-                            (ri-activation-binary (_ _ _ _ _ _ _ _)      'ri-activation-binary)
-                            (ri-flat-bias-broadcast (_ _ _ _ _ _ _ _)   'ri-flat-bias-broadcast)
-                            (ri-flat-broadcast   (_ _ _ _ _ _ _ _ _ _ _) 'ri-flat-broadcast)
-                            (ri-flat-ternary     (_ _ _ _ _ _ _ _)       'ri-flat-ternary)
+                            (ri-segop            (_ _ _ _ _ _ tag)       tag)
                             (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _ _) 'ri-gemm-epilogue)
                             (ri-alias            (_ _ _ _ _)             'ri-alias)
                             (ri-im2col           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-im2col)

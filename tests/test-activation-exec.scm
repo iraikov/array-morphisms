@@ -1,6 +1,6 @@
 ;;; tests/test-activation-exec.scm
 ;;; Test suite for the activation-kernel registry (activation-exec.scm) and
-;;; its use by the SSA replay engine (ri-activation-unary in ssa.scm,
+;;; its use by the SSA replay engine (the activation-unary segop pattern in ssa.scm,
 ;;; execute-activation-unary-compute in realization.scm).
 ;;;
 ;;; The kernels registered here are plain Scheme procedures standing in for
@@ -261,29 +261,29 @@
 (test-group "replay plan: instruction selection"
   (register-activation-backend! #f)
 
-  (test "relu forward and relu-deriv compile to ri-activation-unary"
+  (test "relu forward and relu-deriv compile to the activation-unary pattern"
     2
     (let* ((xv (param-var '(-2.0 -1.0 0.0 1.0 2.0) '(5) 'f64))
            (loss (am:var-mean (am:var-relu xv))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
-        (plan-count joint 'ri-activation-unary))))
+        (plan-count joint 'segop/activation-unary))))
 
-  (test "sigmoid forward and sigmoid-deriv compile to ri-activation-unary"
+  (test "sigmoid forward and sigmoid-deriv compile to the activation-unary pattern"
     2
     (let* ((xv (param-var '(1.0 2.0) '(2) 'f64))
            (loss (am:var-mean (am:var-sigmoid xv))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
-        (plan-count joint 'ri-activation-unary))))
+        (plan-count joint 'segop/activation-unary))))
 
-  (test "a non-activation unary op still compiles to ri-flat-unary"
+  (test "a non-activation unary op still compiles to the flat-unary pattern"
     '(0 #t)
     (let* ((xv (param-var '(1.0 2.0 3.0) '(3) 'f64))
            (loss (am:var-mean (am:var-exp xv))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
-        (list (plan-count joint 'ri-activation-unary)
-              (> (plan-count joint 'ri-flat-unary) 0)))))
+        (list (plan-count joint 'segop/activation-unary)
+              (> (plan-count joint 'segop/flat-unary) 0)))))
 
-  (test "sigmoid fused with its producer is not an ri-activation-unary"
+  (test "sigmoid fused with its producer is not an activation-unary segop"
     ;; negate's output feeds only sigmoid, so the fusion pass merges the
     ;; two into one binding with op sigmoid and combiner sigmoid(-x).
     ;; Only the backward sigmoid-deriv may use the activation instruction.
@@ -291,7 +291,7 @@
     (let* ((xv (param-var '(0.5 -1.0 2.0) '(3) 'f64))
            (loss (am:var-mean (am:var-sigmoid (am:var-negate xv)))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
-        (plan-count joint 'ri-activation-unary))))
+        (plan-count joint 'segop/activation-unary))))
 
   (test "an activation right after a matmul is still a GEMM epilogue"
     '(#t 1)
@@ -303,7 +303,7 @@
            (loss (am:var-mean (am:var-sigmoid (am:var-matmul xv Wv)))))
       (let-values (((joint _) (trace-and-replay loss (list Wv))))
         (list (> (plan-count joint 'ri-gemm-epilogue) 0)
-              (plan-count joint 'ri-activation-unary))))))
+              (plan-count joint 'segop/activation-unary))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 4 - Replay through registered kernels
@@ -439,18 +439,18 @@
   (test-assert "no binary op names are registered by default"
     (not (binary-op-registered? 'mul)))
 
-  (test "an unregistered mul compiles to ri-flat-binary"
+  (test "an unregistered mul compiles to the flat-binary pattern"
     0
     (let-values (((joint _) (mul-loss)))
-      (plan-count joint 'ri-activation-binary)))
+      (plan-count joint 'segop/activation-binary)))
 
   (register-binary-op! 'mul)
 
-  (test-assert "a registered mul compiles to ri-activation-binary"
+  (test-assert "a registered mul compiles to the activation-binary pattern"
     (let-values (((joint _) (mul-loss)))
-      (> (plan-count joint 'ri-activation-binary) 0)))
+      (> (plan-count joint 'segop/activation-binary) 0)))
 
-  (test "without a backend, ri-activation-binary gives the combiner's results"
+  (test "without a backend, the activation-binary pattern gives the combiner's results"
     (let-values (((_ results) (begin (unregister-binary-op! 'mul) (mul-loss))))
       results)
     (begin (register-binary-op! 'mul)

@@ -18,7 +18,13 @@
  (components (extension array-morphisms-morph-env (source "morph-env.scm") (csc-options "-O3" "-d1"))
              (extension array-morphisms-core (source "core.scm") (csc-options "-O3" "-d1"))
              (extension array-morphisms-index-fn (source "index-functions.scm") (csc-options "-O3" "-d1"))
-             (extension array-morphisms-basic-ops (source "basic-ops.scm") (csc-options "-O3" "-d1"))
+             (extension array-morphisms-scalar-ops-table (source "scalar-ops-table.scm") (csc-options "-O2" "-d1"))
+             (extension array-morphisms-scalar-ops (source "scalar-ops.scm") (csc-options "-O3" "-d1")
+                        (component-dependencies array-morphisms-scalar-ops-table))
+             (extension array-morphisms-segop (source "segop.scm") (csc-options "-O2" "-d1")
+                        (component-dependencies array-morphisms-core array-morphisms-scalar-ops))
+             (extension array-morphisms-basic-ops (source "basic-ops.scm") (csc-options "-O3" "-d1")
+                        (component-dependencies array-morphisms-scalar-ops))
              (extension array-morphisms-blas-compat (source "blas-compat.scm")   (csc-options "-O2" "-d1"))
              (extension array-morphisms-blas-exec   (source "blas-exec.scm")     (csc-options "-O2" "-d1"))
              (extension array-morphisms-activation-exec (source "activation-exec.scm") (csc-options "-O2" "-d1"))
@@ -43,7 +49,10 @@
              (extension array-morphisms-grad        (source "grad.scm")        (csc-options "-O2" "-d1"))
              (extension array-morphisms-grad-check  (source "grad-check.scm")  (csc-options "-O2" "-d1"))
              (extension array-morphisms-ssa         (source "ssa.scm")         (csc-options "-O3" "-d1")
+                        (source-dependencies "segop-lower.scm")
                         (component-dependencies array-morphisms-grad
+                                                array-morphisms-scalar-ops
+                                                array-morphisms-segop
                                                 array-morphisms-realization
                                                 array-morphisms-context
                                                 array-morphisms-activation-exec))

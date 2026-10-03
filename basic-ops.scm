@@ -14,6 +14,8 @@
                 morph-negate morph-abs morph-floor morph-ceiling
                 ;; Activation functions
                 morph-relu morph-sigmoid morph-tanh-am
+                ;; Dtype conversion
+                morph-cast cast-combiner
                 ;; Comparisons
                 morph> morph< morph= morph>= morph<=
                 ;; Higher-order
@@ -30,7 +32,7 @@
         (import scheme (chicken base)
                 srfi-4 datatype matchable
                 srfi-1 srfi-69 array-morphisms-core
-                array-morphisms-index-fn)
+                array-morphisms-index-fn array-morphisms-scalar-ops)
 
 ;;; ============================================================================
 ;;; Helper Functions for Binary Operations
@@ -123,13 +125,10 @@
        (list shape1 shape2)))))
 
 (define (get-binary-combiner operation)
-  "Return combiner function for binary operation"
+  "Return the combiner of a binary operation (add, sub, mul, div or pow),
+   taken from the scalar-op table."
   (case operation
-    ((add) +)
-    ((sub) -)
-    ((mul) *)
-    ((div) /)
-    ((pow) expt)
+    ((add sub mul div pow) (scalar-op-combiner operation))
     (else (error "Unknown binary operation" operation))))
 
 (define (infer-binary-batch-axis m1 m2)
@@ -258,35 +257,14 @@
    '()))
 
 (define (get-unary-transformer operation)
-  "Return transformer function for unary operation"
+  "Return the transformer of a unary operation, taken from the scalar-op
+   table.  The arithmetic and transcendental ops use the standard Scheme
+   procedures (sqrt, exp, -, abs, ...), so that integer dtypes are kept
+   and the plain ops can be recognized by identity; the activations
+   (relu, sigmoid, tanh) convert their argument to a flonum first."
   (case operation
-    ;; Transcendental
-    ((sqrt) sqrt)
-    ((exp) exp)
-    ((log) log)
-    ((sin) sin)
-    ((cos) cos)
-    ((tan) tan)
-    
-    ;; Arithmetic
-    ((negate) -)
-    ((abs) abs)
-    ((floor) floor)
-    ((ceiling) ceiling)
-
-    ;; Activations
-    ((relu)    (lambda (x) (max 0.0 (exact->inexact x))))
-    ((sigmoid) (lambda (x) (let ((xf (exact->inexact x)))
-                              (/ 1.0 (+ 1.0 (exp (- xf)))))))
-    ;; tanh x = sign(x) (1 - e) / (1 + e) with e = exp(-2|x|).  Since
-    ;; e <= 1 this never overflows, so large |x| gives +-1.0 rather than
-    ;; the NaN of inf/inf.
-    ((tanh)    (lambda (x)
-                 (let* ((xf (exact->inexact x))
-                        (e  (exp (* -2.0 (abs xf))))
-                        (t  (/ (- 1.0 e) (+ 1.0 e))))
-                   (if (< xf 0.0) (- t) t))))
-
+    ((sqrt exp log sin cos tan negate abs floor ceiling relu sigmoid tanh)
+     (scalar-op-combiner operation))
     (else (error "Unknown unary operation" operation))))
 
 (define (infer-unary-dtype operation dtype)
@@ -376,6 +354,37 @@
    Preserves dtype"
   (create-unary-morphism 'ceiling m))
 
+;;; ============================================================================
+;;; Dtype Conversion
+;;; ============================================================================
+
+(define (cast-identity x) x)
+
+(define (cast-combiner dtype)
+  "The combiner of a cast to dtype.  A cast to f32 or f64 converts its
+   argument with exact->inexact; a cast to an integer dtype passes the
+   value on, and storing it truncates.  Every call for the same dtype class
+   returns the same procedure."
+  (if (floating-point-type? dtype) exact->inexact cast-identity))
+
+(define (morph-cast m dtype)
+  "Element-wise conversion of m to dtype.  Converting to f32 rounds to
+   single precision when the result is stored; converting to an integer
+   dtype truncates.  The result has op name cast and metadata
+   ((dtype . dtype))."
+  (unless (array-morphism? m)
+    (error "Operand must be an array morphism" m))
+  (unless (valid-dtype? dtype)
+    (error "morph-cast: unsupported dtype" dtype))
+  (morphism-expr (gensym 'morph-)
+                 'cast
+                 (list m)
+                 (make-unary-compute-index-fn (cast-combiner dtype))
+                 (get-morphism-shape m)
+                 dtype
+                 `((dtype . ,dtype))
+                 (get-morphism-batch-axis m)))
+
 (define (morph-relu m)    (create-unary-morphism 'relu    m))
 (define (morph-sigmoid m) (create-unary-morphism 'sigmoid m))
 (define (morph-tanh-am m) (create-unary-morphism 'tanh    m))
@@ -409,14 +418,10 @@
          ;; Result is always f64 (boolean as 0.0/1.0)
          (result-dtype 'f64)
          
-         ;; Get comparator function
-         (comparator (get-comparison-function operation))
-         
-         ;; Create compute-index-fn
-         (index-fn (make-binary-compute-index-fn 
+         ;; Create compute-index-fn; the combiner gives 1.0 or 0.0
+         (index-fn (make-binary-compute-index-fn
                     shape1 shape2 result-shape
-                    (lambda (x y) 
-                      (if (comparator x y) 1.0 0.0))))
+                    (get-comparison-function operation)))
          
          ;; Determine batch axis
          (batch-axis (infer-binary-batch-axis m1 m2)))
@@ -431,13 +436,11 @@
                    batch-axis)))
 
 (define (get-comparison-function operation)
-  "Return comparison function for operation"
+  "Return the combiner of a comparison (gt, lt, eq, ge or le), taken from
+   the scalar-op table: a procedure of two numbers giving 1.0 when the
+   comparison holds and 0.0 otherwise."
   (case operation
-    ((gt) >)
-    ((lt) <)
-    ((eq) =)
-    ((ge) >=)
-    ((le) <=)
+    ((gt lt eq ge le) (scalar-op-combiner operation))
     (else (error "Unknown comparison operation" operation))))
 
 ;;; ============================================================================

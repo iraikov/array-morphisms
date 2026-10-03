@@ -13,10 +13,11 @@
 ;;;        - Multi-step replay stability
 ;;;
 
-(import scheme (chicken base)
+(import scheme (chicken base) (chicken format)
         test
-        (only srfi-1 iota every map filter filter-map take drop)
-        (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!)
+        (only srfi-1 iota every any map filter filter-map take drop)
+        (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!
+              make-f32vector f32vector-ref f32vector-set!)
         srfi-69
         datatype
         array-morphisms-core
@@ -27,6 +28,7 @@
         array-morphisms-realization
         array-morphisms-context
         (prefix array-morphisms-grad am:)
+        array-morphisms-segop
         array-morphisms-ssa)
 
 
@@ -1163,14 +1165,14 @@
 
 
 ;;;; ============================================================
-;;;; Broadcast replay: ri-flat-broadcast
+;;;; Broadcast replay: the flat-broadcast segop pattern
 ;;;;
 ;;;; Row broadcasts ([M,N] op [M,1]) and scalar broadcasts ([M,N] op [1])
-;;;; compile to ri-flat-broadcast.  Replay must reproduce the gradients of
+;;;; compile to the flat-broadcast segop pattern.  Replay must reproduce the gradients of
 ;;;; the trace run, which evaluates every binding through realize.
 ;;;; ============================================================
 
-(test-group "broadcast replay: ri-flat-broadcast"
+(test-group "broadcast replay: flat-broadcast segops"
   (let* ((ctx  (make-morphism-context))
          (X-mv (param-var '(0.5 -1.0 2.0 0.25 1.5 -0.5 3.0 1.0 -2.0 0.75 0.1 -0.3) '(3 4)))
          (g-mv (param-var '(1.0 0.5 -1.5 2.0) '(4)))
@@ -1187,9 +1189,9 @@
         (finalize-context! ctx)
         (reset-context! ctx)
         (let ((first (map concrete->list (ssa-realize/ctx ctx joint))))
-          (test-assert "the replay plan uses ri-flat-broadcast"
+          (test-assert "the replay plan uses the flat-broadcast pattern"
             (let ((counts (cdr (assq 'counts (replay-plan-stats joint)))))
-              (> (or (let ((e (assq 'ri-flat-broadcast counts))) (and e (cdr e))) 0) 0)))
+              (> (or (let ((e (assq 'segop/flat-broadcast counts))) (and e (cdr e))) 0) 0)))
           (test-assert "replay reproduces the trace loss and gradients"
             (every lists-approx= first ref))
           (test-assert "5 further replay steps are identical"
@@ -1199,5 +1201,334 @@
                     (reset-context! ctx)
                     (and (every lists-approx= (map concrete->list (ssa-realize/ctx ctx joint)) ref)
                          (loop (+ i 1))))))))))))
+
+;;;; ============================================================
+;;;; Segop lowering of element-wise bindings
+;;;;
+;;;; Element-wise bindings compile to ri-segop instructions.  A checking
+;;;; backend, registered ahead of the built-in ones, wraps every executor
+;;;; they select: after the executor runs, the segop is evaluated again by
+;;;; the reference interpreter on the same input arrays, and the two
+;;;; outputs must agree bit for bit.  This checks the lowered index maps,
+;;;; layouts and bodies against what replay actually computes.
+;;;; ============================================================
+
+(define (seg-var lst shape dtype grad?)
+  (am:make-var (morph-from-list lst (list->vector shape) dtype) grad?))
+
+(define (seg-same? a b)
+  (if (and (flonum? a) (flonum? b))
+      (or (and (nan? a) (nan? b)) (eqv? a b))
+      (eqv? a b)))
+
+;; Runs thunk with the checking backend in front of the backends in use,
+;; through a parameterize of segop-backends.  The checker asks the other
+;; backends for the executor it wraps.  Returns
+;; (values result checks mismatches), the numbers of segop executions
+;; checked and of output elements that differed.
+(define (with-segop-checker thunk)
+  (let ((checks 0) (mismatches 0) (others (segop-backends)))
+    (define (array-data a)
+      (cases array-morphism a
+        (concrete-array (data _ _ _ _ _ _) data)
+        (else (error "with-segop-checker: not concrete" a))))
+    (define (select sg)
+      (let ((sel (parameterize ((segop-backends others))
+                   (select-segop-executor sg))))
+             (and sel
+                  (cons (car sel)
+                        (lambda (deref buf)
+                          ((cdr sel) deref buf)
+                          (let* ((out (car (segop-outputs sg)))
+                                 (dt  (segop-operand-dtype out))
+                                 (n   (shape-size (segop-space sg)))
+                                 (ref (allocate-typed-vector dt n)))
+                            (segop-interpret sg
+                                             (map (lambda (o) (array-data (deref (segop-operand-slot o))))
+                                                  (segop-inputs sg))
+                                             (list ref))
+                            (set! checks (+ checks 1))
+                            (do ((i 0 (+ i 1))) ((= i n))
+                              (unless (seg-same? (typed-vector-ref ref dt i)
+                                                 (typed-vector-ref buf dt i))
+                                (set! mismatches (+ mismatches 1))))))))))
+    (parameterize ((segop-backends (cons (make-segop-backend 'test-checker select) others)))
+      (let ((r (thunk))) (values r checks mismatches)))))
+
+;; Placeholder ssa-values for bindings built by hand.
+(define (const-ref* cid) (const-ref cid))
+(define (binding-ref* bid) (binding-ref bid))
+
+;; An element-wise binding with n inputs (placeholders) and the given meta.
+(define (make-ssa-binding* op n meta)
+  (make-ssa-binding (gensym 'bid-) op (map (lambda (i) #f) (iota n)) #(2) 'f64 meta))
+
+;; The ri-segop instructions of a compiled plan.
+(define (plan-segops joint)
+  (let ((plan (ssa-program-replay-plan joint)))
+    (filter-map (lambda (instr)
+                  (cases replay-instruction instr
+                    (ri-segop (_ _ _ _ sg _ tag) (cons tag sg))
+                    (else #f)))
+                (vector->list plan))))
+
+;; A two-layer network: h = relu(x W1 + b1); y = sigmoid(tanh(h W2));
+;; loss = mean((y - t)^2) + mean(h * c) + mean(exp(-y)) with a per-column
+;; constant c.  negate has a single use, so it is fused into exp.
+(define (seg-mlp-loss dtype)
+  (let* ((x  (seg-var (map (lambda (i) (- (* 0.37 i) 2.0)) (iota 12)) '(4 3) dtype #f))
+         (W1 (seg-var (map (lambda (i) (* 0.21 (sin (+ i 1.0)))) (iota 15)) '(3 5) dtype #t))
+         (b1 (seg-var (map (lambda (i) (- (* 0.1 i) 0.2)) (iota 5)) '(5) dtype #t))
+         (W2 (seg-var (map (lambda (i) (* 0.3 (cos (+ i 0.5)))) (iota 10)) '(5 2) dtype #t))
+         (t  (seg-var '(0.1 0.9 0.4 0.6 0.8 0.2 0.5 0.5) '(4 2) dtype #f))
+         (c  (seg-var '(1.0 -0.5 0.25 2.0 -1.5) '(5) dtype #f))
+         (h  (am:var-relu (am:var+ (am:var-matmul x W1) b1)))
+         (y  (am:var-sigmoid (am:var-tanh (am:var-matmul h W2))))
+         (d  (am:var- y t)))
+    (values (am:var+ (am:var+ (am:var-mean (am:var* d d)) (am:var-mean (am:var* h c)))
+                     (am:var-mean (am:var-exp (am:var-negate y))))
+            (list W1 b1 W2))))
+
+;; Traces the loss, then replays it twice.  Returns (values joint trace
+;; replay) with the outputs of the trace and of the second replay as lists.
+(define (seg-trace-and-replay make-loss)
+  (let-values (((loss params) (make-loss)))
+    (let ((ctx (make-morphism-context)))
+      (let-values (((joint trace) (compile-and-realize/ctx ctx loss params)))
+        (let ((trace-lists (map concrete->list trace)))
+          (finalize-context! ctx)
+          (reset-context! ctx)
+          (ssa-realize/ctx ctx joint)
+          (reset-context! ctx)
+          (values joint trace-lists (map concrete->list (ssa-realize/ctx ctx joint))))))))
+
+(test-group "segop lowering of element-wise bindings"
+  (for-each
+   (lambda (dtype)
+     (let-values (((r checks mismatches)
+                   (with-segop-checker
+                    (lambda ()
+                      (let-values (((joint trace replay)
+                                    (seg-trace-and-replay (lambda () (seg-mlp-loss dtype)))))
+                        (list joint trace replay))))))
+       (let* ((joint (car r)) (trace (cadr r)) (replay (caddr r))
+              (segs (plan-segops joint))
+              (tags (map car segs)))
+         (test-assert (sprintf "~A: element-wise bindings compile to ri-segop" dtype)
+           (> (length segs) 5))
+         (test-assert (sprintf "~A: every tag is a known pattern" dtype)
+           (every (lambda (t)
+                    (memq t '(segop/activation-unary segop/flat-unary segop/activation-binary
+                              segop/flat-binary segop/bias-broadcast segop/flat-ternary
+                              segop/flat-broadcast)))
+                  tags))
+         (test-assert (sprintf "~A: relu keeps its symbolic body" dtype)
+           (any (lambda (ts) (equal? (cases segop (cdr ts)
+                                       (seg-map (space ins outs bodies fallback) (car bodies))
+                                       (else #f))
+                                     '(relu (in 0))))
+                segs))
+         (test-assert (sprintf "~A: the fused negate and exp have a composed body" dtype)
+           (any (lambda (ts) (equal? (cases segop (cdr ts)
+                                       (seg-map (space ins outs bodies fallback) (car bodies))
+                                       (else #f))
+                                     '(exp (negate (in 0)))))
+                segs))
+         (test-assert (sprintf "~A: the checker ran on every segop execution" dtype)
+           (>= checks (* 2 (length segs))))
+         (test (sprintf "~A: executors and the interpreter agree bit for bit" dtype)
+           0 mismatches)
+         (test-assert (sprintf "~A: replay reproduces the trace" dtype)
+           (every (lambda (a b)
+                    (every (lambda (x y) (< (abs (- x y)) (if (eq? dtype 'f32) 1e-6 1e-12))) a b))
+                  trace replay)))))
+   '(f64 f32))
+
+  (let-values (((r checks mismatches)
+                (with-segop-checker
+                 (lambda ()
+                   (let-values (((joint trace replay)
+                                 (seg-trace-and-replay
+                                  (lambda ()
+                                    (let* ((X    (param-var '(0.5 -1.0 2.0 0.25 1.5 -0.5 3.0 1.0 -2.0 0.75 0.1 -0.3) '(3 4)))
+                                           (g    (param-var '(1.0 0.5 -1.5 2.0) '(4)))
+                                           (eps  (input-var '(1e-5) '(1)))
+                                           (ms   (am:var-mean (am:var* X X) '(1) #t))
+                                           (rms  (am:var-sqrt (am:var+ ms eps)))
+                                           (Y    (am:var* (am:var/ X rms) g)))
+                                      (values (am:var-mean (am:var* Y Y)) (list X g)))))))
+                     (list joint trace replay))))))
+    (let ((tags (map car (plan-segops (car r)))))
+      (test-assert "row normalization uses the broadcast patterns"
+        (and (memq 'segop/flat-broadcast tags) (memq 'segop/bias-broadcast tags) #t))
+      (test "broadcast executors and the interpreter agree bit for bit" 0 mismatches)
+      (test-assert "broadcast segops were checked" (> checks 0))))
+
+  (test "the body of a plain binding names its op" '(add (in 0) (in 1))
+    (binding-scalar-body (make-ssa-binding* 'add 2 '()) +))
+  (test-assert "a binding whose combiner is not its op's gets an opaque body"
+    (let ((body (binding-scalar-body (make-ssa-binding* 'add 2 '()) -)))
+      (and (eq? (car body) 'opaque) (eq? (cadr body) -))))
+  (test-assert "a map binding gets an opaque body"
+    (eq? 'opaque (car (binding-scalar-body (make-ssa-binding* 'map 1 '()) abs))))
+  (test "a fused binding keeps its composed body" '(mul (exp (in 0)) (in 1))
+    (binding-scalar-body (make-ssa-binding* 'mul 2 '((body . (mul (exp (in 0)) (in 1)))
+                                                      (fused? . #t)))
+                         *)))
+
+
+;;;; ============================================================
+;;;; Fusion legality and gradient dtypes
+;;;;
+;;;; The element-wise fusion pass reads every input of a fused binding at
+;;;; the output's index, so it may fuse only when all those inputs have the
+;;;; output's shape, when producer and consumer share a dtype, and when the
+;;;; input counts are ones compose-flat-combiners supports.  Gradients of
+;;;; parameters have the parameter's dtype, through a cast when the
+;;;; backward pass computes them in another dtype.
+;;;; ============================================================
+
+;; Loss and gradients of make-loss computed by the eager autodiff of
+;; array-morphisms-grad, as lists of flonums.
+(define (eager-results make-loss)
+  (let-values (((loss params) (make-loss)))
+    (am:backward! loss)
+    (cons (concrete->list (am:var-value loss))
+          (map (lambda (p) (concrete->list (am:var-grad p))) params))))
+
+;; Loss and gradients from SSA: (values joint trace replay) as lists.
+(define (ssa-results make-loss)
+  (seg-trace-and-replay make-loss))
+
+(define (results-close? a b tol)
+  (and (= (length a) (length b))
+       (every (lambda (x y)
+                (and (= (length x) (length y))
+                     (every (lambda (u v) (<= (abs (- u v)) (* tol (max 1.0 (abs v))))) x y)))
+              a b)))
+
+(define (fused-bindings joint)
+  (filter (lambda (b) (assq 'fused? (ssa-binding-meta b))) (ssa-program-bindings joint)))
+
+(define (output-dtypes results)
+  (map (lambda (m) (cases array-morphism m
+                     (concrete-array (_ _ _ _ dt _ _) dt)
+                     (else #f)))
+       results))
+
+(test-group "fusion legality and gradient dtypes"
+  ;; u = x*y + b with a bias b of shape [3]: x*y must not be fused into the
+  ;; add, whose other input is broadcast.
+  (let* ((make (lambda ()
+                 (let* ((x (param-var '(1 2 3 4 5 6) '(2 3)))
+                        (y (param-var '(1 1 1 2 2 2) '(2 3)))
+                        (b (param-var '(100 200 300) '(3)))
+                        (u (am:var+ (am:var* x y) b)))
+                   (values (am:var-sum (am:var* u u)) (list x y b))))))
+    (let-values (((joint trace replay) (ssa-results make)))
+      (test "a product is not fused into an add with a broadcast input" '()
+        (filter (lambda (b) (memq 'add (list (ssa-binding-op b)))) (fused-bindings joint)))
+      (test-assert "loss and gradients with a broadcast bias (trace)"
+        (equal? '((295922.0) (202.0 404.0 606.0 432.0 840.0 1248.0)
+                  (202.0 808.0 1818.0 864.0 2100.0 3744.0) (418.0 824.0 1230.0))
+                trace))
+      (test-assert "replay gives the same values" (equal? trace replay))))
+
+  ;; tanh(x*y + z): the three-input fused binding x*y + z is not fused
+  ;; again into tanh, which compose-flat-combiners cannot express.
+  (let* ((make (lambda ()
+                 (let* ((x (param-var '(-0.7 -0.4 -0.1 0.2 0.5 0.8) '(2 3)))
+                        (y (param-var '(0.2 0.3 0.4 0.5 0.6 0.7) '(2 3)))
+                        (z (param-var '(1.0 0.75 0.5 0.25 0.0 -0.25) '(2 3)))
+                        (v (am:var-tanh (am:var+ (am:var* x y) z))))
+                   (values (am:var-sum (am:var* v v)) (list x y z))))))
+    (let-values (((joint trace replay) (ssa-results make)))
+      (test-assert "the chain compiles, with a three-input fused binding"
+        (any (lambda (b) (= 3 (length (ssa-binding-inputs b)))) (fused-bindings joint)))
+      (test-assert "no fused binding has more than three inputs"
+        (every (lambda (b) (<= (length (ssa-binding-inputs b)) 3)) (fused-bindings joint)))
+      (test-assert "trace agrees with the eager autodiff"
+        (results-close? trace (eager-results make) 1e-12))
+      (test-assert "replay gives the same values as the trace" (equal? trace replay))))
+
+  (let* ((mk (lambda (name op inputs dtype)
+               (make-ssa-binding name op inputs #(2 3) dtype `((combiner . ,+)))))
+         (p   (mk 'bid-p 'add (list (const-ref* 'c1) (const-ref* 'c2)) 'f32))
+         (c32 (mk 'bid-c 'add (list (binding-ref* 'bid-p) (const-ref* 'c3)) 'f32))
+         (c64 (mk 'bid-c 'add (list (binding-ref* 'bid-p) (const-ref* 'c3)) 'f64))
+         (p3  (mk 'bid-p 'add (list (const-ref* 'c1) (const-ref* 'c2) (const-ref* 'c4)) 'f32))
+         (counts (let ((h (make-hash-table))) (hash-table-set! h 'bid-p 1) h)))
+    (test-assert "same dtype, two inputs: eligible" (ssa-fusion-eligible? p c32 counts))
+    (test-assert "different dtypes: not eligible" (not (ssa-fusion-eligible? p c64 counts)))
+    (test-assert "a three-input producer: not eligible" (not (ssa-fusion-eligible? p3 c32 counts))))
+
+  ;; loss = mean(sigmoid(x) * (x + y)) with x f32 and y f64.
+  (let* ((xs '(-0.7 -0.4 -0.1 0.2 0.5 0.8))
+         (ys '(0.2 0.3 0.4 0.5 0.6 0.7))
+         (make (lambda ()
+                 (let ((x (seg-var xs '(2 3) 'f32 #t))
+                       (y (seg-var ys '(2 3) 'f64 #t)))
+                   (values (am:var-mean (am:var* (am:var-sigmoid x) (am:var+ x y))) (list x y))))))
+    (let-values (((loss params) (make)))
+      (let* ((ctx (make-morphism-context)))
+        (let-values (((joint trace) (compile-and-realize/ctx ctx loss params)))
+          (test "mixed f32/f64: the trace gives each gradient its parameter's dtype"
+            '(f64 f32 f64) (output-dtypes trace))
+          (finalize-context! ctx)
+          (reset-context! ctx)
+          (ssa-realize/ctx ctx joint)
+          (reset-context! ctx)
+          (let ((replay (ssa-realize/ctx ctx joint)))
+            (test "mixed f32/f64: replay gives the same dtypes" '(f64 f32 f64) (output-dtypes replay))
+            (test "mixed f32/f64: replay reproduces the trace"
+              (map concrete->list trace) (map concrete->list replay))
+            (let* ((x32 (map (lambda (v) (exact->inexact v))
+                             (concrete->list (am:var-value (car params)))))
+                   ;; sigmoid(x) is an f32 binding: its values are rounded to f32
+                   (s   (map (lambda (x)
+                               (let ((v (make-f32vector 1)))
+                                 (f32vector-set! v 0 (/ 1.0 (+ 1.0 (exp (- x)))))
+                                 (f32vector-ref v 0)))
+                             x32)))
+              (test-assert "mixed f32/f64: gradient of the f32 parameter"
+                (every (lambda (g si xi yi)
+                         (< (abs (- g (/ (+ (* si (- 1.0 si) (+ xi yi)) si) 6.0))) 1e-6))
+                       (concrete->list (cadr replay)) s x32 ys))
+              (test-assert "mixed f32/f64: gradient of the f64 parameter"
+                (every (lambda (g si) (< (abs (- g (/ si 6.0))) 1e-12))
+                       (concrete->list (caddr replay)) s))))))))
+
+  (test "a cast to f32 rounds" (list (exact->inexact 0.10000000149011612))
+    (concrete->list (realize (morph-cast (morph-from-list '(0.1) #(1) 'f64) 'f32))))
+  (test "a cast to s32 truncates" '(2.0 -2.0)
+    (concrete->list (realize (morph-cast (morph-from-list '(2.7 -2.7) #(2) 'f64) 's32))))
+  (test "a cast keeps its dtype metadata" 'f32
+    (get-morphism-dtype (morph-cast (morph-from-list '(1.0) #(1) 'f64) 'f32)))
+  (test "the body of a cast binding is (in 0)" '(in 0)
+    (binding-scalar-body (make-ssa-binding 'bid-x 'cast '(#f) #(2) 'f32 '((dtype . f32)))
+                         (cast-combiner 'f32)))
+
+  ;; A cast in the forward graph: loss = mean(cast(x, f64) * y) with x f32.
+  (let* ((make (lambda ()
+                 (let* ((x (seg-var '(0.5 -1.5 2.25) '(3) 'f32 #t))
+                        (y (seg-var '(2.0 4.0 -1.0) '(3) 'f64 #t))
+                        (xc (am:make-var (morph-cast (am:var-value x) 'f64) #t)))
+                   (values (am:var-mean (am:var* xc y)) (list x y))))))
+    (let-values (((loss params) (make)))
+      (let* ((xv  (am:var-value (car params)))
+             (yv  (am:var-value (cadr params)))
+             (fwd (morphism-to-ssa loss))
+             (p   (filter-map (lambda (m) (ssa-constant-id fwd m)) (list xv yv)))
+             (joint (ssa-vjp fwd p (ssa-loss-binding-val fwd)))
+             (res   (ssa-realize joint)))
+        (test "a forward cast: the gradient of x is f32, that of y f64"
+          '(f64 f32 f64) (output-dtypes res))
+        (test-assert "a forward cast: gradient of x (f32)"
+          (results-close? (list (concrete->list (cadr res)))
+                          (list (list (/ 2.0 3.0) (/ 4.0 3.0) (/ -1.0 3.0))) 1e-7))
+        (test-assert "a forward cast: gradient of y (f64)"
+          (results-close? (list (concrete->list (caddr res)))
+                          (list (list (/ 0.5 3.0) (/ -1.5 3.0) (/ 2.25 3.0))) 1e-15))))))
+
 
 (test-end)
