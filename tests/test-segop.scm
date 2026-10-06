@@ -233,7 +233,31 @@
   (test "inputs used" '(0 2) (scalar-expr-inputs '(add (in 2) (let* ((a (in 0))) (mul a (in 2))))))
   (test-assert "opaque detection"
     (and (scalar-expr-opaque? (list 'add (list 'opaque abs '(in 0)) '(in 1)))
-         (not (scalar-expr-opaque? '(relu (in 0)))))))
+         (not (scalar-expr-opaque? '(relu (in 0))))))
+  ;; (cast dtype e) rounds as a store to dtype would
+  (test-assert "casts are valid with a known dtype"
+    (and (scalar-expr-valid? '(relu (cast f32 (acc))) 0 0 acc?: #t)
+         (scalar-expr-valid? '(cast s64 (in 1)) 2 0)))
+  (test-assert "invalid casts"
+    (not (any-of (lambda (e) (scalar-expr-valid? e 2 0))
+                 '((cast f16 (in 0)) (cast f32) (cast f32 (in 0) (in 1)) (cast (in 0) f32)
+                   (cast f32 (in 2))))))
+  (test "a cast to f32 rounds" (round-to-f32 0.1) (eval-scalar-expr '(cast f32 (in 0)) (sg-reader 0.1)))
+  (test-assert "a cast to f32 keeps -0.0, infinities and NaN"
+    (every (lambda (x) (sg-same? (round-to-f32 x) (eval-scalar-expr '(cast f32 (in 0)) (sg-reader x))))
+           sg-values))
+  (test-assert "a cast to f64 is the identity"
+    (every (lambda (x) (sg-same? x (eval-scalar-expr '(cast f64 (in 0)) (sg-reader x)))) sg-values))
+  (test "a cast to s32 truncates" -2 (eval-scalar-expr '(cast s32 (in 0)) (sg-reader -2.7)))
+  (test "a cast inside a finalize body" (round-to-f32 (/ 1.0 3.0))
+    (eval-scalar-expr '(cast f32 (/ (acc) 3.0)) (sg-reader) acc: 1.0))
+  (test "substitution rewrites under a cast and keeps its dtype"
+    '(cast f32 (relu (in 3)))
+    (scalar-expr-substitute-inputs '(cast f32 (relu (in 0))) (lambda (k) '(in 3))))
+  (test "inputs used under a cast" '(1) (scalar-expr-inputs '(cast f32 (exp (in 1)))))
+  (test-assert "opaque detection under a cast"
+    (and (scalar-expr-opaque? (list 'cast 'f32 (list 'opaque abs '(in 0))))
+         (not (scalar-expr-opaque? '(cast f32 (in 0)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 4 - seg-map interpretation

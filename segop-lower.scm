@@ -1,8 +1,10 @@
 ;;; segop-lower.scm
 ;;;
-;;; Lowering of element-wise SSA bindings to segops, and the two built-in
-;;; segop backends that turn them into replay executors.  Included into the
-;;; array-morphisms-ssa module.
+;;; Lowering of SSA bindings to segops, and the two built-in segop
+;;; backends that turn them into replay executors.  Included into the
+;;; array-morphisms-ssa module.  Element-wise bindings become seg-maps,
+;;; reductions and matmuls seg-reds, affine views gathers; other index
+;;; functions run on the host through a seg-lib.
 ;;;
 ;;; An element-wise binding becomes a seg-map over the binding's shape.
 ;;; Each input is read through the NumPy broadcast map from the output's
@@ -38,8 +40,11 @@
 ;;; The registry backend takes the patterns that use registered kernels:
 ;;; activation-unary, activation-binary, and bias-broadcast and
 ;;; flat-broadcast for the plain add, sub, mul and div bodies.  The scheme
-;;; backend takes the others.  A binding that matches none of them is
-;;; compiled to ri-index.
+;;; backend takes the others.  A segop that matches no pattern runs in the
+;;; strided loop or, as a last resort, the reference interpreter.
+;;;
+;;; The registry backend also takes the GEMMs (segop/gemm, gemm-strided and
+;;; gemm-epilogue, see Contractions below) and the axis-0/1 reductions.
 
 ;;; ------------------------------------------------------------
 ;;; Binding bodies
@@ -682,11 +687,188 @@
                                     (list buf))))))))
 
 ;;; ------------------------------------------------------------
+;;; Contractions
+;;; ------------------------------------------------------------
+;;;
+;;; A matmul A[M,K] x B[K,N] becomes a seg-red over the space (M N K) with
+;;; K reduced.  A is read through #((dim 0) (dim 2)) and B through
+;;; #((dim 2) (dim 1)), each with the layout of its trace-time array, so a
+;;; transposed view is described by its strides.  The body is
+;;; (mul (in 0) (in 1)) and the output is the row-major pool buffer.
+;;;
+;;; The combine spec follows the gemm-plan the product runs with.  A plan
+;;; that calls a backend kernel sums in the order the backend chooses; a
+;;; plan without one runs the Scheme loop, which sums over increasing k in
+;;; double precision and rounds once when storing.
+;;;
+;;; A GEMM can absorb the element-wise binding that consumes it (the
+;;; epilogue): the finalize is the epilogue's body with its input 0
+;;; replaced by (cast dtype (acc)), the product as stored in the output,
+;;; and its other inputs (a bias) appended to the seg-red's inputs.  The
+;;; seg-red's fallback is the epilogue's combiner, which the executor
+;;; applies to the stored product in place.
+
+(define gemm-A-exprs '#((dim 0) (dim 2)))
+(define gemm-B-exprs '#((dim 2) (dim 1)))
+(define gemm-out-exprs '#((dim 0) (dim 1)))
+(define gemm-body '(mul (in 0) (in 1)))
+
+;; A concrete array with the layout of operand o and no elements, for the
+;; blas-exec procedures that decide from shapes, strides and dtypes alone.
+(define (operand-layout-array o)
+  (let ((dt (segop-operand-dtype o)))
+    (concrete-array (allocate-typed-vector dt 0) (segop-operand-shape o)
+                    (segop-operand-strides o) (segop-operand-offset o) dt -1 -1)))
+
+;; gemm when the operands are row-major and contiguous (the plain GEMM
+;; kernel), gemm-strided for other 2-D operands of one dtype, f32 or f64,
+;; and #f when blas-exec cannot multiply them.
+(define (gemm-plan-kind A B)
+  (let ((a (operand-layout-array A)) (b (operand-layout-array B)))
+    (cond ((blas-compatible-matmul? a b) 'gemm)
+          ((matmul-concrete? a b) 'gemm-strided)
+          (else #f))))
+
+(define (prepare-gemm-plan kind A B)
+  ((if (eq? kind 'gemm) prepare-blas-gemm/into prepare-blas-gemm-strided/into)
+   (operand-layout-array A) (operand-layout-array B)))
+
+(define (gemm-combine-spec plan dtype)
+  (if (gemm-plan-uses-kernel? plan)
+      (make-combine-spec 'add 0.0 dtype 'unspecified)
+      (make-combine-spec 'add 0.0 'f64)))
+
+(define (operand-exprs-are? o exprs)
+  (equal? (index-map-exprs (segop-operand-map o)) exprs))
+
+(define (lower-matmul-binding A-tr B-tr A-ref B-ref pool-idx shape strides dtype
+                              #!optional (epilogue #f))
+  "The seg-red of the matmul of the trace-time arrays A-tr and B-tr, found
+   at A-ref and B-ref, writing pool slot pool-idx of the given shape,
+   strides and dtype; #f when blas-exec cannot multiply them.  epilogue is
+   #f or the single-output seg-map of an element-wise binding whose input 0
+   is the product; the seg-red then computes that binding's output, in the
+   epilogue's output slot."
+  (let ((operand (lambda (tr ref exprs)
+                   (cases array-morphism tr
+                     (concrete-array (_ s st off dt _ _)
+                       (make-segop-operand ref dt s st off (make-index-map exprs #f 0.0 #f)))
+                     (else (error "lower-matmul-binding: operand not concrete" tr))))))
+    (let* ((A    (operand A-tr A-ref gemm-A-exprs))
+           (B    (operand B-tr B-ref gemm-B-exprs))
+           (kind (gemm-plan-kind A B)))
+      (and kind
+           (eq? (segop-operand-dtype A) dtype)
+           (let* ((sA    (segop-operand-shape A))
+                  (sB    (segop-operand-shape B))
+                  (space (vector (vector-ref sA 0) (vector-ref sB 1) (vector-ref sA 1)))
+                  ;; a fused epilogue always runs with the strided plan
+                  (plan  (prepare-gemm-plan (if epilogue 'gemm-strided kind) A B))
+                  (spec  (gemm-combine-spec plan dtype))
+                  (out   (lambda (slot)
+                           (make-segop-operand slot dtype shape strides 0
+                                               (make-index-map gemm-out-exprs #f 0.0 #f)))))
+             (if epilogue
+                 (cases segop epilogue
+                   (seg-map (e-space e-ins e-outs e-bodies e-fallback)
+                     (make-seg-red space 1 (append (list A B) (cdr e-ins))
+                                   (list (make-red-result
+                                          (out (segop-operand-slot (car e-outs)))
+                                          gemm-body spec
+                                          (scalar-expr-substitute-inputs
+                                           (car e-bodies)
+                                           (lambda (k) (if (= k 0) `(cast ,dtype (acc)) `(in ,(+ k 1)))))))
+                                   '() e-fallback))
+                   (else #f))
+                 (make-seg-red space 1 (list A B)
+                               (list (make-red-result (out pool-idx) gemm-body spec #f)))))))))
+
+(define (standard-gemm sg)
+  "The GEMM that computes seg-red sg, as a list (A B out kind plan epilogue),
+   or #f when sg is not in the form lower-matmul-binding produces, combine
+   spec included.  kind is gemm or gemm-strided and plan the gemm-plan for
+   the operands; epilogue is #f, (unary . combiner) or
+   (bias bias-operand . combiner)."
+  (cases segop sg
+    (seg-red (space nred ins results map-outs fallback)
+      (and
+       (= (vector-length space) 3) (= nred 1) (= (length results) 1) (null? map-outs)
+       (<= 2 (length ins) 3)
+       (let* ((A     (car ins))
+              (B     (cadr ins))
+              (res   (car results))
+              (out   (red-result-out res))
+              (dtype (segop-operand-dtype out))
+              (fin   (red-result-finalize res))
+              (M     (vector-ref space 0))
+              (N     (vector-ref space 1))
+              (K     (vector-ref space 2)))
+         (and
+          (equal? (red-result-body res) gemm-body)
+          (operand-exprs-are? A gemm-A-exprs) (equal? (segop-operand-shape A) (vector M K))
+          (operand-exprs-are? B gemm-B-exprs) (equal? (segop-operand-shape B) (vector K N))
+          (operand-exprs-are? out gemm-out-exprs) (operand-flat? out (vector M N))
+          (eq? (segop-operand-dtype A) dtype)
+          (let ((epilogue
+                 (cond ((not fin) (and (= (length ins) 2) 'none))
+                       ((not fallback) #f)
+                       ((= (length ins) 2) (cons 'unary fallback))
+                       (else
+                        (let ((bias (caddr ins)))
+                          (and (operand-exprs-are? bias '#((dim 1)))
+                               (operand-row-major? bias)
+                               (equal? (segop-operand-shape bias) (vector N))
+                               (eq? (segop-operand-dtype bias) dtype)
+                               (cons 'bias (cons bias fallback)))))))
+                (kind (if fin 'gemm-strided (gemm-plan-kind A B))))
+            (and epilogue kind
+                 (let ((plan (prepare-gemm-plan kind A B)))
+                   (and (combine-specs-equal? (red-result-combine res) (gemm-combine-spec plan dtype))
+                        (list A B out kind plan (if (eq? epilogue 'none) #f epilogue))))))))))
+    (else #f)))
+
+;; The registry routes GEMMs to the active BLAS backend through prepared
+;; gemm-plans; a fused epilogue then runs in place on the stored product.
+(define (registry-gemm-select sg)
+  (let ((g (standard-gemm sg)))
+    (and g
+         (let* ((A-ref    (segop-operand-slot (list-ref g 0)))
+                (B-ref    (segop-operand-slot (list-ref g 1)))
+                (out      (list-ref g 2))
+                (plan     (list-ref g 4))
+                (epilogue (list-ref g 5))
+                (dtype    (segop-operand-dtype out))
+                (size     (shape-size (segop-operand-shape out)))
+                (gemm!    (lambda (deref buf)
+                            (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf))))
+           (cond
+            ((not epilogue)
+             (cons (if (eq? (list-ref g 3) 'gemm) 'segop/gemm 'segop/gemm-strided) gemm!))
+            ((eq? (car epilogue) 'unary)
+             (let ((combiner (cdr epilogue)))
+               (cons 'segop/gemm-epilogue
+                     (lambda (deref buf)
+                       (gemm! deref buf)
+                       (execute-flat-unary-compute-inplace! combiner buf size dtype)))))
+            (else
+             (let ((bias-ref (segop-operand-slot (cadr epilogue)))
+                   (combiner (cddr epilogue))
+                   (N        (vector-ref (segop-operand-shape out) 1)))
+               (cons 'segop/gemm-epilogue
+                     (lambda (deref buf)
+                       (gemm! deref buf)
+                       (cases array-morphism (deref bias-ref)
+                         (concrete-array (bias-data _ _ _ _ _ _)
+                           (execute-flat-bias-broadcast-inplace! combiner buf bias-data size N dtype))
+                         (else (error "gemm epilogue: bias not concrete"))))))))))))
+
+;;; ------------------------------------------------------------
 ;;; Backend registration and instruction compilation
 ;;; ------------------------------------------------------------
 
 (define (registry-select sg)
-  (or (registry-elementwise-select sg)
+  (or (registry-gemm-select sg)
+      (registry-elementwise-select sg)
       (select-standard-reduction sg '(axis0 axis1))
       (registry-gather-select sg)))
 
@@ -724,6 +906,15 @@
   "The ri-segop instruction materializing affine index function fn, or #f."
   (segop-instruction (lower-affine-binding fn src-tr in-ref pool-idx shape strides dtype)
                      pool-idx shape strides dtype))
+
+(define (compile-matmul-segop A-tr B-tr A-ref B-ref pool-idx shape strides dtype
+                             #!optional (epilogue #f))
+  "The ri-segop instruction of a matmul binding, with the element-wise
+   binding whose seg-map is epilogue fused into it when epilogue is given;
+   #f when the matmul cannot be lowered or no backend accepts its segop."
+  (segop-instruction
+   (lower-matmul-binding A-tr B-tr A-ref B-ref pool-idx shape strides dtype epilogue)
+   pool-idx shape strides dtype))
 
 (define (compile-host-segop fn in-traces in-refs pool-idx shape strides dtype)
   "The ri-segop instruction evaluating index function fn on the host."

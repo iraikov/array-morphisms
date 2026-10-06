@@ -117,6 +117,7 @@
 
    ;; Prepared GEMM: operand checks done once, for repeated products
    gemm-plan?
+   gemm-plan-uses-kernel?
    prepare-blas-gemm/into
    prepare-blas-gemm-strided/into
    execute-gemm-plan/into!
@@ -762,6 +763,11 @@
     strided?  ; #t when made by prepare-blas-gemm-strided/into
     M N K
     lda transa ldb transb)   ; strided kernel arguments; unused otherwise
+
+  (define (gemm-plan-uses-kernel? plan)
+    "True when plan calls a backend GEMM kernel; false when its products
+    are computed by the execute-blas-* procedure it falls back to."
+    (and (gemm-plan-kernel plan) #t))
 
   (define (prepare-blas-gemm/into A B)
     "Check A and B once for execute-gemm-plan/into!.  Returns a gemm-plan

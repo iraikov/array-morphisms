@@ -37,10 +37,12 @@
 ;;;       | (op e ...)                  a primitive (see scalar-primitives) or
 ;;;                                     an op of the scalar-op table
 ;;;       | (if e e e) | (let* ((v e) ...) e)
+;;;       | (cast dtype e)              e rounded as storing it in an array of
+;;;                                     dtype would round it
 ;;;       | (opaque proc e ...)         a Scheme procedure, host only
 ;;;
 ;;; Bodies compute in double precision; a result is rounded when it is
-;;; stored to a single-precision output.
+;;; stored to a single-precision output, or where a cast says so.
 
 (module array-morphisms-segop
 
@@ -523,6 +525,7 @@
                          (<= 0 (cadr e)) (< (cadr e) space-rank)))
              ((acc) (and acc? (null? (cdr e))))
              ((if) (and (= (length e) 4) (every (lambda (x) (walk x vars)) (cdr e))))
+             ((cast) (and (= (length e) 3) (memq (cadr e) cast-dtypes) (walk (caddr e) vars)))
              ((let*)
               (and (= (length e) 3) (list? (cadr e))
                    (let loop ((bs (cadr e)) (vars vars))
@@ -538,6 +541,8 @@
                        (and (scalar-op? (car e))
                             (= (scalar-op-arity (car e)) (length (cdr e)))))
                    (every (lambda (x) (walk x vars)) (cdr e)))))))))
+
+(define cast-dtypes '(f32 f64 s32 s64 u32 u64))
 
 (define (fp-abs x) (abs (exact->inexact x)))
 
@@ -566,6 +571,7 @@
              ((idx) (vector-ref coords (cadr e)))
              ((acc) (or acc (error 'eval-scalar-expr "(acc) outside a finalize body")))
              ((if) (if (ev (cadr e) env) (ev (caddr e) env) (ev (cadddr e) env)))
+             ((cast) (round-to-dtype (ev (caddr e) env) (cadr e)))
              ((let*)
               (let loop ((bs (cadr e)) (env env))
                 (if (null? bs)
@@ -586,6 +592,7 @@
   (cond ((not (pair? e)) e)
         ((eq? (car e) 'in) (subst (cadr e)))
         ((memq (car e) '(param idx acc)) e)
+        ((eq? (car e) 'cast) `(cast ,(cadr e) ,(scalar-expr-substitute-inputs (caddr e) subst)))
         ((eq? (car e) 'let*)
          `(let* ,(map (lambda (b) (list (car b) (scalar-expr-substitute-inputs (cadr b) subst)))
                       (cadr e))
@@ -600,6 +607,7 @@
     (cond ((not (pair? e)) acc)
           ((eq? (car e) 'in) (if (memv (cadr e) acc) acc (cons (cadr e) acc)))
           ((memq (car e) '(param idx acc)) acc)
+          ((eq? (car e) 'cast) (walk (caddr e) acc))
           ((eq? (car e) 'let*)
            (walk (caddr e) (fold (lambda (b acc) (walk (cadr b) acc)) acc (cadr e))))
           ((eq? (car e) 'opaque) (fold walk acc (cddr e)))
@@ -614,7 +622,8 @@
            (and (eq? (car e) 'let*)
                 (or (any (lambda (b) (scalar-expr-opaque? (cadr b))) (cadr e))
                     (scalar-expr-opaque? (caddr e))))
-           (and (not (memq (car e) '(in param idx acc let*)))
+           (and (eq? (car e) 'cast) (scalar-expr-opaque? (caddr e)))
+           (and (not (memq (car e) '(in param idx acc let* cast)))
                 (any scalar-expr-opaque? (cdr e))))))
 
 

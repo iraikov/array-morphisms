@@ -219,6 +219,13 @@ parameter's dtype. When an `'f32` parameter meets `'f64` values, the
 backward pass computes in `'f64` as promotion requires, and the gradient
 is cast back to `'f32` at the end.
 
+`ssa-vjp` returns one gradient per parameter, in the order of the
+parameters. A parameter that no gradient reaches gets zeros of its shape
+and dtype; this includes a parameter reached only through a max reduction,
+whose derivative is not computed. A `morph-map` traces and replays like any
+element-wise op, but its procedure has no derivative: `ssa-vjp` raises an
+error when the input of a map depends on a trainable parameter.
+
 ## Performance Tips
 
 1. **Laziness is your friend** - Build expression trees, materialize once
@@ -284,8 +291,9 @@ those checks once:
 A plan records the backend kernel to call and its arguments. It is used
 only while BLAS is enabled and the backend it was made for is still
 registered; otherwise `execute-gemm-plan/into!` falls back to the
-corresponding `execute-blas-*` procedure. Compiled SSA replay plans prepare
-their GEMM instructions this way when they are compiled.
+corresponding `execute-blas-*` procedure. `gemm-plan-uses-kernel?` tells
+whether a plan calls a backend kernel. Compiled SSA replay plans prepare
+their GEMM segops this way when they are compiled.
 
 ## Element-wise Kernel Backends
 
@@ -342,7 +350,8 @@ represented as *segmented operations* (segops,
 - operands, each an array with its layout (dtype, shape, strides, offset)
   and an *index map* from iteration coordinates to the array's index;
 - a *body*, a symbolic expression computing one output element, such as
-  `(relu (in 0))` or `(add (mul (in 0) (in 1)) (in 2))`;
+  `(relu (in 0))` or `(add (mul (in 0) (in 1)) (in 2))`; `(cast f32 e)`
+  rounds a value as storing it in an f32 array would;
 - the Scheme function it was lowered from, used to execute it on the host.
 
 There are three kinds: `seg-map` (element-wise maps, possibly with several
@@ -365,8 +374,8 @@ same formula.
 `segop-interpret` executes any `seg-map` or `seg-red` directly from its
 definition. It is slow and is meant for testing.
 
-When a replay plan is compiled, every binding except matrix products,
-convolutions and zero-copy views is lowered to a segop:
+When a replay plan is compiled, every binding except convolutions and
+zero-copy views is lowered to a segop:
 
 - element-wise ops become a `seg-map` whose inputs are read through
   broadcast maps and their own strides, so transposed views are read in
@@ -374,6 +383,14 @@ convolutions and zero-copy views is lowered to a segop:
 - reductions become a `seg-red`, whose combine spec records how the
   reduction loop rounds: f32 sums over axis 0 round after every step, sums
   over axis 1 accumulate in double precision, and so on;
+- a matrix product `A[M,K] B[K,N]` becomes a `seg-red` over `(M N K)` with
+  the body `(mul (in 0) (in 1))`; transposed operands are described by their
+  strides. Its combine spec sums in the BLAS backend's order when the
+  prepared plan calls a kernel, and otherwise in increasing k with a double
+  accumulator, as the Scheme loop does. An adjacent element-wise consumer
+  (an activation, or a bias add) of the same shape and dtype is fused as
+  the reduction's finalize, applied to the stored product
+  (`(sigmoid (cast f32 (acc)))`);
 - materialized views (such as a reshape of a transposed array) become a
   gather, a `seg-map` with the body `(in 0)`;
 - the remaining index functions run on the host through a `seg-lib`.
@@ -391,8 +408,9 @@ value of the parameter `segop-backends`:
 ```
 
 Two backends are always present. `registry` handles the patterns that use
-the activation backend's kernels (element-wise, reduction over axis 0 or 1
-of a row-major matrix, and strided copy), and `scheme` handles the rest with
+the BLAS backend (matrix products, through prepared GEMM plans) and the
+activation backend's kernels (element-wise, reduction over axis 0 or 1 of a
+row-major matrix, and strided copy), and `scheme` handles the rest with
 Scheme loops; as a last resort it evaluates a segop with the reference
 interpreter. Replay results are the same as those of the instructions they
 replaced, bit for bit.
@@ -406,6 +424,9 @@ each segop instruction by its pattern:
   any other layout;
 - reductions: `segop/reduce-1d`, `segop/reduce-axis0`, `segop/reduce-axis1`
   and `segop/reduce-general`;
+- matrix products: `segop/gemm` (row-major operands), `segop/gemm-strided`
+  (transposed or strided operands) and `segop/gemm-epilogue` (with a fused
+  consumer);
 - `segop/gather` for materialized views, `segop/host-index-fn` for index
   functions run on the host, and `segop/interpreted`.
 

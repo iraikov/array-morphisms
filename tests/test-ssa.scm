@@ -15,7 +15,7 @@
 
 (import scheme (chicken base) (chicken format)
         test
-        (only srfi-1 iota every any map filter filter-map take drop)
+        (only srfi-1 iota every any map filter filter-map take drop fold)
         (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!
               make-f32vector f32vector-ref f32vector-set! f32vector->list f64vector->list
               list->s32vector s32vector->list make-s32vector make-f64vector)
@@ -1053,12 +1053,13 @@
       ((>= i (vector-length plan)) #f)
       (else
        (cases replay-instruction (vector-ref plan i)
-         (ri-gemm-epilogue (_ _ _ _ _ _ _ _ _ _) #t)
+         (ri-segop (_ _ _ _ _ _ tag)
+           (or (eq? tag 'segop/gemm-epilogue) (loop (+ i 1))))
          (else (loop (+ i 1))))))))
 
-(test-group "E3: ri-gemm-epilogue in replay plan"
+(test-group "E3: GEMM epilogue in replay plan"
 
-  (test "Dense+relu: replay plan contains ri-gemm-epilogue after ctx replay"
+  (test "Dense+relu: replay plan contains a GEMM epilogue segop after ctx replay"
     #t
     ;; x[2,3] @ W[3,4] + b[4], then relu, then mean
     (let* ((x-data (morph-from-list '(1.0 2.0 3.0 4.0 5.0 6.0) #(2 3) 'f64))
@@ -1235,15 +1236,25 @@
         (concrete-array (data _ _ _ _ _ _) data)
         (else (error "with-segop-checker: not concrete" a))))
     ;; A seg-red whose combine order the backend chooses (as the BLAS dot
-    ;; product of a rank-1 sum) is compared up to rounding.
-    (define (unspecified-order? sg)
+    ;; product of a rank-1 sum, or a GEMM kernel) is compared up to
+    ;; rounding: the relative tolerance is 8 n eps, with n the number of
+    ;; reduced values and eps the machine epsilon of the accumulator dtype.
+    ;; Returns that tolerance, or #f for an exact comparison.
+    (define (unspecified-order-tolerance sg)
       (cases segop sg
         (seg-red (space nred ins results map-outs fallback)
-          (any (lambda (r) (eq? 'unspecified (combine-spec-order (red-result-combine r)))) results))
+          (let ((specs (filter (lambda (spec) (eq? 'unspecified (combine-spec-order spec)))
+                               (map red-result-combine results))))
+            (and (pair? specs)
+                 (let ((n (fold * 1 (drop (vector->list space) (- (vector-length space) nred))))
+                       (eps (if (any (lambda (spec) (eq? (combine-spec-acc-dtype spec) 'f32)) specs)
+                                1.2e-7
+                                2.3e-16)))
+                   (* 8 n eps)))))
         (else #f)))
-    (define (agree? a b loose?)
+    (define (agree? a b tol)
       (or (seg-same? a b)
-          (and loose? (<= (abs (- a b)) (* 1e-12 (max 1.0 (abs a)))))))
+          (and tol (<= (abs (- a b)) (* tol (max 1.0 (abs a)))))))
     (define (select sg)
       (let ((sel (parameterize ((segop-backends others))
                    (select-segop-executor sg))))
@@ -1257,7 +1268,7 @@
                                      (dt  (segop-operand-dtype out))
                                      (n   (shape-size (segop-operand-shape out)))
                                      (ref (allocate-typed-vector dt n))
-                                     (loose? (unspecified-order? sg)))
+                                     (loose? (unspecified-order-tolerance sg)))
                                 (segop-interpret sg
                                                  (map (lambda (o) (array-data (deref (segop-operand-slot o))))
                                                       (segop-inputs sg))
@@ -1336,6 +1347,7 @@
                     (memq t '(segop/activation-unary segop/flat-unary segop/activation-binary
                               segop/flat-binary segop/bias-broadcast segop/flat-ternary
                               segop/flat-broadcast segop/reduce-1d segop/reduce-axis0
+                              segop/gemm segop/gemm-strided segop/gemm-epilogue
                               segop/reduce-axis1 segop/reduce-general segop/gather
                               segop/strided-map)))
                   tags))
@@ -2008,5 +2020,300 @@
            (L (am:var-mean (am:var-matmul X W))))
       (am:backward! L)
       (eq? (get-morphism-dtype (realize (am:var-grad W))) 'f32))))
+
+;;;; ============================================================
+;;;; GEMM as seg-red
+;;;;
+;;;; Every matmul is a seg-red over (M N K) routed to the BLAS backend.
+;;;; Forward programs are traced and replayed with the checking backend, so
+;;;; each GEMM is also run by the reference interpreter.  Products below
+;;;; the BLAS size threshold run the Scheme loop, whose combine spec is
+;;;; exact (sequential, f64 accumulator), and are compared with a
+;;;; reference computed here.
+;;;; ============================================================
+
+(define (gm-vals n seed) (map (lambda (i) (* 0.9 (sin (+ (* 1.37 i) seed)))) (iota n)))
+
+(define (gm-round dt x)
+  (if (eq? dt 'f32)
+      (let ((b (make-f32vector 1))) (f32vector-set! b 0 x) (f32vector-ref b 0))
+      x))
+
+;; Row-major values of the [M,K] matrix seen through a transpose when t?.
+(define (gm-matrix-values vals rows cols t?)
+  (if t?
+      (append-map* (lambda (i) (map (lambda (j) (list-ref vals (+ (* j rows) i))) (iota cols)))
+                   (iota rows))
+      vals))
+(define (append-map* f lst) (apply append (map f lst)))
+
+;; A[M,K] (stored transposed when tA?) times B[K,N] (stored transposed when tB?).
+(define (gm-operands dt M K N tA? tB?)
+  (let ((a (map (lambda (v) (gm-round dt v)) (gm-vals (* M K) 0.3)))
+        (b (map (lambda (v) (gm-round dt v)) (gm-vals (* K N) 1.1))))
+    (values (if tA?
+                (morph-transpose (morph-from-list a (vector K M) dt) '(1 0))
+                (morph-from-list a (vector M K) dt))
+            (if tB?
+                (morph-transpose (morph-from-list b (vector N K) dt) '(1 0))
+                (morph-from-list b (vector K N) dt))
+            (gm-matrix-values a M K tA?)
+            (gm-matrix-values b K N tB?))))
+
+;; The product summed over increasing k in double precision, rounded once.
+(define (gm-reference dt av bv M K N)
+  (append-map* (lambda (i)
+                 (map (lambda (j)
+                        (gm-round dt (fold (lambda (k acc) (+ acc (* (list-ref av (+ (* i K) k))
+                                                                     (list-ref bv (+ (* k N) j)))))
+                                           0.0 (iota K))))
+                      (iota N)))
+               (iota M)))
+
+(define (gm-close? xs ys tol)
+  (and (= (length xs) (length ys))
+       (every (lambda (x y) (<= (abs (- x y)) (* tol (max 1.0 (abs y))))) xs ys)))
+
+;; The GEMM segops of a plan, as (tag . segop).
+(define (gm-segops prog)
+  (filter (lambda (p) (memq (car p) '(segop/gemm segop/gemm-strided segop/gemm-epilogue)))
+          (plan-segops prog)))
+
+(test-group "GEMM as seg-red"
+  ;; layouts, dtypes, and sizes below (3x4x5) and above (9x8x10) the threshold
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (layout)
+        (for-each
+         (lambda (mkn)
+           (let* ((M (car mkn)) (K (cadr mkn)) (N (caddr mkn))
+                  (tA? (car layout)) (tB? (cadr layout))
+                  (name (sprintf "~A ~Ax~Ax~A~A~A" dt M K N (if tA? " A^T" "") (if tB? " B^T" ""))))
+             (let-values (((A B av bv) (gm-operands dt M K N tA? tB?)))
+               (let* ((r (s2-run (lambda () (morph-matmul A B))))
+                      (prog (car r)) (trace (cadr r)) (replay (caddr r))
+                      (gs (gm-segops prog))
+                      (small? (< (* M N) 64)))
+                 (test-assert (string-append name ": one GEMM segop of the expected kind")
+                   (and (= (length gs) 1)
+                        (eq? (caar gs) (if (or tA? tB?) 'segop/gemm-strided 'segop/gemm))))
+                 (let* ((sg (cdar gs))
+                        (g  (standard-gemm sg))
+                        (spec (red-result-combine (car (cases segop sg
+                                                         (seg-red (_ _ _ results _ _) results)
+                                                         (else '()))))))
+                   (test-assert (string-append name ": standard-gemm recovers it")
+                     (and g (eq? (list-ref g 3) (if (or tA? tB?) 'gemm-strided 'gemm))
+                          (not (list-ref g 5))))
+                   (test-assert (string-append name ": the combine spec follows the plan")
+                     (if small?
+                         (and (eq? (combine-spec-acc-dtype spec) 'f64)
+                              (eq? (combine-spec-order spec) 'sequential))
+                         (and (eq? (combine-spec-acc-dtype spec) dt)
+                              (eq? (combine-spec-order spec) 'unspecified)))))
+                 (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+                 (test-assert (string-append name ": replay reproduces the trace")
+                   (s2-same-lists? trace replay))
+                 (test-assert (string-append name ": values")
+                   (let ((ref (gm-reference dt av bv M K N)))
+                     (if small?
+                         (s2-same-lists? trace ref)
+                         (gm-close? trace ref (if (eq? dt 'f32) 1e-5 1e-13)))))))))
+         '((3 4 5) (9 8 10))))
+      '((#f #f) (#t #f) (#f #t) (#t #t))))
+   '(f32 f64))
+
+  ;; degenerate shapes
+  (for-each
+   (lambda (mkn)
+     (let* ((M (car mkn)) (K (cadr mkn)) (N (caddr mkn)))
+       (let-values (((A B av bv) (gm-operands 'f64 M K N #f #f)))
+         (let ((r (s2-run (lambda () (morph-matmul A B)))))
+           (test-assert (sprintf "~Ax~Ax~A: replay, interpreter and reference agree" M K N)
+             (and (= 0 (list-ref r 4)) (s2-same-lists? (cadr r) (caddr r))
+                  (gm-close? (cadr r) (gm-reference 'f64 av bv M K N) 1e-13)))))))
+   '((4 1 5) (1 6 5) (4 6 1) (1 1 1) (1 70 1) (70 1 1)))
+
+  ;; the Scheme loop with BLAS disabled, above the threshold
+  (let-values (((A B av bv) (gm-operands 'f32 9 8 10 #t #f)))
+    (disable-blas!)
+    (let* ((r (s2-run (lambda () (morph-matmul A B))))
+           (spec (red-result-combine
+                  (car (cases segop (cdar (gm-segops (car r)))
+                         (seg-red (_ _ _ results _ _) results)
+                         (else '()))))))
+      (enable-blas!)
+      (test-assert "without BLAS the combine spec is sequential with an f64 accumulator"
+        (and (eq? (combine-spec-order spec) 'sequential) (eq? (combine-spec-acc-dtype spec) 'f64)))
+      (test-assert "without BLAS the values are the exact reference"
+        (s2-same-lists? (cadr r) (gm-reference 'f32 av bv 9 8 10)))
+      (test "without BLAS the executor and the interpreter agree" 0 (list-ref r 4))))
+
+  ;; epilogues: a table op, a fused composed body, a bias, and bias + activation
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (case)
+        (let-values (((A B av bv) (gm-operands dt 9 8 10 #f #t)))
+          (let* ((bias (morph-from-list (map (lambda (v) (gm-round dt v)) (gm-vals 10 2.3)) #(10) dt))
+                 (make (lambda () ((cadr case) (morph-matmul A B) bias)))
+                 (r    (s2-run make))
+                 (gs   (gm-segops (car r)))
+                 (name (sprintf "~A ~A" dt (car case))))
+            (test-assert (string-append name ": the GEMM carries the epilogue")
+              (and (= 1 (length gs)) (eq? (caar gs) 'segop/gemm-epilogue)
+                   (let ((g (standard-gemm (cdar gs))))
+                     (and g (eq? (car (list-ref g 5)) (caddr case))))))
+            (test-assert (string-append name ": the finalize reads the stored product")
+              (let ((fin (red-result-finalize
+                          (car (cases segop (cdar gs)
+                                 (seg-red (_ _ _ results _ _) results)
+                                 (else '()))))))
+                (and (pair? fin) (member `(cast ,dt (acc)) (cdr fin)) #t)))
+            (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+            (test-assert (string-append name ": replay reproduces the trace")
+              (s2-same-lists? (cadr r) (caddr r)))
+            (test-assert (string-append name ": the trace agrees with realize")
+              (gm-close? (cadr r) (s2-values (realize (make))) (if (eq? dt 'f32) 1e-6 1e-13))))))
+      (list (list "sigmoid" (lambda (c b) (morph-sigmoid c)) 'unary)
+            (list "exp" (lambda (c b) (morph-exp c)) 'unary)
+            (list "bias" (lambda (c b) (morph+ c b)) 'bias))))
+   '(f32 f64))
+
+  ;; a cast after a GEMM is not fused: its buffer has another dtype
+  (let-values (((A B av bv) (gm-operands 'f32 9 8 10 #f #f)))
+    (let* ((r (s2-run (lambda () (morph-cast (morph-matmul A B) 'f64))))
+           (tags (s2-tags (car r))))
+      (test-assert "a cast to f64 after an f32 GEMM is left unfused"
+        (and (memq 'segop/gemm tags) (not (memq 'segop/gemm-epilogue tags))))
+      (test-assert "the cast after a GEMM replays as traced"
+        (s2-same-lists? (cadr r) (caddr r)))
+      (test-assert "the cast after a GEMM has the f32 product's values"
+        (gm-close? (cadr r) (gm-reference 'f32 av bv 9 8 10) 1e-5))))
+
+  ;; with only the scheme backend, a GEMM is interpreted
+  (let-values (((A B av bv) (gm-operands 'f32 3 4 5 #t #f)))
+    (let* ((scheme-only (filter (lambda (b) (eq? (segop-backend-name b) 'scheme)) (segop-backends)))
+           (r (parameterize ((segop-backends scheme-only))
+                (s2-run (lambda () (morph-matmul A B))))))
+      (test-assert "with only the scheme backend a GEMM is interpreted"
+        (and (memq 'segop/interpreted (s2-tags (car r))) (null? (gm-segops (car r)))))
+      (test-assert "the interpreted GEMM gives the exact reference"
+        (and (s2-same-lists? (cadr r) (gm-reference 'f32 av bv 3 4 5))
+             (s2-same-lists? (cadr r) (caddr r)))))))
+
+
+;;;; ============================================================
+;;;; morph-map in SSA
+;;;;
+;;;; A user procedure mapped over an array traces and replays like any
+;;;; element-wise op, with an opaque body.  It has no derivative: ssa-vjp
+;;;; rejects a map whose input depends on a trainable parameter.  A
+;;;; parameter that no gradient reaches gets zeros, so the gradient outputs
+;;;; stay aligned with the parameters.
+;;;; ============================================================
+
+(define (mm-square x) (* x x))
+(define (mm-shift x) (- (* 0.75 x) 0.5))
+
+;; The finalize body of the single seg-red among the plan's GEMM segops.
+(define (mm-gemm-finalize prog)
+  (let ((gs (gm-segops prog)))
+    (and (= 1 (length gs))
+         (red-result-finalize
+          (car (cases segop (cdar gs)
+                 (seg-red (_ _ _ results _ _) results)
+                 (else '())))))))
+
+(test-group "morph-map in SSA"
+  ;; forward programs: trace, replay, interpreter and realize agree
+  (for-each
+   (lambda (case)
+     (let* ((make (cadr case))
+            (r    (s2-run make))
+            (name (car case)))
+       (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+       (test-assert (string-append name ": replay reproduces the trace")
+         (s2-same-lists? (cadr r) (caddr r)))
+       (test-assert (string-append name ": the trace equals realize")
+         (s2-same-lists? (cadr r) (s2-values (realize (make)))))
+       (when (pair? (cddr case))
+         (test-assert (string-append name ": executed as " (symbol->string (caddr case)))
+           (memq (caddr case) (s2-tags (car r)))))))
+   (list (list "map of a computed array"
+               (lambda () (morph-map mm-square (s2-src 'f64 '(3 4) s2-val))))
+         (list "map of a constant"
+               (lambda () (morph-map mm-shift (morph-from-list (gm-vals 12 0.4) #(3 4) 'f32))))
+         (list "map of a transposed view"
+               (lambda () (morph-map mm-shift (morph-transpose (s2-src 'f32 '(3 4) s2-val) '(1 0))))
+               'segop/strided-map)
+         (list "s32 map with non-integer results"
+               (lambda () (morph-map mm-shift (morph+ (morph-from-list '(3 -1 4 1 -5 9) #(2 3) 's32)
+                                                       (morph-from-list '(2) #(1) 's32)))))
+         (list "f32 map after a matmul"
+               (lambda () (let-values (((A B av bv) (gm-operands 'f32 9 8 10 #f #f)))
+                            (morph-map mm-shift (morph-matmul A B))))
+               'segop/gemm-epilogue)
+         (list "f64 map after a matmul"
+               (lambda () (let-values (((A B av bv) (gm-operands 'f64 9 8 10 #t #f)))
+                            (morph-map mm-square (morph-matmul A B))))
+               'segop/gemm-epilogue)))
+
+  (let-values (((A B av bv) (gm-operands 'f32 9 8 10 #f #f)))
+    (let ((fin (mm-gemm-finalize (car (s2-run (lambda () (morph-map mm-shift (morph-matmul A B))))))))
+      (test-assert "a map epilogue is an opaque finalize over the stored product"
+        (and (pair? fin) (eq? (car fin) 'opaque) (eq? (cadr fin) mm-shift)
+             (equal? (cddr fin) '((cast f32 (acc))))))))
+
+  ;; a map off the gradient path: x is an input, so map(x) needs no gradient
+  (gradcheck "a map of an input added to a product"
+             (lambda (ps)
+               (let* ((x  (seg-var (gm-vals 6 0.9) '(2 3) 'f64 #f))
+                      (mx (am:make-var (morph-map mm-square (am:var-value x)) #f)))
+                 (am:var-mean (am:var* (am:var+ (am:var* (car ps) x) mx) (cadr ps)))))
+             '(((2 3) f64) ((2 3) f64))
+             '())
+
+  ;; a map on a gradient path is rejected
+  (let ((W (seg-var (gm-vals 6 0.2) '(2 3) 'f64 #t)))
+    (test-error "a map of a parameter has no derivative"
+      (compile-and-realize (am:var-sum (am:make-var (morph-map mm-square (am:var-value W)) #t))
+                           (list W)))
+    (test-error "a map of a value computed from a parameter has no derivative"
+      (compile-and-realize
+       (am:var-sum (am:make-var (morph-map mm-square (am:var-value (am:var* W W))) #t))
+       (list W))))
+
+  ;; a parameter reached only through a max reduction (whose VJP is skipped)
+  ;; gets zeros, and the parameters after it keep their own gradients
+  (let* ((av (gm-vals 6 0.1)) (wv (gm-vals 6 0.5)) (bv (gm-vals 3 0.8))
+         (make (lambda ()
+                 (let* ((A (seg-var av '(2 3) 'f64 #t))
+                        (W (seg-var wv '(2 3) 'f32 #t))
+                        (B (seg-var bv '(3) 'f64 #t))
+                        (mw (am:make-var (morph-reduce 'max (am:var-value W) '(1)) #t)))
+                   (values (am:var+ (am:var-sum (am:var* (am:var-exp A) B))
+                                    (am:var-sum (am:make-var (morph-cast (am:var-value mw) 'f64) #t)))
+                           (list A W B))))))
+    (let-values (((joint trace replay) (seg-trace-and-replay make)))
+      (test "one output per parameter, after the loss" 4 (length replay))
+      (test "the parameter behind the max reduction gets zeros" (map (lambda (i) 0.0) (iota 6))
+        (caddr replay))
+      (test-assert "the zero gradient has the parameter's dtype"
+        (eq? 'f32 (cases array-morphism (list-ref (ssa-realize joint) 2)
+                    (concrete-array (_ _ _ _ dt _ _) dt)
+                    (else #f))))
+      (test-assert "replay reproduces the trace" (equal? trace replay))
+      (test-assert "the other gradients are those of the expression"
+        (and (results-close? (list (cadr replay))
+                             (list (map (lambda (a b) (* (exp a) b))
+                                        av (append bv bv)))
+                             1e-12)
+             (results-close? (list (cadddr replay))
+                             (list (map (lambda (j) (+ (exp (list-ref av j)) (exp (list-ref av (+ j 3)))))
+                                        (iota 3)))
+                             1e-12))))))
+
 
 (test-end)

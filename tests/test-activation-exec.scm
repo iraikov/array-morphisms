@@ -302,7 +302,7 @@
            (Wv (param-var '(0.1 -0.2 0.3 0.4 -0.5 0.6) '(3 2) 'f64))
            (loss (am:var-mean (am:var-sigmoid (am:var-matmul xv Wv)))))
       (let-values (((joint _) (trace-and-replay loss (list Wv))))
-        (list (> (plan-count joint 'ri-gemm-epilogue) 0)
+        (list (> (plan-count joint 'segop/gemm-epilogue) 0)
               (plan-count joint 'segop/activation-unary))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
