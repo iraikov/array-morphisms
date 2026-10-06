@@ -1200,4 +1200,115 @@
                     (and (every lists-approx= (map concrete->list (ssa-realize/ctx ctx joint)) ref)
                          (loop (+ i 1))))))))))))
 
+
+;;;; ============================================================
+;;;; f32 eager gradients
+;;;;
+;;;; Eager backward! on f32 parameters must give f32 gradients, and
+;;;; these must agree with the ssa-vjp gradients of the same graph and
+;;;; with eager f64 gradients to within f32 precision.  Each graph is
+;;;; built fresh for every evaluation so that gradients do not
+;;;; accumulate across runs.
+;;;; ============================================================
+
+(define f32-tol 1e-5)
+
+(define (f32-approx= a b)
+  (<= (abs (- a b)) (* f32-tol (max 1.0 (abs b)))))
+
+(define (lists-f32-approx= l1 l2)
+  (and (= (length l1) (length l2))
+       (every f32-approx= l1 l2)))
+
+;;; build: (lambda (make-param) -> (values loss-var param-vars)), where
+;;; make-param takes a flat list and a shape list.
+(define (make-param-of dtype)
+  (lambda (lst shape)
+    (am:make-var (morph-from-list lst (list->vector shape) dtype) #t)))
+
+;;; Eager gradients: (values grad-lists grad-dtypes).
+(define (eager-grads build dtype)
+  (let-values (((loss params) (build (make-param-of dtype))))
+    (am:backward! loss)
+    (let ((grads (map (lambda (p) (realize (am:var-grad p))) params)))
+      (values (map concrete->list grads)
+              (map get-morphism-dtype grads)))))
+
+;;; SSA gradients as lists, without the loss value.
+(define (ssa-grads build dtype)
+  (let-values (((loss params) (build (make-param-of dtype))))
+    (cdr (compile-and-realize loss params))))
+
+(define (check-f32-eager-grads name build)
+  (let-values (((g32 dtypes) (eager-grads build 'f32))
+               ((g64 _)      (eager-grads build 'f64)))
+    (let ((s32 (ssa-grads build 'f32)))
+      (test-assert (string-append name ": eager gradients are f32")
+        (every (lambda (d) (eq? d 'f32)) dtypes))
+      (test-assert (string-append name ": eager f32 agrees with SSA f32")
+        (every lists-f32-approx= g32 s32))
+      (test-assert (string-append name ": eager f32 agrees with eager f64")
+        (every lists-f32-approx= g32 g64)))))
+
+(define A-vals '(0.5 -1.0 2.0 0.25 1.5 -0.5))
+(define B-vals '(1.0 -2.0 0.5 0.75 -1.25 3.0))
+
+(test-group "f32 eager gradients"
+
+  (test-assert "mean of an f32 matmul has f32 gradients"
+    (let* ((A (am:make-var (morph-from-list '(1 2 3 4 5 6) #(2 3) 'f32) #t))
+           (B (am:make-var (morph-from-list '(1 2 3 4 5 6) #(3 2) 'f32) #t))
+           (L (am:var-mean (am:var-matmul A B))))
+      (am:backward! L)
+      ;; dL/dA[i,k] = sum_j B[k,j] / 4, dL/dB[k,j] = sum_i A[i,k] / 4
+      (and (eq? (get-morphism-dtype (realize (am:var-grad A))) 'f32)
+           (lists-f32-approx= (concrete->list (am:var-grad A))
+                              '(0.75 1.75 2.75 0.75 1.75 2.75))
+           (lists-f32-approx= (concrete->list (am:var-grad B))
+                              '(1.25 1.25 1.75 1.75 2.25 2.25)))))
+
+  (check-f32-eager-grads "mean(A B)"
+    (lambda (param)
+      (let ((A (param A-vals '(2 3)))
+            (B (param B-vals '(3 2))))
+        (values (am:var-mean (am:var-matmul A B)) (list A B)))))
+
+  (check-f32-eager-grads "row mean of (A B)^2"
+    (lambda (param)
+      (let* ((A (param A-vals '(2 3)))
+             (B (param B-vals '(3 2)))
+             (Y (am:var-matmul A B)))
+        (values (am:var-mean (am:var-mean (am:var* Y Y) '(1) #t))
+                (list A B)))))
+
+  (check-f32-eager-grads "mean(A^T B)"
+    (lambda (param)
+      (let ((At (param A-vals '(3 2)))
+            (B  (param B-vals '(3 2))))
+        (values (am:var-mean (am:var-matmul (am:var-transpose At '(1 0)) B))
+                (list At B)))))
+
+  (check-f32-eager-grads "mean(A B^T)"
+    (lambda (param)
+      (let ((A  (param A-vals '(2 3)))
+            (Bt (param B-vals '(2 3))))
+        (values (am:var-mean (am:var-matmul A (am:var-transpose Bt '(1 0))))
+                (list A Bt)))))
+
+  (check-f32-eager-grads "two-layer mean(sigmoid(relu(X W1) W2))"
+    (lambda (param)
+      (let* ((X  (param A-vals '(2 3)))
+             (W1 (param B-vals '(3 2)))
+             (W2 (param '(0.3 -0.7 1.1 0.2) '(2 2)))
+             (H  (am:var-relu (am:var-matmul X W1))))
+        (values (am:var-mean (am:var-sigmoid (am:var-matmul H W2)))
+                (list X W1 W2)))))
+
+  (test-assert "f32 parameter times f64 input has an f32 gradient"
+    (let* ((W (am:make-var (morph-from-list B-vals #(3 2) 'f32) #t))
+           (X (am:make-var (morph-from-list A-vals #(2 3) 'f64) #f))
+           (L (am:var-mean (am:var-matmul X W))))
+      (am:backward! L)
+      (eq? (get-morphism-dtype (realize (am:var-grad W))) 'f32))))
+
 (test-end)

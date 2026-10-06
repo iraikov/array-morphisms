@@ -1236,6 +1236,64 @@
      (concrete-array (make-f64vector 0) #(0 3) (compute-strides #(0 3)) 0 'f64 -1 -1))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Mixed-dtype operands
+;;;
+;;; matmul, matvec and dot of an f32 and an f64 operand produce the
+;;; promoted dtype f64; realize converts the f32 operand before dispatch.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(test-group "Mixed-dtype operands"
+
+  (test-assert "f64 x f32 matmul is promoted to f64"
+    (let* ((A (morph-from-list '((1 2 3) (4 5 6)) #(2 3) 'f64))
+           (B (morph-from-list '((7 8) (9 10) (11 12)) #(3 2) 'f32))
+           (C (realize (morph-matmul A B))))
+      (and (eq? (get-morphism-dtype C) 'f64)
+           (concrete-values-approx? C '((58 64) (139 154))))))
+
+  (test-assert "f32 x f64 matmul is promoted to f64"
+    (let* ((A (morph-from-list '((1 2 3) (4 5 6)) #(2 3) 'f32))
+           (B (morph-from-list '((7 8) (9 10) (11 12)) #(3 2) 'f64))
+           (C (realize (morph-matmul A B))))
+      (and (eq? (get-morphism-dtype C) 'f64)
+           (concrete-values-approx? C '((58 64) (139 154))))))
+
+  (test-assert "mixed-dtype matmul above the BLAS size threshold"
+    (let* ((A64 (morph-from-list (iota 64 1) #(8 8) 'f64))
+           (B32 (morph-from-list (iota 64 1) #(8 8) 'f32))
+           (B64 (morph-from-list (iota 64 1) #(8 8) 'f64))
+           (C   (realize (morph-matmul A64 B32))))
+      (and (eq? (get-morphism-dtype C) 'f64)
+           (concrete-values-approx?
+            C (morph->list (realize (morph-matmul A64 B64)))))))
+
+  (test-assert "mixed-dtype matmul with a transposed f32 operand"
+    (let* ((A (morph-from-list '((1 2 3) (4 5 6)) #(2 3) 'f64))
+           (Bt (morph-transpose
+                (morph-from-list '((7 9 11) (8 10 12)) #(2 3) 'f32)
+                '(1 0)))
+           (C (realize (morph-matmul A Bt))))
+      (concrete-values-approx? C '((58 64) (139 154)))))
+
+  (test-assert "mixed-dtype matvec is promoted to f64"
+    (let* ((A (morph-from-list '((1 2 3) (4 5 6)) #(2 3) 'f32))
+           (v (morph-from-list '(1 2 3) #(3) 'f64))
+           (y (realize (morph-matvec A v))))
+      (and (eq? (get-morphism-dtype y) 'f64)
+           (concrete-values-approx? y '(14 32)))))
+
+  (test-assert "mixed-dtype dot is promoted to f64"
+    (let* ((v1 (morph-from-list '(1 2 3) #(3) 'f32))
+           (v2 (morph-from-list '(4 5 6) #(3) 'f64))
+           (r  (realize (morph-dot v1 v2))))
+      (and (eq? (get-morphism-dtype r) 'f64)
+           (concrete-values-approx? r '(32)))))
+
+  (test-error "integer matmul raises an error"
+    (realize (morph-matmul (morph-from-list '((1 2) (3 4)) #(2 2) 's32)
+                           (morph-from-list '((1 2) (3 4)) #(2 2) 's32)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Run All Tests
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
