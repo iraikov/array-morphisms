@@ -521,11 +521,18 @@
                        ;; Returns #f for other ops, allowing standard path below.
                        ;; For matmul/matvec/dot: always dispatches here since those
                        ;; morphisms carry an identity-fn placeholder that
-                       ;; execute-index-fn cannot handle.
+                       ;; execute-index-fn cannot handle.  Operands of mixed
+                       ;; dtype are first promoted to the expression dtype.
                        (blas-result
                         (execute-blas-operation
-                         (morphism-expr morph-id op realized-operands index-fn
-                                        shape dtype metadata batch-axis))))
+                         (morphism-expr morph-id op
+                                        (promote-blas-operands
+                                         op realized-operands dtype)
+                                        index-fn shape dtype metadata
+                                        batch-axis))))
+
+                  (when (and (not blas-result) (linalg-op? op))
+                    (unsupported-linalg-error op realized-operands dtype))
 
                   (if blas-result
                       blas-result
@@ -553,6 +560,20 @@
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Context-Aware Realization
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (linalg-op? op)
+    "True for the ops whose morphisms carry an identity-fn placeholder and
+    must be executed by a GEMM, GEMV or DOT kernel."
+    (memq op '(matmul matvec dot)))
+
+  (define (unsupported-linalg-error op operands dtype)
+    "Signal that a matmul, matvec or dot cannot be executed on operands."
+    (error (string-append "realize: " (symbol->string op)
+                          " requires concrete f32 or f64 operands of"
+                          " compatible shape")
+           (list 'result-dtype dtype
+                 'operand-dtypes (map get-morphism-dtype operands)
+                 'operand-shapes (map get-morphism-shape operands))))
 
   (define (realize-morphism-expr/ctx ctx m)
     "Realize morphism-expr with an active dispatch context vector.
@@ -610,10 +631,18 @@
                      ;; matmul/matvec/dot (which use identity-fn as placeholder)
                      ;; to fall through to execute-index-fn, which cannot handle
                      ;; identity-fn with two operands.
+                     ;; Operands of mixed dtype are promoted to the
+                     ;; expression dtype; input-ids above still refer to
+                     ;; the unconverted operands.
                      (blas-info
                       (blas-compatible-operation?
-                       (morphism-expr morph-id op realized-operands index-fn
-                                      shape dtype metadata batch-axis))))
+                       (morphism-expr morph-id op
+                                      (promote-blas-operands
+                                       op realized-operands dtype)
+                                      index-fn shape dtype metadata
+                                      batch-axis))))
+                (when (and (not blas-info) (linalg-op? op))
+                  (unsupported-linalg-error op realized-operands dtype))
                 ;; Fill result-data via BLAS/into! or the generic index kernel.
                 (if blas-info
                     (let ((blas-op  (car blas-info))

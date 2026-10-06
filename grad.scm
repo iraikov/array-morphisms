@@ -158,10 +158,31 @@
 (define (accumulate-grad! v g)
   "Add lazy morphism g to v's accumulated gradient.
    First call: sets gradient directly.
-   Subsequent calls: combines via morph+ (lazy, no realization)."
-  (let ((existing (morph-variable-grad v)))
+   Subsequent calls: combines via morph+ (lazy, no realization).
+   g is first given the gradient dtype of v's value, so that the
+   gradient of an f32 variable stays f32 even when the backward rule
+   mixes in f64 terms."
+  (let ((existing (morph-variable-grad v))
+        (g (morph-as-dtype g (effective-grad-dtype
+                              (morph-dtype (morph-variable-value v))))))
     (morph-variable-grad-set!
      v (if existing (morph+ existing g) g))))
+
+(define (morph-as-dtype m dtype)
+  "Return m when its dtype is dtype; otherwise a lazy element-wise
+   conversion of m to dtype."
+  (if (eq? (morph-dtype m) dtype)
+      m
+      (morphism-expr (gensym 'morph-)
+                     'map
+                     (list m)
+                     (make-compute-index-fn (list (lambda (idx) idx))
+                                            identity
+                                            '())
+                     (morph-shape m)
+                     dtype
+                     `((function . ,identity))
+                     (get-morphism-batch-axis m))))
 
 (define (grad-requires? vs)
   "True if any variable in vs has requires-grad=#t."
@@ -402,7 +423,8 @@
           (let ((x1 (var-value v1))
                 (x2 (var-value v2)))
             (when (var-requires-grad? v1)
-              (let* ((one (morph-from-list '(1.0) '(1) 'f64))
+              (let* ((one (morph-from-list '(1.0) '(1)
+                                           (effective-grad-dtype (morph-dtype x2))))
                      (dx1 (morph* g (morph* x2 (morph-pow x1 (morph- x2 one))))))
                 (accumulate-grad! v1 (reduce-sum-to dx1 (morph-shape x1)))))
             (when (var-requires-grad? v2)
@@ -434,7 +456,9 @@
         (lambda (g)
           (let* ((x-now   (var-value v))
                  (out-now (morph-sqrt x-now))
-                 (two     (morph-from-list '(2.0) '(1) 'f64))
+                 (two     (morph-from-list '(2.0) '(1)
+                                               (effective-grad-dtype
+                                                (morph-dtype x-now))))
                  (dx      (morph/ g (morph* two out-now))))
             (accumulate-grad! v dx)))))
     out))
@@ -605,7 +629,8 @@
                         (iota x-rank)
                         (map (lambda (a) (normalize-axis a x-rank)) axes)))
          (n        (compute-reduction-n x-shape norm-axes))
-         (n-morph  (morph-from-list (list (exact->inexact n)) '(1) 'f64))
+         (n-morph  (morph-from-list (list (exact->inexact n)) '(1)
+                                    (effective-grad-dtype (morph-dtype x))))
          (rg  (var-requires-grad? v))
          (out (make-var (morph-reduce 'mean x axes keepdims?) rg)))
     (when rg

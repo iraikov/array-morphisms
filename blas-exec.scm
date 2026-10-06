@@ -104,6 +104,7 @@
 
    ;; High-level morphism-expr dispatch (used by realization engine)
    execute-blas-operation
+   promote-blas-operands
 
    ;; In-place variants: write result into caller-supplied typed-vector.
    ;; Used by realize-morphism-expr/ctx
@@ -1109,6 +1110,50 @@ this is a bug (compat predicates should have rejected it)" m)))
   ;;; High-Level Morphism-Expr Dispatch
   ;;; Called by the realization engine after operand realization.
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  ;; -- Operand dtype promotion -----------------------------------------------
+  ;; morph-matmul, morph-matvec and morph-dot give their expression the
+  ;; promoted dtype of the two operands, but the GEMM, GEMV and DOT kernels
+  ;; read both operands with a single dtype.  When the operand dtypes
+  ;; differ, each operand whose dtype is not the expression dtype is copied
+  ;; into a contiguous row-major array of that dtype before dispatch.
+
+  (define (%convert-concrete-dtype m dtype)
+    "Copy concrete-array m into a new contiguous array of the given dtype."
+    (cases array-morphism m
+      (concrete-array (data shape strides offset src-dtype alloc-id batch-axis)
+        (let* ((n   (shape-size shape))
+               (out (allocate-typed-vector dtype n)))
+          (do ((i 0 (+ i 1)))
+              ((= i n))
+            (let ((phys (multi-to-linear-index
+                         (linear-to-multi-index i shape) strides offset)))
+              (typed-vector-set! out dtype i
+                                 (exact->inexact
+                                  (typed-vector-ref data src-dtype phys)))))
+          (concrete-array out shape (compute-strides shape) 0 dtype -1
+                          batch-axis)))
+      (else (error "%convert-concrete-dtype: expected a concrete array" m))))
+
+  (define (promote-blas-operands op operands dtype)
+    "Return operands with every concrete operand converted to dtype.
+
+    Applies only to the linear-algebra ops matmul, matvec and dot, and only
+    when dtype is f32 or f64; other operand lists are returned unchanged.
+
+    Args:
+      op:       the morphism-expr op symbol
+      operands: list of realized operands
+      dtype:    the dtype of the morphism-expr"
+    (if (and (memq op '(matmul matvec dot))
+             (memq dtype '(f32 f64)))
+        (map (lambda (m)
+               (if (and (concrete-array? m)
+                        (not (eq? (get-morphism-dtype m) dtype)))
+                   (%convert-concrete-dtype m dtype)
+                   m))
+             operands)
+        operands))
 
   (define (execute-blas-operation morphism)
     "Attempt to execute morphism via a registered BLAS backend.
