@@ -58,7 +58,7 @@
    replay-ref?
    rr-val rr-const
    replay-instruction replay-instruction?
-   ri-gemm ri-gemm-strided ri-index ri-reduce ri-view
+   ri-gemm ri-gemm-strided ri-view
    ri-segop
    ri-gemm-epilogue ri-alias
    ri-im2col ri-col2im
@@ -71,6 +71,7 @@
 
    ;; Segop lowering
    binding-scalar-body
+   standard-reduction
 
    ;; Replay plan compilation and execution
    compile-replay-plan
@@ -84,13 +85,14 @@
     replay-timing-results)
 
   (import scheme (chicken base) (chicken time) (chicken format)
-          (only (chicken fixnum) fx+ fx* fx=)
+          (only (chicken fixnum) fx+ fx- fx* fx= fx< fx>=)
           (only (chicken flonum) fp+ fp- fp* fp/ fp= fpexpt)
           (only (scheme time) current-jiffy jiffies-per-second)
           (only srfi-1 iota fold filter map for-each append-map filter-map every)
           (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
-                f32vector f32vector? f32vector-ref f32vector-set! f32vector-length)
+                f32vector f32vector? f32vector-ref f32vector-set! f32vector-length
+                s32vector-set! s64vector-set!)
           (only srfi-69
                 make-hash-table
                 hash-table-ref
@@ -213,28 +215,6 @@
     (in-A         replay-ref?)
     (in-B         replay-ref?)
     (plan         gemm-plan?))
-
-  ;; Element-wise / general index-fn op: strides pre-computed at compile time.
-  (ri-index
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (index-fn     index-fn?)
-    (in-refs      list?))
-
-  ;; Reduction (sum, mean, max, ...): strides pre-computed at compile time.
-  (ri-reduce
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (src-dtype    symbol?)
-    (rop          symbol?)
-    (reduce-axes  list?)
-    (reducer      procedure?)
-    (keepdims?    boolean?)
-    (in-ref       replay-ref?))
 
   ;; Zero-copy view (transpose, reshape, slice): shares pool buffer with source.
   (ri-view
@@ -1305,6 +1285,14 @@
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
          (morph-reduce 'max (car inputs) axes keepdims?)))
+      ((equal? op '(reduce min))
+       (let ((axes     (cdr (assq 'axes meta)))
+             (keepdims? (cdr (assq 'keepdims? meta))))
+         (morph-reduce 'min (car inputs) axes keepdims?)))
+      ((equal? op '(reduce prod))
+       (let ((axes     (cdr (assq 'axes meta)))
+             (keepdims? (cdr (assq 'keepdims? meta))))
+         (morph-reduce 'prod (car inputs) axes keepdims?)))
       ((eq? op 'matmul)
        (morph-matmul (car inputs) (cadr inputs)))
       ((eq? op 'transpose)
@@ -1792,17 +1780,11 @@
       ;; VJP-emitted reduce has 'axes and 'keepdims? in meta but no 'index-fn;
       ;; get-index-fn handles both via rebuild-morphism.
       ((and (pair? op) (eq? (car op) 'reduce))
-       (let* ((rop       (cadr op))
-              (axes      (cdr (assq 'axes meta)))
-              (keepdims? (cdr (assq 'keepdims? meta)))
-              (rfn       (get-index-fn))
-              (reducer   (reduction-index-fn-reducer rfn))
-              (src-arr   (trace-arr-of (car (ssa-binding-inputs b))))
-              (src-dtype (cases array-morphism src-arr
-                           (concrete-array (_ _ _ _ d _ _) d)
-                           (else dtype))))
-         (ri-reduce pool-idx shape strides dtype src-dtype rop axes reducer keepdims?
-                    (car in-refs))))
+       (compile-reduction-segop (cadr op)
+                                (cdr (assq 'axes meta))
+                                (cdr (assq 'keepdims? meta))
+                                (trace-arr-of (car (ssa-binding-inputs b)))
+                                (car in-refs) pool-idx shape strides dtype))
 
       ;; Fast im2col: extract kernel/stride/padding from morph meta; bake into ri-im2col.
       ;; The morph meta carries kernel-size/stride/padding/spatial-output from im2col-morph.
@@ -1987,25 +1969,23 @@
                               col-buf
                               N C H W KH KW SH SW PH PW OH OW out-ch col-layout)))
 
-      ;; Element-wise and all other pool-backed ops.
-      ;; VJP-emitted bindings have empty meta; get-index-fn rebuilds via trace inputs.
-      ;; classify once at compile time into flat fast-paths or generic ri-index fallback.
+      ;; Element-wise ops, materialized affine views and all other
+      ;; pool-backed ops.  VJP-emitted bindings have empty meta; get-index-fn
+      ;; rebuilds via trace inputs.  Each binding is lowered to a segop
+      ;; once, at compile time; an index function with no segop form runs on
+      ;; the host through execute-index-fn.
       (else
        (let* ((index-fn  (get-index-fn))
               (in-traces (map trace-arr-of (ssa-binding-inputs b))))
-         (cond
-           ;; Non-compute index-fns (affine, window, etc.): generic path
-           ((not (compute-index-fn? index-fn))
-            (ri-index pool-idx shape strides dtype index-fn in-refs))
-
-           ;; Element-wise ops that lower to a segop some backend accepts
-           ((compile-elementwise-segop b (compute-index-fn-combiner index-fn)
-                                       in-traces in-refs pool-idx shape strides dtype)
-            => (lambda (instr) instr))
-
-           ;; Generic fallback: compute-index-fn with non-trivial layout
-           (else
-            (ri-index pool-idx shape strides dtype index-fn in-refs))))))))
+         (or (cond
+              ((compute-index-fn? index-fn)
+               (compile-elementwise-segop b (compute-index-fn-combiner index-fn)
+                                          in-traces in-refs pool-idx shape strides dtype))
+              ((and (affine-index-fn? index-fn) (= (length in-traces) 1))
+               (compile-affine-segop index-fn (car in-traces) (car in-refs)
+                                     pool-idx shape strides dtype))
+              (else #f))
+             (compile-host-segop index-fn in-traces in-refs pool-idx shape strides dtype)))))))
 
 
 ;;; ============================================================
@@ -2272,26 +2252,6 @@
                       (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
                       (make-pool-arr pool-idx shape strides dtype))))
 
-                (ri-index (pool-idx shape strides dtype index-fn in-refs)
-                  (time-instr 'ri-index
-                    (let ((buf (vector-ref pool-bufs pool-idx)))
-                      (execute-index-fn index-fn buf shape (map deref in-refs) dtype)
-                      (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-reduce (pool-idx shape strides dtype src-dtype rop axes reducer keepdims? in-ref)
-                  (time-instr 'ri-reduce
-                    (let* ((src (deref in-ref))
-                           (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism src
-                        (concrete-array (src-data src-shape src-strides src-offset _ _ _)
-                          (execute-reduction-morphism
-                           rop buf shape
-                           src-data src-shape src-strides src-offset
-                           axes reducer keepdims? dtype src-dtype)
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else
-                         (error "execute-replay-plan ri-reduce: source not concrete" src))))))
-
                 (ri-view (view-fn in-ref)
                   (time-instr 'ri-view
                     (view-fn (deref in-ref))))
@@ -2556,8 +2516,10 @@
   (define (replay-plan-stats prog)
     "Return alist with:
        (counts . alist-of-tag.count)
-       (ri-index-shapes . list-of-(i . shape-vector))
-       (ri-reduce-specs . list-of-(i axes keepdims? shape))"
+       (ri-index-shapes . list-of-(i . shape-vector)), the positions of the
+          segops executed by the generic strided loops, gathers, host index
+          functions and the interpreter
+       (ri-reduce-specs . list-of-(i axes keepdims? shape)), the reductions"
     (let ((plan (ssa-program-replay-plan prog)))
       (if (not plan)
           '()
@@ -2569,16 +2531,15 @@
                      (tag (cases replay-instruction instr
                             (ri-gemm             (_ _ _ _ _ _ _)         'ri-gemm)
                             (ri-gemm-strided     (_ _ _ _ _ _ _)         'ri-gemm-strided)
-                            (ri-index            (_ shape _ _ _ _)
-                                                 (begin
-                                                   (stack-push! index-shapes (cons i shape))
-                                                   'ri-index))
-                            (ri-reduce           (_ shape _ _ _ _ axes _ keepdims? _)
-                                                 (begin
-                                                   (stack-push! reduce-specs (list i axes keepdims? shape))
-                                                   'ri-reduce))
                             (ri-view             (_ _)                   'ri-view)
-                            (ri-segop            (_ _ _ _ _ _ tag)       tag)
+                            (ri-segop            (_ shape _ _ sg _ tag)
+                              (when (memq tag '(segop/strided-map segop/gather
+                                                segop/host-index-fn segop/interpreted))
+                                (stack-push! index-shapes (cons i shape)))
+                              (let ((r (and (eq? (segop-kind sg) 'seg-red) (standard-reduction sg))))
+                                (when r
+                                  (stack-push! reduce-specs (list i (cadr r) (caddr r) shape))))
+                              tag)
                             (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _ _) 'ri-gemm-epilogue)
                             (ri-alias            (_ _ _ _ _)             'ri-alias)
                             (ri-im2col           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-im2col)

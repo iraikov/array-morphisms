@@ -99,12 +99,22 @@
     (apply-index-map (broadcast-index-map #(3 1) 2) #(1 5)))
   (test-error "an operand of higher rank cannot be broadcast"
     (broadcast-index-map #(2 2 2) 2))
+  (test "extra leading dimensions of extent 1 are read at index 0" #(0 0 2)
+    (apply-index-map (broadcast-index-map #(1 1 3) 1) #(2)))
+  (test "a [1] operand broadcasts to a rank-0 space" #(0)
+    (apply-index-map (broadcast-index-map #(1) 0) #()))
+  (test-assert "identity-fn between different shapes is the reshape map"
+    (let ((m (affine-index-fn->index-map (identity-fn) #(3 4) #(2 6))))
+      (every (lambda (i)
+               (equal? (apply-index-map m (linear-to-multi-index i #(3 4)))
+                       (linear-to-multi-index i #(2 6))))
+             (iota 12))))
   (test "permutation map" #(5 7 6) (apply-index-map (permutation-index-map '(1 2 0)) #(6 5 7)))
   (test "offset map" #(3 5) (apply-index-map (offset-index-map 2 '(2 0)) #(1 5)))
   (test-assert "affine index functions translate to maps"
     (every
      (lambda (fn)
-       (let ((m (affine-index-fn->index-map fn 2)))
+       (let ((m (affine-index-fn->index-map fn #(3 4) #(3 4))))
          (every (lambda (p)
                   (equal? (vector->list (apply-index-map m p))
                           (apply-affine-index-fn fn (vector->list p))))
@@ -145,7 +155,7 @@
     (let ((m (compose-index-maps (permutation-index-map '(2 0 1)) (permutation-index-map '(1 2 0)))))
       (equal? (index-map-exprs m) (index-map-exprs (identity-index-map 3)))))
   (test-assert "composition agrees with applying the maps in turn"
-    (let* ((g (affine-index-fn->index-map (diagonal-fn '(2 1) '(1 0)) 2))
+    (let* ((g (affine-index-fn->index-map (diagonal-fn '(2 1) '(1 0)) #(3 3) #(7 3)))
            (f (permutation-index-map '(1 0)))
            (fg (compose-index-maps f g)))
       (every (lambda (p) (equal? (apply-index-map fg p) (apply-index-map f (apply-index-map g p))))
@@ -454,6 +464,36 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 6 - Construction checks
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(test-group "combine semantics"
+  (let* ((data (sg-f64 '(1.0 +nan.0 3.0 -0.0 0.0 -1.0)))   ; [2 3], reduce axis 0
+         (sel (make-f64vector 3)) (opq (make-f64vector 3)))
+    (segop-interpret (sg-col-sum 'f64 2 3 (make-combine-spec 'max -inf.0 'f64)) (list data) (list sel))
+    (segop-interpret (sg-col-sum 'f64 2 3 (make-combine-spec (list 'opaque max) -inf.0 'f64))
+                     (list data) (list opq))
+    (test-assert "max replaces only by greater values: NaN is skipped, -0.0 kept first"
+      (and (eqv? 1.0 (f64vector-ref sel 0)) (eqv? 3.0 (f64vector-ref sel 2))
+           (eqv? 0.0 (f64vector-ref sel 1))))
+    (test-assert "(opaque max) applies the Scheme procedure"
+      (every sg-same? (f64vector->list opq)
+             (list (max (max -inf.0 1.0) -0.0) (max (max -inf.0 +nan.0) 0.0)
+                   (max (max -inf.0 3.0) -1.0)))))
+  (let* ((data (list->s32vector '(3 -1 4 1 -5 9)))
+         (out (make-s32vector 3 0))
+         (sr (make-seg-red #(3 2) 1
+                           (list (sg-op 's32 #(2 3) (permutation-index-map '(1 0))))
+                           (list (make-red-result (sg-op 's32 #(3) (identity-index-map 1)) '(in 0)
+                                                  (make-combine-spec 'max (- (expt 2 31)) 's32) #f)))))
+    (segop-interpret sr (list data) (list out))
+    (test "an integer accumulator starting at the dtype minimum" '(3 -1 9) (s32vector->list out)))
+  (let* ((data (sg-f64 '(0.75 0.75 0.75)))
+         (out (make-f64vector 1))
+         (sr (make-seg-red #(3) 1 (list (sg-op 'f64 #(3) (identity-index-map 1)))
+                           (list (make-red-result (sg-op 'f64 #() (identity-index-map 0)) '(in 0)
+                                                  (make-combine-spec 'add 0.0 's32) #f)))))
+    (segop-interpret sr (list data) (list out))
+    (test "an integer accumulator truncates after every step" 0.0 (f64vector-ref out 0)))
+  (test-error "an unknown accumulator dtype is an error" (make-combine-spec 'add 0.0 'c64)))
 
 (test-group "construction checks"
   (let ((id2 (lambda () (sg-op 'f64 #(2 3) (identity-index-map 2))))

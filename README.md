@@ -365,9 +365,21 @@ same formula.
 `segop-interpret` executes any `seg-map` or `seg-red` directly from its
 definition. It is slow and is meant for testing.
 
-When a replay plan is compiled, each element-wise segop is offered to the
-segop backends in turn; the first that accepts it supplies an executor, and
-the binding becomes an `ri-segop` instruction. The backends in use are the
+When a replay plan is compiled, every binding except matrix products,
+convolutions and zero-copy views is lowered to a segop:
+
+- element-wise ops become a `seg-map` whose inputs are read through
+  broadcast maps and their own strides, so transposed views are read in
+  place;
+- reductions become a `seg-red`, whose combine spec records how the
+  reduction loop rounds: f32 sums over axis 0 round after every step, sums
+  over axis 1 accumulate in double precision, and so on;
+- materialized views (such as a reshape of a transposed array) become a
+  gather, a `seg-map` with the body `(in 0)`;
+- the remaining index functions run on the host through a `seg-lib`.
+
+Each segop is offered to the segop backends in turn; the first that accepts
+it supplies an executor, and the binding becomes an `ri-segop` instruction. The backends in use are the
 value of the parameter `segop-backends`:
 
 ```scheme
@@ -379,16 +391,23 @@ value of the parameter `segop-backends`:
 ```
 
 Two backends are always present. `registry` handles the patterns that use
-the activation backend's kernels, and `scheme` handles the rest with Scheme
-loops. Replay results are the same as those of the instructions they
-replaced, bit for bit. Bindings that neither backend accepts, such as
-element-wise ops over transposed views, still compile to the generic
-`ri-index` instruction.
+the activation backend's kernels (element-wise, reduction over axis 0 or 1
+of a row-major matrix, and strided copy), and `scheme` handles the rest with
+Scheme loops; as a last resort it evaluates a segop with the reference
+interpreter. Replay results are the same as those of the instructions they
+replaced, bit for bit.
 
 The timing profile (`replay-timing-results`) and `replay-plan-stats` name
-each segop instruction by its pattern: `segop/activation-unary`,
-`segop/activation-binary`, `segop/flat-unary`, `segop/flat-binary`,
-`segop/bias-broadcast`, `segop/flat-ternary` or `segop/flat-broadcast`.
+each segop instruction by its pattern:
+
+- element-wise: `segop/activation-unary`, `segop/activation-binary`,
+  `segop/flat-unary`, `segop/flat-binary`, `segop/bias-broadcast`,
+  `segop/flat-ternary`, `segop/flat-broadcast`, and `segop/strided-map` for
+  any other layout;
+- reductions: `segop/reduce-1d`, `segop/reduce-axis0`, `segop/reduce-axis1`
+  and `segop/reduce-general`;
+- `segop/gather` for materialized views, `segop/host-index-fn` for index
+  functions run on the host, and `segop/interpreted`.
 
 ## Examples
 

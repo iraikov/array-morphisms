@@ -19,6 +19,8 @@
    execute-compute-morphism
    execute-window-morphism
    execute-reduction-morphism
+   reduction-path
+   reduction-neutral
    execute-routing-morphism
    
    ;; Value retrieval
@@ -2751,6 +2753,53 @@
       
       (else (error "Expected reduction-morphism" m))))
 
+  (define (reduction-path op src-shape src-strides src-offset src-dtype reduce-axes)
+    "The loop execute-reduction-morphism uses for reduction op over
+    reduce-axes of a source with the given layout and dtype:
+      1d       a contiguous rank-1 source reduced over its one axis;
+      axis0    a row-major rank-2 source reduced over axis 0;
+      axis1    a row-major rank-2 source reduced over axis 1;
+      general  every other case.
+    The first three apply only to sum, mean, max and min of f32 or f64
+    data; they differ from the general loop in how they accumulate (see
+    execute-reduction-morphism)."
+    (let ((rank (vector-length src-shape)))
+      (cond
+       ((not (and (memq op '(sum mean max min)) (memq src-dtype '(f32 f64)))) 'general)
+       ((and (= rank 1) (= src-offset 0) (= (vector-ref src-strides 0) 1)
+             (equal? reduce-axes '(0)))
+        '1d)
+       ((and (= rank 2) (= src-offset 0)
+             (= (vector-ref src-strides 1) 1)
+             (= (vector-ref src-strides 0) (vector-ref src-shape 1)))
+        (cond ((equal? reduce-axes '(0)) 'axis0)
+              ((equal? reduce-axes '(1)) 'axis1)
+              (else 'general)))
+       (else 'general))))
+
+  (define (reduction-neutral op dtype)
+    "The value each accumulator of reduction op starts from when the result
+    has dtype dtype: 0 for sum and mean, 1 for prod, and for max and min the
+    smallest and largest value of the dtype (minus and plus infinity for
+    floating-point dtypes)."
+    (let ((float? (memq dtype '(f32 f64))))
+      (case op
+        ((sum mean) (if float? 0.0 0))
+        ((prod)     (if float? 1.0 1))
+        ((max) (case dtype
+                 ((f32 f64) -inf.0)
+                 ((s32) (- (expt 2 31)))
+                 ((s64) (- (expt 2 63)))
+                 (else 0)))
+        ((min) (case dtype
+                 ((f32 f64) +inf.0)
+                 ((s32) (- (expt 2 31) 1))
+                 ((s64) (- (expt 2 63) 1))
+                 ((u32) (- (expt 2 32) 1))
+                 ((u64) (- (expt 2 64) 1))
+                 (else 0)))
+        (else 0.0))))
+
   (define (execute-reduction-morphism op output-buffer out-shape
                                       src-data src-shape
                                       src-strides src-offset
@@ -2788,14 +2837,9 @@
                               src-data output-buffer)
                       #t))))
 
-      ;; Fast path: 2D row-major source with a single axis reduced.
-      ;; Avoids per-element linear-to-multi-index and multi-to-linear-index calls.
-      (define (row-major-2d?)
-        (and (= src-rank 2)
-             (= src-offset 0)
-             (= (vector-ref src-strides 1) 1)
-             (= (vector-ref src-strides 0) (vector-ref src-shape 1))))
-
+      ;; The fast paths for a rank-2 row-major source with a single axis
+      ;; reduced avoid per-element linear-to-multi-index and
+      ;; multi-to-linear-index calls.
       (define (fast-reduce-2d-axis0!)
         ;; Reduce [M, N] over axis 0 -> [N]; op must be sum/mean/max/min.
         (let* ((M (vector-ref src-shape 0))
@@ -2968,14 +3012,9 @@
                      (set! acc (+ acc (f64vector-ref src-data i))))
                    (f64vector-set! output-buffer 0 (if (eq? op 'mean) (/ acc N) acc))))))))
 
-      (cond
+      (case (reduction-path op src-shape src-strides src-offset src-dtype reduce-axes)
         ;; Fast path: 1D row-major, reduce all axes (scalar result).
-        ((and (= src-rank 1)
-              (= src-offset 0)
-              (= (vector-ref src-strides 0) 1)
-              (null? (cdr reduce-axes))   ; single axis
-              (= (car reduce-axes) 0)
-              (memq op '(sum mean max min)))
+        ((1d)
           (let ((N (vector-ref src-shape 0)))
             (case src-dtype
               ((f32)
@@ -3013,25 +3052,16 @@
               (else (error "execute-reduction-morphism: unsupported dtype for 1D fast path" src-dtype)))))
 
         ;; Fast path: 2D row-major, reduce axis 0
-        ((and (row-major-2d?)
-              (equal? reduce-axes '(0))
-              (memq op '(sum mean max min)))
+        ((axis0)
          (or (kernel-reduce-2d! 0) (fast-reduce-2d-axis0!)))
 
         ;; Fast path: 2D row-major, reduce axis 1
-        ((and (row-major-2d?)
-              (equal? reduce-axes '(1))
-              (memq op '(sum mean max min)))
+        ((axis1)
          (or (kernel-reduce-2d! 1) (fast-reduce-2d-axis1!)))
 
         (else
          ;; General path: initialise output then accumulate over all source positions.
-         (let ((init-val (case op
-                           ((sum mean) 0.0)
-                           ((prod)     1.0)
-                           ((max)      -inf.0)
-                           ((min)      +inf.0)
-                           (else       0.0))))
+         (let ((init-val (reduction-neutral op out-dtype)))
            (do ((i 0 (+ i 1)))
                ((= i out-size))
              (typed-vector-set! output-buffer out-dtype i init-val)))

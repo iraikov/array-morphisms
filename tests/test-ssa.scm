@@ -17,7 +17,8 @@
         test
         (only srfi-1 iota every any map filter filter-map take drop)
         (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!
-              make-f32vector f32vector-ref f32vector-set!)
+              make-f32vector f32vector-ref f32vector-set! f32vector->list f64vector->list
+              list->s32vector s32vector->list make-s32vector make-f64vector)
         srfi-69
         datatype
         array-morphisms-core
@@ -29,6 +30,7 @@
         array-morphisms-context
         (prefix array-morphisms-grad am:)
         array-morphisms-segop
+        array-morphisms-activation-exec
         array-morphisms-ssa)
 
 
@@ -1232,26 +1234,39 @@
       (cases array-morphism a
         (concrete-array (data _ _ _ _ _ _) data)
         (else (error "with-segop-checker: not concrete" a))))
+    ;; A seg-red whose combine order the backend chooses (as the BLAS dot
+    ;; product of a rank-1 sum) is compared up to rounding.
+    (define (unspecified-order? sg)
+      (cases segop sg
+        (seg-red (space nred ins results map-outs fallback)
+          (any (lambda (r) (eq? 'unspecified (combine-spec-order (red-result-combine r)))) results))
+        (else #f)))
+    (define (agree? a b loose?)
+      (or (seg-same? a b)
+          (and loose? (<= (abs (- a b)) (* 1e-12 (max 1.0 (abs a)))))))
     (define (select sg)
       (let ((sel (parameterize ((segop-backends others))
                    (select-segop-executor sg))))
              (and sel
                   (cons (car sel)
-                        (lambda (deref buf)
-                          ((cdr sel) deref buf)
-                          (let* ((out (car (segop-outputs sg)))
-                                 (dt  (segop-operand-dtype out))
-                                 (n   (shape-size (segop-space sg)))
-                                 (ref (allocate-typed-vector dt n)))
-                            (segop-interpret sg
-                                             (map (lambda (o) (array-data (deref (segop-operand-slot o))))
-                                                  (segop-inputs sg))
-                                             (list ref))
-                            (set! checks (+ checks 1))
-                            (do ((i 0 (+ i 1))) ((= i n))
-                              (unless (seg-same? (typed-vector-ref ref dt i)
-                                                 (typed-vector-ref buf dt i))
-                                (set! mismatches (+ mismatches 1))))))))))
+                        (if (eq? (segop-kind sg) 'seg-lib)
+                            (cdr sel)
+                            (lambda (deref buf)
+                              ((cdr sel) deref buf)
+                              (let* ((out (car (segop-outputs sg)))
+                                     (dt  (segop-operand-dtype out))
+                                     (n   (shape-size (segop-operand-shape out)))
+                                     (ref (allocate-typed-vector dt n))
+                                     (loose? (unspecified-order? sg)))
+                                (segop-interpret sg
+                                                 (map (lambda (o) (array-data (deref (segop-operand-slot o))))
+                                                      (segop-inputs sg))
+                                                 (list ref))
+                                (set! checks (+ checks 1))
+                                (do ((i 0 (+ i 1))) ((= i n))
+                                  (unless (agree? (typed-vector-ref ref dt i)
+                                                  (typed-vector-ref buf dt i) loose?)
+                                    (set! mismatches (+ mismatches 1)))))))))))
     (parameterize ((segop-backends (cons (make-segop-backend 'test-checker select) others)))
       (let ((r (thunk))) (values r checks mismatches)))))
 
@@ -1320,7 +1335,9 @@
            (every (lambda (t)
                     (memq t '(segop/activation-unary segop/flat-unary segop/activation-binary
                               segop/flat-binary segop/bias-broadcast segop/flat-ternary
-                              segop/flat-broadcast)))
+                              segop/flat-broadcast segop/reduce-1d segop/reduce-axis0
+                              segop/reduce-axis1 segop/reduce-general segop/gather
+                              segop/strided-map)))
                   tags))
          (test-assert (sprintf "~A: relu keeps its symbolic body" dtype)
            (any (lambda (ts) (equal? (cases segop (cdr ts)
@@ -1529,6 +1546,358 @@
         (test-assert "a forward cast: gradient of y (f64)"
           (results-close? (list (concrete->list (caddr res)))
                           (list (list (/ 0.5 3.0) (/ -1.5 3.0) (/ 2.25 3.0))) 1e-15))))))
+
+
+;;;; ============================================================
+;;;; Reductions, gathers and strided element-wise ops as segops
+;;;;
+;;;; Forward programs are traced and replayed with the checking backend in
+;;;; place, so every reduction, gather and strided map is also evaluated by
+;;;; the reference interpreter.  Replay must reproduce the trace bit for
+;;;; bit.  The executors for host index functions, integer outputs and the
+;;;; interpreter fallback are also called directly on hand-built segops.
+;;;; ============================================================
+
+;; Element values of a concrete array, exactly as stored, in row-major order.
+(define (s2-values m)
+  (cases array-morphism m
+    (concrete-array (data shape strides offset dtype _ _)
+      (map (lambda (i) (typed-vector-ref data dtype
+                                         (multi-to-linear-index (linear-to-multi-index i shape)
+                                                                strides offset)))
+           (iota (shape-size shape))))
+    (else (error "s2-values: not concrete"))))
+
+(define (s2-same-lists? a b)
+  (and (= (length a) (length b)) (every seg-same? a b)))
+
+;; Traces the forward program of morphism m and replays it twice with the
+;; checking backend.  Returns (list prog trace replay checks mismatches),
+;; trace and replay as value lists of the output.
+(define (s2-run make-m)
+  (let-values (((r checks mismatches)
+                (with-segop-checker
+                 (lambda ()
+                   (let* ((ctx  (make-morphism-context))
+                          (prog (morphism-to-ssa (am:make-var (make-m) #f)))
+                          (tr   (s2-values (car (ssa-realize/ctx ctx prog)))))
+                     (finalize-context! ctx)
+                     (reset-context! ctx)
+                     (ssa-realize/ctx ctx prog)
+                     (reset-context! ctx)
+                     (list prog tr (s2-values (car (ssa-realize/ctx ctx prog)))))))))
+    (append r (list checks mismatches))))
+
+(define (s2-tags prog)
+  (map car (plan-segops prog)))
+
+;; A computing node, so that the reduced array is a pool buffer.
+(define (s2-src dt shape f)
+  (morph* (morph-from-list (map f (iota (apply * shape))) (list->vector shape) dt)
+          (morph-from-list '(1.0) #(1) dt)))
+
+(define (s2-val i) (case (modulo i 7) ((0) -0.0) ((3) 1e8) (else (- (* 0.37 i) 2.0))))
+
+(test-group "reductions as seg-red"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (op)
+        (for-each
+         (lambda (spec)
+           (let* ((axes (car spec)) (kd (cadr spec)) (expect (caddr spec))
+                  (r (s2-run (lambda () (morph-reduce op (s2-src dt '(3 4) s2-val) axes kd))))
+                  (name (sprintf "~A ~A over ~A~A" dt op axes (if kd " keepdims" ""))))
+             (test-assert (string-append name ": replay equals the trace")
+               (s2-same-lists? (cadr r) (caddr r)))
+             (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+             (test-assert (string-append name ": " (symbol->string (if (eq? op 'prod) 'segop/reduce-general expect)))
+               (memq (if (eq? op 'prod) 'segop/reduce-general expect) (s2-tags (car r))))))
+         '(((0) #f segop/reduce-axis0) ((1) #t segop/reduce-axis1)
+           ((0 1) #f segop/reduce-general) ((1) #f segop/reduce-axis1))))
+      '(sum mean max min prod)))
+   '(f64 f32))
+
+  (for-each
+   (lambda (case-spec)
+     (let* ((name (car case-spec)) (tag (cadr case-spec))
+            (r (s2-run (caddr case-spec))))
+       (test-assert (string-append name ": replay equals the trace") (s2-same-lists? (cadr r) (caddr r)))
+       (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+       (test-assert (string-append name ": uses " (symbol->string tag)) (memq tag (s2-tags (car r))))))
+   (list
+    (list "rank-1 f64 sum" 'segop/reduce-1d
+          (lambda () (morph-reduce 'sum (s2-src 'f64 '(7) s2-val) '(0))))
+    (list "rank-1 f32 max" 'segop/reduce-1d
+          (lambda () (morph-reduce 'max (s2-src 'f32 '(7) s2-val) '(0))))
+    (list "sum of a transposed source" 'segop/reduce-general
+          (lambda () (morph-reduce 'sum (morph-transpose (s2-src 'f64 '(3 4) s2-val) '(1 0)) '(0))))
+    (list "mean over axes 0 and 2 of a rank-3 array, keepdims" 'segop/reduce-general
+          (lambda () (morph-reduce 'mean (s2-src 'f32 '(2 3 4) s2-val) '(0 2) #t)))
+    (list "max with NaN over axis 0" 'segop/reduce-axis0
+          (lambda () (morph-reduce 'max (s2-src 'f64 '(2 3) (lambda (i) (list-ref '(1.0 +nan.0 3.0 -0.0 0.0 -1.0) i))) '(0))))
+    (list "max with NaN over both axes" 'segop/reduce-general
+          (lambda () (morph-reduce 'max (s2-src 'f64 '(2 3) (lambda (i) (list-ref '(1.0 +nan.0 3.0 -0.0 0.0 -1.0) i))))))))
+
+  (let ((r (s2-run (lambda () (morph-reduce 'sum (morph+ (morph-from-list '(3 -1 4 1 -5 9) #(2 3) 's32)
+                                                        (morph-from-list '(0) #(1) 's32))
+                                            '(0))))))
+    (test "an s32 sum over axis 0 replays correctly" '(4 -6 13) (caddr r))
+    (test-assert "the s32 sum takes the general path" (memq 'segop/reduce-general (s2-tags (car r)))))
+  (let ((r (s2-run (lambda () (morph-reduce 'max (morph+ (morph-from-list (list (expt 2 62) (+ (expt 2 62) 1) 7) #(3) 's64)
+                                                        (morph-from-list '(0) #(1) 's64)))))))
+    (test "an s64 max near 2^62 replays exactly" (list (+ (expt 2 62) 1)) (caddr r)))
+
+  (let* ((r (s2-run (lambda () (morph-reduce 'mean (s2-src 'f64 '(2 3 4) s2-val) '(2 0) #t))))
+         (prog (car r))
+         (reds (filter (lambda (ts) (eq? 'seg-red (segop-kind (cdr ts)))) (plan-segops prog))))
+    (test "standard-reduction recovers the reduction" '((mean (0 2) #t))
+      (map (lambda (ts) (let ((p (standard-reduction (cdr ts)))) (list (car p) (cadr p) (caddr p))))
+           reds))
+    (test "replay-plan-stats lists the reduction" '(((0 2) #t #(1 3 1)))
+      (map cdr (cdr (assq 'ri-reduce-specs (replay-plan-stats prog)))))))
+
+(test-group "gathers and strided element-wise ops"
+  (let ((r (s2-run (lambda () (morph-reshape (morph-transpose (s2-src 'f64 '(3 4) s2-val) '(1 0)) #(2 6))))))
+    (test-assert "a reshape of a transposed view is a gather" (memq 'segop/gather (s2-tags (car r))))
+    (test-assert "the gather replays the trace" (s2-same-lists? (cadr r) (caddr r)))
+    (test "the gather agrees with the interpreter" 0 (list-ref r 4))
+    (test "replay-plan-stats lists the gather" '(#(2 6))
+      (map cdr (cdr (assq 'ri-index-shapes (replay-plan-stats (car r)))))))
+
+  ;; With a copy kernel registered, gathers call it and give the same values.
+  (let* ((calls 0)
+         (kernel (lambda (src offset shape strides dst)
+                   (set! calls (+ calls 1))
+                   (do ((i 0 (+ i 1))) ((= i (shape-size shape)))
+                     (f32vector-set! dst i
+                       (f32vector-ref src (multi-to-linear-index (linear-to-multi-index i shape)
+                                                                 strides offset))))))
+         (bkend (make-activation-backend 'test-copy))
+         (saved (active-activation-backend))
+         (make (lambda () (morph-reshape (morph-transpose (s2-src 'f32 '(2 3 4) s2-val) '(2 0 1)) #(24)))))
+    (activation-backend-add-copy-kernel! bkend 'f32 kernel)
+    (let ((without (s2-run make)))
+      (register-activation-backend! bkend)
+      (let ((with (s2-run make)))
+        (register-activation-backend! saved)
+        (test-assert "the copy kernel is called by the gather" (> calls 0))
+        (test-assert "the copy kernel gives the same values"
+          (s2-same-lists? (caddr without) (caddr with))))))
+
+  (for-each
+   (lambda (case-spec)
+     (let ((r (s2-run (cadr case-spec))))
+       (test-assert (string-append (car case-spec) ": a strided map")
+         (memq 'segop/strided-map (s2-tags (car r))))
+       (test-assert (string-append (car case-spec) ": replay equals the trace")
+         (s2-same-lists? (cadr r) (caddr r)))
+       (test (string-append (car case-spec) ": agrees with the interpreter") 0 (list-ref r 4))))
+   (list
+    (list "exp of a transposed view"
+          (lambda () (morph-exp (morph-transpose (s2-src 'f64 '(3 4) s2-val) '(1 0)))))
+    (list "product of a transposed and a row-major array"
+          (lambda () (morph* (morph-transpose (s2-src 'f32 '(3 4) s2-val) '(1 0))
+                             (morph-from-list (map (lambda (i) (- i 5.0)) (iota 12)) #(4 3) 'f32))))
+    (list "s32 sum of a transposed view and a row-major array"
+          (lambda () (morph+ (morph-transpose (morph+ (morph-from-list (iota 6) #(2 3) 's32)
+                                                      (morph-from-list '(1) #(1) 's32))
+                                              '(1 0))
+                             (morph-from-list '(10 20 30 40 50 60) #(3 2) 's32)))))))
+
+(test-group "segop executors called directly"
+  (let* ((deref-of (lambda (alist) (lambda (slot) (cdr (assq slot alist)))))
+         (a (morph-from-list '(1.0 2.0 3.0 4.0 5.0 6.0) #(2 3) 'f64))
+         (b (morph-from-list '(10.0 20.0 30.0 40.0 50.0 60.0) #(2 3) 'f64))
+         (sel (lambda (sg) (select-segop-executor sg))))
+    ;; host index function: a stack of two arrays
+    (let* ((sl (make-seg-lib 'host-index-fn
+                             (list (make-segop-operand 'a 'f64 #(2 3) #(3 1) 0 (opaque-index-map values))
+                                   (make-segop-operand 'b 'f64 #(2 3) #(3 1) 0 (opaque-index-map values)))
+                             (list (make-segop-operand 'out 'f64 #(2 2 3) #(6 3 1) 0 (opaque-index-map values)))
+                             `((index-fn . ,(make-stack-index-fn 0)))))
+           (ex  (sel sl))
+           (buf (make-f64vector 12 0.0)))
+      (test "a host index function is selected" 'segop/host-index-fn (car ex))
+      ((cdr ex) (deref-of `((a . ,a) (b . ,b))) buf)
+      (test "the host executor stacks the inputs"
+        (s2-values (realize (morph-stack (list a b) 0)))
+        (f64vector->list buf)))
+    ;; strided map with an s64 output over a rank-0 space
+    (let* ((x  (morph-from-list '(7) #(1) 's64))
+           (sm (make-seg-map #() (list (make-segop-operand 'x 's64 #(1) #(1) 0 (broadcast-index-map #(1) 0)))
+                             (list (make-segop-operand 'out 's64 #() #() 0 (identity-index-map 0)))
+                             '((negate (in 0))) -))
+           (ex (sel sm))
+           (buf (allocate-typed-vector 's64 1)))
+      (test "a rank-0 s64 map is a strided map" 'segop/strided-map (car ex))
+      ((cdr ex) (deref-of `((x . ,x))) buf)
+      (test "the rank-0 s64 result" -7 (typed-vector-ref buf 's64 0)))
+    ;; an opaque input map falls back to the interpreter
+    (let* ((sm (make-seg-map #(3) (list (make-segop-operand 'a 'f64 #(2 3) #(3 1) 0
+                                                            (opaque-index-map (lambda (c) (vector 1 (vector-ref c 0))))))
+                             (list (make-segop-operand 'out 'f64 #(3) #(1) 0 (identity-index-map 1)))
+                             '((in 0))))
+           (ex (sel sm))
+           (buf (make-f64vector 3 0.0)))
+      (test "an opaque map is interpreted" 'segop/interpreted (car ex))
+      ((cdr ex) (deref-of `((a . ,a))) buf)
+      (test "the interpreted gather reads the second row" '(4.0 5.0 6.0) (f64vector->list buf)))))
+;;;; ============================================================
+;;;; Numerical gradient checks
+;;;;
+;;;; The gradients of the replayed plan are compared with central
+;;;; differences of the loss, realized directly from its morphism.  The
+;;;; graphs send their backward pass through transposed element-wise ops,
+;;;; gathers, reductions with keepdims and casts.  Every plan runs with the
+;;;; checking backend in place.
+;;;; ============================================================
+
+;; Parameters of the given (shape dtype) specs and values; build maps them
+;; to the loss.  Returns a make-loss thunk for seg-trace-and-replay.
+(define (gc-make-loss build specs vals)
+  (lambda ()
+    (let ((ps (map (lambda (spec v) (seg-var v (car spec) (cadr spec) #t)) specs vals)))
+      (values (build ps) ps))))
+
+(define (gc-loss-value build specs vals)
+  (let-values (((loss ps) ((gc-make-loss build specs vals))))
+    (car (concrete->list (am:var-value loss)))))
+
+;; The value v as stored in a dtype buffer.
+(define (gc-stored dtype v)
+  (if (eq? dtype 'f32)
+      (let ((b (make-f32vector 1))) (f32vector-set! b 0 v) (f32vector-ref b 0))
+      v))
+
+;; Central differences of the loss with respect to every parameter
+;; element.  The step is the difference of the stored perturbed values.
+(define (gc-numeric-grads build specs vals eps)
+  (map (lambda (spec j)
+         (map (lambda (i)
+                (let* ((dt (cadr spec))
+                       (x  (list-ref (list-ref vals j) i))
+                       (xp (gc-stored dt (+ x eps)))
+                       (xm (gc-stored dt (- x eps)))
+                       (at (lambda (xv)
+                             (gc-loss-value build specs
+                                            (map (lambda (v k)
+                                                   (if (= k j)
+                                                       (append (take v i) (list xv) (drop v (+ i 1)))
+                                                       v))
+                                                 vals (iota (length vals)))))))
+                  (/ (- (at xp) (at xm)) (- xp xm))))
+              (iota (length (list-ref vals j)))))
+       specs (iota (length specs))))
+
+(define (gc-values n seed)
+  (map (lambda (i) (* 0.8 (sin (+ (* 1.3 i) seed)))) (iota n)))
+
+;; Runs one gradient check.  The tags of the replay plan must include
+;; expect-tags.
+(define (gradcheck name build specs expect-tags #!key (eps 1e-6) (tol 1e-6))
+  (let* ((vals (map (lambda (spec k)
+                      (map (lambda (v) (gc-stored (cadr spec) v))
+                           (gc-values (apply * (car spec)) (* 0.7 k))))
+                    specs (iota (length specs))))
+         (numeric (gc-numeric-grads build specs vals eps)))
+    (let-values (((r checks mismatches)
+                  (with-segop-checker
+                   (lambda ()
+                     (let-values (((joint trace replay) (seg-trace-and-replay (gc-make-loss build specs vals))))
+                       (list joint trace replay))))))
+      (let* ((joint (car r)) (trace (cadr r)) (replay (caddr r))
+             (tags  (map car (plan-segops joint))))
+        (test-assert (string-append name ": the plan uses the expected executors")
+          (every (lambda (t) (memq t tags)) expect-tags))
+        (test-assert (string-append name ": segop executions were checked") (> checks 0))
+        (test (string-append name ": executors agree with the interpreter") 0 mismatches)
+        (test-assert (string-append name ": replay reproduces the trace") (equal? trace replay))
+        (test-assert (string-append name ": gradients match central differences")
+          (results-close? (cdr replay) numeric tol))))))
+
+(test-group "numerical gradient checks"
+  ;; transposes feeding element-wise ops
+  (gradcheck "tanh of a transpose times a row-major parameter"
+             (lambda (ps)
+               (let ((wt (am:var-transpose (car ps) '(1 0))))
+                 (am:var-sum (am:var* (am:var-tanh wt) (cadr ps)))))
+             '(((3 4) f64) ((4 3) f64))
+             '(segop/strided-map))
+  (gradcheck "a sum of two transposed views"
+             (lambda (ps)
+               (let ((s (am:var+ (am:var-transpose (car ps) '(1 0))
+                                 (am:var-exp (am:var-transpose (cadr ps) '(1 0))))))
+                 (am:var-mean (am:var* s s))))
+             '(((2 5) f64) ((2 5) f64))
+             '(segop/strided-map))
+  (gradcheck "a rank-3 permutation feeding sigmoid"
+             (lambda (ps)
+               (am:var-sum (am:var-sigmoid (am:var-transpose (car ps) '(2 0 1)))))
+             '(((2 3 4) f64))
+             '(segop/strided-map))
+  (gradcheck "a reshape of a transpose"
+             (lambda (ps)
+               (let ((r (am:var-reshape (am:var-transpose (car ps) '(1 0)) '(2 6))))
+                 (am:var-sum (am:var* (am:var-sin r) (cadr ps)))))
+             '(((3 4) f64) ((2 6) f64))
+             '(segop/gather))
+  ;; reductions with keepdims
+  (gradcheck "centering rows with a keepdims mean"
+             (lambda (ps)
+               (let* ((x (car ps))
+                      (c (am:var- x (am:var-mean x '(1) #t))))
+                 (am:var-sum (am:var* c c))))
+             '(((4 5) f64))
+             '(segop/reduce-axis1 segop/bias-broadcast))
+  (gradcheck "scaling columns by a keepdims sum"
+             (lambda (ps)
+               (let* ((x (am:var-exp (car ps)))
+                      (s (am:var-sum x '(0) #t)))
+                 (am:var-sum (am:var* (am:var/ x s) (cadr ps)))))
+             '(((3 4) f64) ((3 4) f64))
+             '(segop/reduce-axis0))
+  (gradcheck "a keepdims mean over two axes of a rank-3 array"
+             (lambda (ps)
+               (let* ((x (car ps))
+                      (m (am:var-mean (am:var* x x) '(0 2) #t)))
+                 (am:var-sum (am:var* (am:var-sqrt m) (am:var-sum x '(0 2) #t)))))
+             '(((2 3 4) f64))
+             '(segop/reduce-general segop/strided-map))
+  (gradcheck "a keepdims sum over a transposed view"
+             (lambda (ps)
+               (let* ((xt (am:var-transpose (car ps) '(1 0)))
+                      (s  (am:var-sum xt '(1) #t)))
+                 (am:var-sum (am:var* (am:var-tanh (am:var* xt s)) (cadr ps)))))
+             '(((3 4) f64) ((4 3) f64))
+             '(segop/strided-map segop/reduce-axis1))
+  ;; casts
+  (gradcheck "a cast of an f64 parameter to f32 and back"
+             (lambda (ps)
+               (let* ((x   (car ps))
+                      (x32 (am:make-var (morph-cast (am:var-value x) 'f32) #t))
+                      (y32 (am:var-tanh (am:var* x32 x32)))
+                      (y64 (am:make-var (morph-cast (am:var-value y32) 'f64) #t)))
+                 (am:var-sum (am:var* y64 (cadr ps)))))
+             '(((2 3) f64) ((2 3) f64))
+             '(segop/reduce-general)
+             eps: 1e-3 tol: 2e-4)
+  (gradcheck "an f32 parameter cast to f64"
+             (lambda (ps)
+               (let ((xc (am:make-var (morph-cast (am:var-value (car ps)) 'f64) #t)))
+                 (am:var-mean (am:var* (am:var-exp xc) (cadr ps)))))
+             '(((5) f32) ((5) f64))
+             '(segop/reduce-1d segop/strided-map)
+             eps: 1e-3 tol: 1e-4)
+  (gradcheck "a cast of a transposed view"
+             (lambda (ps)
+               (let* ((xt (am:var-transpose (car ps) '(1 0)))
+                      (xc (am:make-var (morph-cast (am:var-value xt) 'f32) #t))
+                      (yc (am:make-var (morph-cast (am:var-value (am:var-sigmoid xc)) 'f64) #t)))
+                 (am:var-sum (am:var* yc (cadr ps)))))
+             '(((3 2) f64) ((2 3) f64))
+             '(segop/strided-map)
+             eps: 1e-3 tol: 2e-4))
 
 
 (test-end)

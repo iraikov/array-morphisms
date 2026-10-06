@@ -666,6 +666,76 @@
       (morphism-values-equal? orig '(1 2 3)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Reduction paths and integer reductions
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Data of a realized reduction, as a list of exact or inexact numbers.
+(define (rz-data m)
+  (cases array-morphism (realize m)
+    (concrete-array (data shape strides offset dtype _ _)
+      (map (lambda (i) (typed-vector-ref data dtype
+                                         (multi-to-linear-index (linear-to-multi-index i shape)
+                                                                strides offset)))
+           (iota (shape-size shape))))
+    (else (error "rz-data: not concrete"))))
+
+(test-group "Reduction paths"
+  (test "a contiguous rank-1 f64 sum takes the 1d path" '1d
+    (reduction-path 'sum #(5) #(1) 0 'f64 '(0)))
+  (test "a row-major rank-2 f32 max over axis 0 takes the axis0 path" 'axis0
+    (reduction-path 'max #(3 4) #(4 1) 0 'f32 '(0)))
+  (test "a row-major rank-2 mean over axis 1 takes the axis1 path" 'axis1
+    (reduction-path 'mean #(3 4) #(4 1) 0 'f64 '(1)))
+  (test "prod always takes the general path" 'general
+    (reduction-path 'prod #(3 4) #(4 1) 0 'f64 '(0)))
+  (test "integer dtypes take the general path" '(general general general)
+    (list (reduction-path 'sum #(5) #(1) 0 's32 '(0))
+          (reduction-path 'sum #(3 4) #(4 1) 0 's32 '(0))
+          (reduction-path 'sum #(3 4) #(4 1) 0 's64 '(1))))
+  (test "a transposed or offset rank-2 source takes the general path" '(general general)
+    (list (reduction-path 'sum #(3 4) #(1 3) 0 'f64 '(0))
+          (reduction-path 'sum #(3 4) #(4 1) 2 'f64 '(0))))
+  (test "a strided rank-1 view takes the general path" 'general
+    (reduction-path 'sum #(5) #(2) 0 'f64 '(0)))
+  (test "reducing both axes takes the general path" 'general
+    (reduction-path 'sum #(3 4) #(4 1) 0 'f64 '(0 1)))
+  (test "neutral elements of floats" '(0.0 1.0 -inf.0 +inf.0)
+    (map (lambda (op) (reduction-neutral op 'f32)) '(sum prod max min)))
+  (test "neutral elements of integers"
+    (list 0 1 (- (expt 2 31)) (- (expt 2 31) 1) (- (expt 2 63)) 0 (- (expt 2 32) 1))
+    (list (reduction-neutral 'sum 's32) (reduction-neutral 'prod 's32)
+          (reduction-neutral 'max 's32) (reduction-neutral 'min 's32)
+          (reduction-neutral 'max 's64) (reduction-neutral 'max 'u32)
+          (reduction-neutral 'min 'u32))))
+
+(test-group "Integer reductions"
+  (let ((m2 (morph-from-list '(3 -1 4 1 -5 9) #(2 3) 's32))
+        (m1 (morph-from-list '(3 -1 4) #(3) 's64)))
+    (test "s32 sum over axis 0" '(4 -6 13) (rz-data (morph-reduce 'sum m2 '(0))))
+    (test "s32 sum over axis 1" '(6 5) (rz-data (morph-reduce 'sum m2 '(1))))
+    (test "s32 sum over both axes" '(11) (rz-data (morph-reduce 'sum m2)))
+    (test "s32 max and min over axis 0" '((3 -1 9) (1 -5 4))
+      (list (rz-data (morph-reduce 'max m2 '(0))) (rz-data (morph-reduce 'min m2 '(0)))))
+    (test "s32 max over both axes" '(9) (rz-data (morph-reduce 'max m2)))
+    (test "s32 prod over axis 1" '(-12 -45) (rz-data (morph-reduce 'prod m2 '(1))))
+    (test "the mean of s32 data is f64" '(2.0 -3.0 6.5) (rz-data (morph-reduce 'mean m2 '(0))))
+    (test "rank-1 s64 sum and min" '((6) (-1)) 
+      (list (rz-data (morph-reduce 'sum m1 '(0))) (rz-data (morph-reduce 'min m1 '(0)))))
+    (test "s64 max near 2^62 stays exact" (list (+ (expt 2 62) 1))
+      (rz-data (morph-reduce 'max (morph-from-list (list (expt 2 62) (+ (expt 2 62) 1) 7) #(3) 's64)
+                             '(0))))))
+
+(test-group "Reduction axes"
+  (let ((m (morph-from-list '(1.0 2.0 3.0 4.0 5.0 6.0) #(2 3) 'f64)))
+    (test "axes are kept in increasing order without repetitions" '((0 1) (0))
+      (list (cases array-morphism (morph-reduce 'sum m '(1 0))
+              (reduction-morphism (_ _ _ axes _ _ _ _) axes) (else #f))
+            (cases array-morphism (morph-reduce 'sum m '(0 0))
+              (reduction-morphism (_ _ _ axes _ _ _ _) axes) (else #f))))
+    (test "repeated axes reduce once" '(5.0 7.0 9.0) (rz-data (morph-reduce 'sum m '(0 0))))
+    (test "negative axes are normalized" '(6.0 15.0) (rz-data (morph-reduce 'sum m '(-1))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Run All Tests
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

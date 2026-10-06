@@ -89,15 +89,18 @@
 ;;; Lowering
 ;;; ------------------------------------------------------------
 
-;; True when an operand of shape in-shape broadcasts to out-shape.
+;; True when an operand of shape in-shape broadcasts to out-shape: aligned
+;; on the right, each operand extent is 1 or equals the output's, and any
+;; extra leading dimensions of the operand have extent 1.
 (define (broadcastable? in-shape out-shape)
-  (let ((k (vector-length in-shape)) (r (vector-length out-shape)))
-    (and (<= k r)
-         (let loop ((j 0))
-           (or (= j k)
-               (let ((n (vector-ref in-shape j)))
-                 (and (or (= n 1) (= n (vector-ref out-shape (+ j (- r k)))))
-                      (loop (+ j 1)))))))))
+  (let* ((k (vector-length in-shape)) (r (vector-length out-shape)) (extra (- k r)))
+    (let loop ((j 0))
+      (or (= j k)
+          (let ((n (vector-ref in-shape j)))
+            (and (if (< j extra)
+                     (= n 1)
+                     (or (= n 1) (= n (vector-ref out-shape (- j extra)))))
+                 (loop (+ j 1))))))))
 
 (define (lower-elementwise-binding b combiner in-traces in-refs pool-idx shape strides dtype)
   "The seg-map of element-wise binding b with combiner combiner, whose
@@ -250,7 +253,7 @@
 
 (define (all-flat? ins space) (every (lambda (o) (operand-flat? o space)) ins))
 
-(define (registry-select sg)
+(define (registry-elementwise-select sg)
   (with-single-output-seg-map sg
     (lambda (space ins out body fallback)
       (let ((dtype (segop-operand-dtype out))
@@ -287,7 +290,7 @@
                                               (car refs) (cadr refs) space steps dtype))))
          (else #f))))))
 
-(define (scheme-select sg)
+(define (scheme-elementwise-select sg)
   (with-single-output-seg-map sg
     (lambda (space ins out body fallback)
       (let ((dtype (segop-operand-dtype out))
@@ -315,14 +318,415 @@
                                                 space steps dtype)))))
          (else #f))))))
 
+;;; ------------------------------------------------------------
+;;; Reductions
+;;; ------------------------------------------------------------
+
+;; The combine spec that describes how execute-reduction-morphism
+;; accumulates reduction rop on path (see reduction-path) for a source of
+;; dtype src-dtype and a result of dtype out-dtype.  The 1d sum may use the
+;; BLAS dot product, whose summation order the backend chooses.  The fast
+;; paths compare (max and min replace only by a greater or smaller value);
+;; the general path applies the Scheme reducer and keeps the running value
+;; in the output, so it is rounded to the output dtype after every step.
+(define (reduction-combine-spec rop path src-dtype out-dtype)
+  (let ((sum? (memq rop '(sum mean))))
+    (case path
+      ((1d)
+       (if sum?
+           (make-combine-spec 'add 0.0 'f64 'unspecified)
+           (make-combine-spec rop (reduction-neutral rop 'f64) 'f64)))
+      ((axis0)
+       (if sum?
+           (make-combine-spec 'add 0.0 src-dtype)
+           (make-combine-spec rop (reduction-neutral rop src-dtype) src-dtype)))
+      ((axis1)
+       (if sum?
+           (make-combine-spec 'add 0.0 'f64)
+           (make-combine-spec rop (reduction-neutral rop 'f64) 'f64)))
+      (else
+       (make-combine-spec (case rop
+                            ((sum mean) 'add)
+                            ((prod)     'mul)
+                            (else       (list 'opaque (get-reduction-function rop))))
+                          (reduction-neutral rop out-dtype)
+                          out-dtype)))))
+
+(define (combine-specs-equal? a b)
+  (and (equal? (combine-spec-op a) (combine-spec-op b))
+       (eqv? (combine-spec-neutral a) (combine-spec-neutral b))
+       (eq? (combine-spec-acc-dtype a) (combine-spec-acc-dtype b))
+       (eq? (combine-spec-order a) (combine-spec-order b))))
+
+(define (lower-reduction-binding rop axes keepdims? src-tr in-ref pool-idx shape strides dtype)
+  "The seg-red of reduction rop over axes (with keepdims?) of the trace-time
+   source array src-tr, found at in-ref at replay, writing pool slot
+   pool-idx of the given shape, strides and dtype.  The space lists the
+   kept axes, then the reduced axes in increasing order.  Its combine spec
+   is the one of the loop execute-reduction-morphism takes for this layout."
+  (cases array-morphism src-tr
+    (concrete-array (_ s st off sdt _ _)
+      (let* ((rank  (vector-length s))
+             (red   (filter (lambda (k) (memv k axes)) (iota rank)))
+             (par   (filter (lambda (k) (not (memv k axes))) (iota rank)))
+             (pos   (map cons (append par red) (iota rank)))
+             (dim-of (lambda (k) `(dim ,(cdr (assv k pos)))))
+             (space (list->vector (map (lambda (k) (vector-ref s k)) (append par red))))
+             (in-map (make-index-map (list->vector (map dim-of (iota rank))) #f 0.0 #f))
+             (out-map (if keepdims?
+                          (make-index-map (list->vector
+                                           (map (lambda (k) (if (memv k red) 0 (dim-of k)))
+                                                (iota rank)))
+                                          #f 0.0 #f)
+                          (identity-index-map (length par))))
+             (count (fold (lambda (k acc) (* acc (vector-ref s k))) 1 red))
+             (path  (reduction-path rop s st off sdt red)))
+        (make-seg-red space (length red)
+                      (list (make-segop-operand in-ref sdt s st off in-map))
+                      (list (make-red-result
+                             (make-segop-operand pool-idx dtype shape strides 0 out-map)
+                             '(in 0)
+                             (reduction-combine-spec rop path sdt dtype)
+                             (and (eq? rop 'mean) `(/ (acc) ,count)))))))
+    (else (error "lower-reduction-binding: source not concrete" src-tr))))
+
+(define (standard-reduction sg)
+  "The parameters of execute-reduction-morphism that compute seg-red sg, as
+   a list (rop axes keepdims? reducer src-operand path), or #f when sg is not
+   in the form lower-reduction-binding produces, combine spec included."
+  (cases segop sg
+    (seg-red (space nred ins results map-outs fallback)
+      (and
+       (= (length ins) 1) (= (length results) 1) (null? map-outs)
+       (let* ((src  (car ins))
+              (res  (car results))
+              (out  (red-result-out res))
+              (rank (vector-length space))
+              (npar (- rank nred))
+              (exprs (index-map-exprs (segop-operand-map src)))
+              (dims (and exprs
+                         (= (vector-length exprs) rank)
+                         (every (lambda (e) (and (pair? e) (eq? (car e) 'dim))) (vector->list exprs))
+                         (map cadr (vector->list exprs)))))
+         (and
+          dims
+          (equal? (red-result-body res) '(in 0))
+          ;; kept axes in order on dims 0..npar-1, reduced axes in order after
+          (equal? (filter (lambda (d) (< d npar)) dims) (iota npar))
+          (equal? (filter (lambda (d) (>= d npar)) dims) (iota nred npar))
+          (let* ((red  (filter (lambda (k) (>= (list-ref dims k) npar)) (iota rank)))
+                 (oexprs (index-map-exprs (segop-operand-map out)))
+                 (keepdims?
+                  (cond ((and oexprs (= (vector-length oexprs) npar)
+                              (equal? (vector->list oexprs) (map (lambda (j) `(dim ,j)) (iota npar))))
+                         #f)
+                        ((and oexprs (= (vector-length oexprs) rank)
+                              (equal? (vector->list oexprs)
+                                      (map (lambda (k) (if (memv k red) 0 `(dim ,(list-ref dims k))))
+                                           (iota rank))))
+                         #t)
+                        (else 'no)))
+                 (spec (red-result-combine res))
+                 (fin  (red-result-finalize res))
+                 (count (fold (lambda (k acc) (* acc (vector-ref (segop-operand-shape src) k))) 1 red))
+                 (cop  (combine-spec-op spec))
+                 (rop  (cond ((and (eq? cop 'add) (not fin)) 'sum)
+                             ((and (eq? cop 'add) (equal? fin `(/ (acc) ,count))) 'mean)
+                             ((and (eq? cop 'mul) (not fin)) 'prod)
+                             (fin #f)
+                             ((memq cop '(max min)) cop)
+                             ((and (pair? cop) (eq? (cadr cop) max)) 'max)
+                             ((and (pair? cop) (eq? (cadr cop) min)) 'min)
+                             (else #f))))
+            (and (not (eq? keepdims? 'no))
+                 rop
+                 (let ((path (reduction-path rop (segop-operand-shape src) (segop-operand-strides src)
+                                             (segop-operand-offset src) (segop-operand-dtype src) red)))
+                   (and (combine-specs-equal?
+                         spec (reduction-combine-spec rop path (segop-operand-dtype src)
+                                                      (segop-operand-dtype out)))
+                        (list rop red keepdims? (get-reduction-function rop) src path)))))))))
+    (else #f)))
+
+(define (reduction-executor rop axes keepdims? reducer src out)
+  (let ((in-ref    (segop-operand-slot src))
+        (src-dtype (segop-operand-dtype src))
+        (out-shape (segop-operand-shape out))
+        (out-dtype (segop-operand-dtype out)))
+    (lambda (deref buf)
+      (cases array-morphism (deref in-ref)
+        (concrete-array (data s st off _ _ _)
+          (execute-reduction-morphism rop buf out-shape data s st off
+                                      axes reducer keepdims? out-dtype src-dtype))
+        (else (error "reduction: source not concrete"))))))
+
+;; (tag . executor) for a standard reduction whose path is one of paths.
+(define (select-standard-reduction sg paths)
+  (let ((r (standard-reduction sg)))
+    (and r
+         (memq (list-ref r 5) paths)
+         (let ((out (red-result-out (car (cases segop sg
+                                            (seg-red (space nred ins results map-outs fallback) results)
+                                            (else '()))))))
+           (cons (case (list-ref r 5)
+                   ((1d) 'segop/reduce-1d)
+                   ((axis0) 'segop/reduce-axis0)
+                   ((axis1) 'segop/reduce-axis1)
+                   (else 'segop/reduce-general))
+                 (reduction-executor (car r) (cadr r) (caddr r) (cadddr r) (list-ref r 4) out))))))
+
+;;; ------------------------------------------------------------
+;;; Affine gathers and host index functions
+;;; ------------------------------------------------------------
+
+(define (lower-affine-binding fn src-tr in-ref pool-idx shape strides dtype)
+  "The seg-map that materializes the affine index function fn applied to the
+   trace-time source src-tr.  A reshape (identity-fn) iterates over the
+   source's shape and writes the output buffer, viewed with that shape, in
+   row-major order; other affine functions iterate over the output shape."
+  (cases array-morphism src-tr
+    (concrete-array (_ s st off sdt _ _)
+      (let ((reshape? (cases affine-index-fn fn (identity-fn () #t) (else #f))))
+        (if reshape?
+            (make-seg-map s
+                          (list (make-segop-operand in-ref sdt s st off
+                                                    (identity-index-map (vector-length s))))
+                          (list (make-segop-operand pool-idx dtype s (compute-strides s) 0
+                                                    (identity-index-map (vector-length s))))
+                          '((in 0)))
+            (make-seg-map shape
+                          (list (make-segop-operand in-ref sdt s st off
+                                                    (affine-index-fn->index-map fn shape s)))
+                          (list (make-segop-operand pool-idx dtype shape strides 0
+                                                    (identity-index-map (vector-length shape))))
+                          '((in 0))))))
+    (else (error "lower-affine-binding: source not concrete" src-tr))))
+
+;; A placeholder map for the operands of a seg-lib, whose access pattern the
+;; library operation defines.
+(define seg-lib-operand-map (opaque-index-map (lambda (coords) coords)))
+
+(define (lower-host-index-fn fn in-traces in-refs pool-idx shape strides dtype)
+  "A seg-lib host-index-fn that evaluates index function fn on the host
+   with execute-index-fn."
+  (make-seg-lib 'host-index-fn
+                (map (lambda (tr ref)
+                       (cases array-morphism tr
+                         (concrete-array (_ s st off dt _ _)
+                           (make-segop-operand ref dt s st off seg-lib-operand-map))
+                         (else (error "lower-host-index-fn: input not concrete" tr))))
+                     in-traces in-refs)
+                (list (make-segop-operand pool-idx dtype shape strides 0 seg-lib-operand-map))
+                `((index-fn . ,fn))))
+
+(define (host-index-fn-select sg)
+  (cases segop sg
+    (seg-lib (name ins outs attrs)
+      (and (eq? name 'host-index-fn)
+           (let ((fn    (cdr (assq 'index-fn attrs)))
+                 (refs  (map segop-operand-slot ins))
+                 (shape (segop-operand-shape (car outs)))
+                 (dtype (segop-operand-dtype (car outs))))
+             (cons 'segop/host-index-fn
+                   (lambda (deref buf)
+                     (execute-index-fn fn buf shape (map deref refs) dtype))))))
+    (else #f)))
+
+;;; ------------------------------------------------------------
+;;; Strided loops
+;;; ------------------------------------------------------------
+
+;; Calls (proc offs) at every point of space in row-major order, where offs
+;; is a vector holding, for each linear form (base . coefs) of linears, the
+;; flat offset at that point.  offs is updated in place; no storage is
+;; allocated per point.
+(define (for-each-strided-point space linears proc)
+  (let* ((rank  (vector-length space))
+         (n     (length linears))
+         (coefs (list->vector (map cdr linears)))
+         (offs  (list->vector (map car linears)))
+         (idx   (make-vector rank 0)))
+    (unless (let loop ((d 0)) (and (< d rank) (or (fx= 0 (vector-ref space d)) (loop (+ d 1)))))
+      (if (fx= rank 0)
+          (proc offs)
+          (let ((last (fx- rank 1)))
+            (let outer ()
+              ;; innermost dimension
+              (let ((ext (vector-ref space last)))
+                (do ((i 0 (fx+ i 1))) ((fx= i ext))
+                  (proc offs)
+                  (do ((k 0 (fx+ k 1))) ((fx= k n))
+                    (vector-set! offs k (fx+ (vector-ref offs k)
+                                             (vector-ref (vector-ref coefs k) last)))))
+                ;; rewind the innermost dimension
+                (do ((k 0 (fx+ k 1))) ((fx= k n))
+                  (vector-set! offs k (fx- (vector-ref offs k)
+                                           (fx* ext (vector-ref (vector-ref coefs k) last))))))
+              ;; carry into the outer dimensions
+              (let carry ((d (fx- last 1)))
+                (when (fx>= d 0)
+                  (let ((v (fx+ 1 (vector-ref idx d))))
+                    (do ((k 0 (fx+ k 1))) ((fx= k n))
+                      (vector-set! offs k (fx+ (vector-ref offs k)
+                                               (vector-ref (vector-ref coefs k) d))))
+                    (if (fx< v (vector-ref space d))
+                        (begin (vector-set! idx d v) (outer))
+                        (begin
+                          (vector-set! idx d 0)
+                          (do ((k 0 (fx+ k 1))) ((fx= k n))
+                            (vector-set! offs k (fx- (vector-ref offs k)
+                                                     (fx* v (vector-ref (vector-ref coefs k) d)))))
+                          (carry (fx- d 1)))))))))))))
+
+;; The procedure storing a value v at offset i of an output of dtype dtype,
+;; converting it as execute-compute-morphism does.
+(define (strided-store dtype)
+  (case dtype
+    ((f32) (lambda (buf i v) (f32vector-set! buf i (exact->inexact v))))
+    ((f64) (lambda (buf i v) (f64vector-set! buf i (exact->inexact v))))
+    ((s32) (lambda (buf i v) (s32vector-set! buf i (inexact->exact (truncate v)))))
+    ((s64) (lambda (buf i v) (s64vector-set! buf i (inexact->exact (truncate v)))))
+    (else #f)))
+
+(define (operand-data who arr)
+  (cases array-morphism arr
+    (concrete-array (data _ _ _ _ _ _) data)
+    (else (error who "operand not concrete" arr))))
+
+;; Executor of a single-output seg-map whose operands all have linear forms.
+;; body-proc is the fallback combiner, or #f for the body (in 0).
+(define (strided-map-executor space ins out body-proc)
+  (let* ((rank   (vector-length space))
+         (refs   (map segop-operand-slot ins))
+         (dtypes (list->vector (map segop-operand-dtype ins)))
+         (n      (length ins))
+         (lins   (append (map (lambda (o) (segop-operand-linear o rank)) ins)
+                         (list (segop-operand-linear out rank))))
+         (store  (strided-store (segop-operand-dtype out)))
+         (proc   (or body-proc (lambda (x) x))))
+    (lambda (deref buf)
+      (let ((datas (list->vector (map (lambda (r) (operand-data 'strided-map (deref r))) refs))))
+        (define (arg offs k) (typed-vector-ref (vector-ref datas k) (vector-ref dtypes k)
+                                               (vector-ref offs k)))
+        (for-each-strided-point
+         space lins
+         (case n
+           ((1) (lambda (offs) (store buf (vector-ref offs 1) (proc (arg offs 0)))))
+           ((2) (lambda (offs) (store buf (vector-ref offs 2) (proc (arg offs 0) (arg offs 1)))))
+           ((3) (lambda (offs) (store buf (vector-ref offs 3)
+                                      (proc (arg offs 0) (arg offs 1) (arg offs 2)))))
+           (else (lambda (offs)
+                   (store buf (vector-ref offs n)
+                          (apply proc (map (lambda (k) (arg offs k)) (iota n))))))))))))
+
+;; Executor of a gather (body (in 0)) into a row-major output, through the
+;; active backend's copy kernel when it has one for the dtype.
+(define (gather-executor space in out)
+  (let* ((rank   (vector-length space))
+         (lin    (segop-operand-linear in rank))
+         (dtype  (segop-operand-dtype out))
+         (loop   (strided-map-executor space (list in) out #f))
+         (ref    (segop-operand-slot in)))
+    (lambda (deref buf)
+      (let ((kernel (lookup-copy-kernel (active-activation-backend) dtype)))
+        (if kernel
+            (kernel (operand-data 'gather (deref ref)) (car lin) space (cdr lin) buf)
+            (loop deref buf))))))
+
+;; True when every operand of a single-output seg-map has a linear form.
+(define (all-linear? ops rank)
+  (every (lambda (o) (segop-operand-linear o rank)) ops))
+
+(define (gather-body? body ins fallback)
+  (and (equal? body '(in 0)) (= (length ins) 1) (not fallback)))
+
+(define (registry-gather-select sg)
+  (cases segop sg
+    (seg-map (space ins outs bodies fallback)
+      (let ((rank (vector-length space)))
+        (and (= (length outs) 1)
+             (gather-body? (car bodies) ins fallback)
+             (<= rank 4)
+             (memq (segop-operand-dtype (car outs)) '(f32 f64))
+             (eq? (segop-operand-dtype (car ins)) (segop-operand-dtype (car outs)))
+             (all-linear? (append ins outs) rank)
+             (equal? (segop-operand-linear (car outs) rank) (cons 0 (compute-strides space)))
+             (every (lambda (c) (>= c 0)) (vector->list (cdr (segop-operand-linear (car ins) rank))))
+             (cons 'segop/gather (gather-executor space (car ins) (car outs))))))
+    (else #f)))
+
+(define (strided-select sg)
+  (cases segop sg
+    (seg-map (space ins outs bodies fallback)
+      (let ((rank (vector-length space)))
+        (and (= (length outs) 1)
+             (strided-store (segop-operand-dtype (car outs)))
+             (all-linear? (append ins outs) rank)
+             (cond ((gather-body? (car bodies) ins fallback)
+                    (cons 'segop/gather (strided-map-executor space ins (car outs) #f)))
+                   (fallback
+                    (cons 'segop/strided-map (strided-map-executor space ins (car outs) fallback)))
+                   (else #f)))))
+    (else #f)))
+
+;; The last resort: evaluate a single-output seg-map or a single-result
+;; seg-red with the reference interpreter.
+(define (interpreted-select sg)
+  (let ((outs (segop-outputs sg)))
+    (and (memq (segop-kind sg) '(seg-map seg-red))
+         (= (length outs) 1)
+         (let ((refs (map segop-operand-slot (segop-inputs sg))))
+           (cons 'segop/interpreted
+                 (lambda (deref buf)
+                   (segop-interpret sg (map (lambda (r) (operand-data 'interpreted (deref r))) refs)
+                                    (list buf))))))))
+
+;;; ------------------------------------------------------------
+;;; Backend registration and instruction compilation
+;;; ------------------------------------------------------------
+
+(define (registry-select sg)
+  (or (registry-elementwise-select sg)
+      (select-standard-reduction sg '(axis0 axis1))
+      (registry-gather-select sg)))
+
+(define (scheme-select sg)
+  (or (scheme-elementwise-select sg)
+      (select-standard-reduction sg '(1d axis0 axis1 general))
+      (strided-select sg)
+      (host-index-fn-select sg)
+      (interpreted-select sg)))
+
 (register-segop-backend! (make-segop-backend 'registry registry-select) 'last)
 (register-segop-backend! (make-segop-backend 'scheme scheme-select) 'last)
+
+;; The ri-segop of sg, or #f when no backend accepts it.
+(define (segop-instruction sg pool-idx shape strides dtype)
+  (and sg
+       (let ((sel (select-segop-executor sg)))
+         (and sel (ri-segop pool-idx shape strides dtype sg (cdr sel) (car sel))))))
 
 (define (compile-elementwise-segop b combiner in-traces in-refs pool-idx shape strides dtype)
   "The ri-segop instruction of element-wise binding b, or #f when the
    binding cannot be lowered or no backend accepts its segop."
-  (let ((sg (lower-elementwise-binding b combiner in-traces in-refs pool-idx shape strides dtype)))
-    (and sg
-         (let ((sel (select-segop-executor sg)))
-           (and sel
-                (ri-segop pool-idx shape strides dtype sg (cdr sel) (car sel)))))))
+  (segop-instruction
+   (lower-elementwise-binding b combiner in-traces in-refs pool-idx shape strides dtype)
+   pool-idx shape strides dtype))
+
+(define (compile-reduction-segop rop axes keepdims? src-tr in-ref pool-idx shape strides dtype)
+  "The ri-segop instruction of a reduction binding."
+  (or (segop-instruction
+       (lower-reduction-binding rop axes keepdims? src-tr in-ref pool-idx shape strides dtype)
+       pool-idx shape strides dtype)
+      (error "compile-reduction-segop: no backend accepts the reduction" rop axes)))
+
+(define (compile-affine-segop fn src-tr in-ref pool-idx shape strides dtype)
+  "The ri-segop instruction materializing affine index function fn, or #f."
+  (segop-instruction (lower-affine-binding fn src-tr in-ref pool-idx shape strides dtype)
+                     pool-idx shape strides dtype))
+
+(define (compile-host-segop fn in-traces in-refs pool-idx shape strides dtype)
+  "The ri-segop instruction evaluating index function fn on the host."
+  (or (segop-instruction (lower-host-index-fn fn in-traces in-refs pool-idx shape strides dtype)
+                         pool-idx shape strides dtype)
+      (error "compile-host-segop: no backend accepts the index function" fn)))

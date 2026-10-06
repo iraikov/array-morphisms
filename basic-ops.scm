@@ -551,11 +551,14 @@
   (let* ((shape (get-morphism-shape m))
          (rank (vector-length shape))
          
-         ;; Normalize axes (handle negative indices)
+         ;; Normalize axes (handle negative indices), in increasing order
+         ;; and without repetitions, so that every executor sees one form
          (normalized-axes 
           (if (null? axes)
               (iota rank)  ; Reduce all axes
-              (map (lambda (ax) (normalize-axis ax rank)) axes)))
+              (filter (lambda (i)
+                        (member i (map (lambda (ax) (normalize-axis ax rank)) axes)))
+                      (iota rank))))
          
          ;; Compute result shape
          (result-shape 

@@ -279,10 +279,17 @@
 (define (broadcast-index-map in-shape out-rank)
   "The map of NumPy broadcasting from an iteration space of rank out-rank to
    an operand of shape in-shape: dimensions are aligned on the right, and an
-   operand dimension of extent 1 is read at index 0."
-  (let ((k (vector-length in-shape)))
-    (when (> k out-rank)
-      (error 'broadcast-index-map "operand rank exceeds the space rank" in-shape out-rank))
+   operand dimension of extent 1 is read at index 0.  An operand of higher
+   rank than the space is allowed when its extra leading dimensions have
+   extent 1; they too are read at index 0."
+  (let* ((k (vector-length in-shape))
+         (extra (- k out-rank)))
+    (when (> extra 0)
+      (let loop ((j 0))
+        (when (< j extra)
+          (unless (= (vector-ref in-shape j) 1)
+            (error 'broadcast-index-map "operand rank exceeds the space rank" in-shape out-rank))
+          (loop (+ j 1)))))
     (make-index-map
      (list->vector
       (map (lambda (j)
@@ -302,15 +309,21 @@
                                      (iota rank) offsets))
                   #f 0.0 #f))
 
-(define (affine-index-fn->index-map fn rank)
+(define (affine-index-fn->index-map fn out-shape in-shape)
   "The index map of the affine index function fn (identity-fn,
-   permutation-fn, diagonal-fn or general-fn) over a space of rank rank."
+   permutation-fn, diagonal-fn or general-fn) from a space of shape
+   out-shape to an operand of shape in-shape.  identity-fn reinterprets the
+   operand's elements in row-major order: it is the identity map when the
+   shapes are equal and the reshape map otherwise."
   (define (affine-row coefs bias)
     (simplify-index-expr
      (fold (lambda (c d acc) (if (zero? c) acc `(+ ,acc (* ,c (dim ,d)))))
            bias coefs (iota (length coefs)))))
   (cases affine-index-fn fn
-    (identity-fn () (identity-index-map rank))
+    (identity-fn ()
+      (if (equal? out-shape in-shape)
+          (identity-index-map (vector-length out-shape))
+          (reshape-index-map out-shape in-shape)))
     (permutation-fn (perm) (permutation-index-map perm))
     (diagonal-fn (diag bias)
       (make-index-map
@@ -612,9 +625,16 @@
 ;; How the values of a reduction are combined.
 ;;   op:         add, mul, max, min, or (opaque proc) with proc a procedure
 ;;               of the accumulator and a value.
-;;   neutral:    the neutral element of op (0.0, 1.0, -inf.0, +inf.0).
-;;   acc-dtype:  f64: accumulate in double precision and round once when
-;;               storing; f32: round to single precision after every step.
+;;               max and min replace the accumulator by a value only when
+;;               the value is greater (smaller); a NaN value never
+;;               replaces it.  The Scheme procedures max and min, which
+;;               treat NaN otherwise, are written (opaque max) and
+;;               (opaque min).
+;;   neutral:    the neutral element of op (0.0, 1.0, -inf.0, +inf.0, or the
+;;               extreme values of an integer dtype).
+;;   acc-dtype:  the dtype the accumulator is rounded to after every step:
+;;               f64 accumulates in double precision, f32 rounds to single
+;;               precision, and an integer dtype truncates.
 ;;   order:      sequential: increasing index;
 ;;               blocked: fixed contiguous chunks of block-size values, each
 ;;               folded in increasing order, the chunk results then folded
@@ -637,8 +657,8 @@
       (error 'make-combine-spec "unknown combine op" op))
     (unless (number? neutral)
       (error 'make-combine-spec "neutral element must be a number" neutral))
-    (unless (memq acc-dtype '(f32 f64))
-      (error 'make-combine-spec "accumulator dtype must be f32 or f64" acc-dtype))
+    (unless (memq acc-dtype '(f32 f64 s32 s64 u32 u64))
+      (error 'make-combine-spec "unknown accumulator dtype" acc-dtype))
     (unless (memq order '(sequential blocked unspecified))
       (error 'make-combine-spec "unknown order" order))
     (when (and (eq? order 'blocked)
@@ -825,10 +845,15 @@
 ;;;; Reference interpreter
 ;;;; ============================================================
 
-(define %f32-cell (make-f32vector 1 0.0))
-(define (round-f32 x)
-  (f32vector-set! %f32-cell 0 x)
-  (f32vector-ref %f32-cell 0))
+(define %acc-cells
+  (map (lambda (dt) (cons dt (allocate-typed-vector dt 1))) '(f32 f64 s32 s64 u32 u64)))
+
+;; x rounded to dtype as storing it in an array of that dtype would round
+;; it (see typed-vector-set!).
+(define (round-to-dtype x dtype)
+  (let ((cell (cdr (assq dtype %acc-cells))))
+    (typed-vector-set! cell dtype 0 x)
+    (typed-vector-ref cell dtype 0)))
 
 (define (float-dtype? dt) (memq dt '(f32 f64)))
 
@@ -867,10 +892,10 @@
   (let ((r (case (combine-spec-op spec)
              ((add) (+ acc v))
              ((mul) (* acc v))
-             ((max) (max acc v))
-             ((min) (min acc v))
+             ((max) (if (> v acc) v acc))
+             ((min) (if (< v acc) v acc))
              (else ((cadr (combine-spec-op spec)) acc v)))))
-    (if (eq? (combine-spec-acc-dtype spec) 'f32) (round-f32 (exact->inexact r)) r)))
+    (round-to-dtype r (combine-spec-acc-dtype spec))))
 
 (define (segop-interpret s in-bufs out-bufs #!key (params '#()) (use-fallback #f))
   "Execute s directly from its definition.  in-bufs and out-bufs are lists
@@ -927,8 +952,8 @@
               (for-each
                (lambda (res buf)
                  (let* ((spec (red-result-combine res))
-                        (start (let ((n (exact->inexact (combine-spec-neutral spec))))
-                                 (if (eq? (combine-spec-acc-dtype spec) 'f32) (round-f32 n) n)))
+                        (start (round-to-dtype (combine-spec-neutral spec)
+                                               (combine-spec-acc-dtype spec)))
                         (fold-points (lambda (pts acc)
                                        (fold (lambda (r acc)
                                                (combine-step spec acc (value-at r (red-result-body res))))
