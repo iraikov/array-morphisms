@@ -14,7 +14,7 @@
 ;;;   Group 7 - Backend registry
 
 (import scheme (chicken base) test
-        (only srfi-1 every iota fold make-list)
+        (only srfi-1 every iota fold make-list filter)
         srfi-4
         datatype
         array-morphisms-core
@@ -601,5 +601,72 @@
              (not (memq b2 (segop-backends)))))
     (test "with no backends nothing is selected" #f
       (parameterize ((segop-backends '())) (select-segop-executor sm)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Body compiler
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The compiled body of e applied to args, and e evaluated directly.
+(define (bc-compiled e args) (apply (scalar-expr->procedure e (length args)) args))
+(define (bc-evaluated e args) (eval-scalar-expr e (lambda (k) (list-ref args k))))
+
+(test-group "body compiler"
+  (test-assert "every table op compiles to its combiner"
+    (every (lambda (op)
+             (let ((f (scalar-op-combiner op)) (n (scalar-op-arity op)))
+               (every (lambda (x)
+                        (let* ((args (if (= n 1) (list x) (list x 1.75)))
+                               (body (cons op (map (lambda (k) `(in ,k)) (iota n)))))
+                          (and (sg-same? (apply f args) (bc-compiled body args))
+                               (sg-same? (bc-evaluated body args) (bc-compiled body args)))))
+                      (if (memq op '(sqrt log pow)) (filter-pos sg-values) sg-values))))
+           (scalar-op-names)))
+  (test-assert "generic table ops on integer arguments give the combiner's result"
+    (every (lambda (op)
+             (let ((args (if (= (scalar-op-arity op) 1) '(7) '(7 -3))))
+               (equal? (apply (scalar-op-combiner op) args)
+                       (bc-compiled (cons op (map (lambda (k) `(in ,k)) (iota (length args)))) args))))
+           (filter scalar-op-generic? (filter (lambda (op) (not (memq op '(div pow log sqrt))))
+                                              (scalar-op-names)))))
+  (test-assert "nested bodies agree with eval-scalar-expr"
+    (every (lambda (case)
+             (sg-same? (bc-evaluated (car case) (cdr case)) (bc-compiled (car case) (cdr case))))
+           (list (cons '(add (mul (in 0) (in 1)) (relu (in 2))) '(1.5 -2.0 0.25))
+                 (cons '(if (> (in 0) 0.0) (sigmoid (in 0)) (tanh (in 1))) '(-0.3 0.8))
+                 (cons '(let* ((a (exp (in 0))) (b (* a a))) (/ b (+ a 1.0))) '(0.7))
+                 (cons '(let* ((a (in 0))) (if (< a 0.0) (let* ((a (- a))) (sqrt a)) a)) '(-4.0))
+                 (cons '(fpabs (- (in 0) (in 1))) '(1.0 3.5))
+                 (cons (list 'opaque (lambda (x y) (- (* x y) 1.0)) '(in 0) '(cast f32 (in 1))) '(2.0 0.1))
+                 (cons '(sub (cast f32 (mul (in 0) (in 0))) (cast f32 (in 1))) '(0.1 0.2))
+                 (cons 3.25 '()))))
+  (test-assert "casts round as a store would, including NaN and infinities"
+    (every (lambda (dt)
+             (every (lambda (x)
+                      (let ((cell (allocate-typed-vector dt 1)))
+                        (typed-vector-set! cell dt 0 x)
+                        (sg-same? (typed-vector-ref cell dt 0) (bc-compiled `(cast ,dt (in 0)) (list x)))))
+                    (if (memq dt '(f32 f64))
+                        sg-values
+                        '(0.0 -0.0 1.5 -2.75 3.0 -7.9 1e6 -1e6))))
+           '(f32 f64 s32 s64 u32 u64)))
+  (test "a cast to f32 of 0.1 is the f32 value" (round-to-f32 0.1) (bc-compiled '(cast f32 (in 0)) '(0.1)))
+  (test "a cast to s32 truncates towards zero" -2 (bc-compiled '(cast s32 (in 0)) '(-2.7)))
+  (test "a cast to u32 keeps the magnitude" 2 (bc-compiled '(cast u32 (in 0)) '(-2.7)))
+  (test-assert "every arity from 0 to 6 computes the sum"
+    (every (lambda (n)
+             (let ((body (let loop ((k 0) (e 0.0)) (if (= k n) e (loop (+ k 1) `(+ ,e (in ,k))))))
+                   (args (map (lambda (k) (+ 1.0 k)) (iota n))))
+               (= (bc-compiled body args) (fold + 0.0 args))))
+           '(0 1 2 3 4 6)))
+  (test-assert "the arguments keep their positions beyond three inputs"
+    (equal? '(4.0 6.0) (list (bc-compiled '(in 3) '(1.0 2.0 3.0 4.0))
+                             (bc-compiled '(in 5) '(1.0 2.0 3.0 4.0 5.0 6.0)))))
+  (test-error "a wrong number of arguments beyond three inputs is an error"
+    ((scalar-expr->procedure '(in 0) 4) 1.0 2.0))
+  (test-error "(param k) is not supported" (scalar-expr->procedure '(param 0) 0))
+  (test-error "(idx d) is not supported" (scalar-expr->procedure '(idx 0) 0))
+  (test-error "(acc) is not supported" (scalar-expr->procedure '(acc) 0))
+  (test-error "an invalid body is rejected" (scalar-expr->procedure '(relu (in 0) (in 1)) 2))
+  (test-error "an input beyond the arity is rejected" (scalar-expr->procedure '(in 2) 2)))
 
 (test-exit)

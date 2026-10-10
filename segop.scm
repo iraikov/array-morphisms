@@ -84,6 +84,7 @@
    scalar-expr-substitute-inputs
    scalar-expr-inputs
    scalar-expr-opaque?
+   scalar-expr->procedure
 
    ;; Reductions
    make-combine-spec
@@ -625,6 +626,103 @@
            (and (eq? (car e) 'cast) (scalar-expr-opaque? (caddr e)))
            (and (not (memq (car e) '(in param idx acc let* cast)))
                 (any scalar-expr-opaque? (cdr e))))))
+
+
+;;; ------------------------------------------------------------
+;;; Body compiler
+;;; ------------------------------------------------------------
+;;;
+;;; scalar-expr->procedure turns a body into a Scheme procedure when a plan
+;;; is compiled, so that executors do not walk the expression for every
+;;; element.  An op of the scalar-op table compiles to its combiner, not to
+;;; its table formula: a fused body then applies exactly the procedures that
+;;; the separate bindings applied, for integer as well as floating-point
+;;; arguments.  A cast rounds as storing the value in an array of its dtype
+;;; does (typed-vector-set!).
+;;;
+;;; Every compiled node is a procedure (node a b c v): a, b and c are the
+;;; first three inputs when the body has at most three, and v is the vector
+;;; of all inputs otherwise.  let* variables and casts use cells made when
+;;; the node is compiled, so a compiled body must not be called again while
+;;; one of its own calls is still running (an opaque procedure calling the
+;;; same compiled body).
+
+(define (scalar-expr->procedure body n-inputs)
+  "A procedure of n-inputs arguments that computes body.  The body may use
+   (in k), numbers, table ops, primitives, if, let*, cast and opaque; (param
+   k), (idx d) and (acc) are not supported."
+  (unless (scalar-expr-valid? body n-inputs 0)
+    (error 'scalar-expr->procedure "invalid body" body n-inputs))
+  (let ((wide? (> n-inputs 3)))
+    (define (compile e env)
+      (cond
+       ((number? e) (lambda (a b c v) e))
+       ((symbol? e)
+        (let ((cell (cdr (or (assq e env)
+                             (error 'scalar-expr->procedure "unbound variable" e)))))
+          (lambda (a b c v) (car cell))))
+       (else
+        (case (car e)
+          ((in)
+           (let ((k (cadr e)))
+             (cond (wide? (lambda (a b c v) (vector-ref v k)))
+                   ((= k 0) (lambda (a b c v) a))
+                   ((= k 1) (lambda (a b c v) b))
+                   (else    (lambda (a b c v) c)))))
+          ((param idx acc)
+           (error 'scalar-expr->procedure "form not supported by the body compiler" e))
+          ((if)
+           (let ((t (compile (cadr e) env))
+                 (y (compile (caddr e) env))
+                 (n (compile (cadddr e) env)))
+             (lambda (a b c v) (if (t a b c v) (y a b c v) (n a b c v)))))
+          ((let*)
+           (let loop ((bs (cadr e)) (env env) (inits '()))
+             (if (null? bs)
+                 (let ((body (compile (caddr e) env))
+                       (inits (reverse inits)))
+                   (lambda (a b c v)
+                     (for-each (lambda (init) (set-car! (car init) ((cdr init) a b c v))) inits)
+                     (body a b c v)))
+                 (let ((cell (list #f))
+                       (init (compile (cadar bs) env)))
+                   (loop (cdr bs) (cons (cons (caar bs) cell) env) (cons (cons cell init) inits))))))
+          ((cast) (compile-cast (cadr e) (compile (caddr e) env)))
+          ((opaque) (compile-call (cadr e) (map (lambda (x) (compile x env)) (cddr e))))
+          (else
+           (compile-call (if (scalar-op? (car e))
+                             (scalar-op-combiner (car e))
+                             (primitive-procedure (car e)))
+                         (map (lambda (x) (compile x env)) (cdr e))))))))
+    (define (compile-call f args)
+      (case (length args)
+        ((0) (lambda (a b c v) (f)))
+        ((1) (let ((x (car args)))
+               (lambda (a b c v) (f (x a b c v)))))
+        ((2) (let ((x (car args)) (y (cadr args)))
+               (lambda (a b c v) (f (x a b c v) (y a b c v)))))
+        (else (lambda (a b c v) (apply f (map (lambda (x) (x a b c v)) args))))))
+    (define (compile-cast dtype x)
+      (case dtype
+        ((f64) (lambda (a b c v) (exact->inexact (x a b c v))))
+        ((f32) (let ((cell (make-f32vector 1)))
+                 (lambda (a b c v)
+                   (f32vector-set! cell 0 (exact->inexact (x a b c v)))
+                   (f32vector-ref cell 0))))
+        (else (let ((cell (allocate-typed-vector dtype 1)))
+                (lambda (a b c v)
+                  (typed-vector-set! cell dtype 0 (x a b c v))
+                  (typed-vector-ref cell dtype 0))))))
+    (let ((node (compile body '())))
+      (case n-inputs
+        ((0) (lambda () (node #f #f #f #f)))
+        ((1) (lambda (x) (node x #f #f #f)))
+        ((2) (lambda (x y) (node x y #f #f)))
+        ((3) (lambda (x y z) (node x y z #f)))
+        (else (lambda args
+                (unless (= (length args) n-inputs)
+                  (error 'scalar-expr->procedure "wrong number of arguments" n-inputs args))
+                (node #f #f #f (list->vector args))))))))
 
 
 ;;;; ============================================================

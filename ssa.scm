@@ -68,6 +68,7 @@
    ssa-compute-use-counts
    ssa-fusion-eligible?
    ssa-element-wise-fusion-pass
+   segop-fusion
 
    ;; Segop lowering
    binding-scalar-body
@@ -89,6 +90,7 @@
           (only (chicken fixnum) fx+ fx- fx* fx= fx< fx>=)
           (only (chicken flonum) fp+ fp- fp* fp/ fp= fpexpt)
           (only (scheme time) current-jiffy jiffies-per-second)
+          (only (scheme base) make-parameter)
           (only srfi-1 iota fold filter map for-each append-map filter-map every any)
           (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
@@ -400,10 +402,18 @@
          (ssa-binding-has-combiner? producer)
          (ssa-binding-has-combiner? consumer))))
 
+;; True when ssa-vjp applies the element-wise fusion pass to the programs it
+;; builds.  Fusion does not change results, so turning it off gives the
+;; reference that fused programs are compared with.
+(define segop-fusion (make-parameter #t (lambda (x) (and x #t))))
+
 (define (fuse-two-ssa-bindings producer consumer)
-  "Fuse producer into consumer via combiner composition.
-   The fused binding inherits consumer's name (preserving downstream refs).
-   Producer's intermediate buffer is eliminated."
+  "Fuse producer into consumer by composing their scalar bodies.  The fused
+   binding's combiner is the compiled composed body, which rounds the
+   producer's value to the producer's dtype, so the result is the one the
+   two bindings give.  The fused binding inherits consumer's name
+   (preserving downstream refs).  Producer's intermediate buffer is
+   eliminated."
   (let* ((p-inputs (ssa-binding-inputs producer))
          (c-inputs (ssa-binding-inputs consumer))
          (c-other  (cdr c-inputs))
@@ -411,9 +421,15 @@
          (p-comb  (ssa-binding-combiner producer))
          (c-comb  (ssa-binding-combiner consumer))
          (p-nargs (length p-inputs))
-         (fused-comb (compose-flat-combiners p-comb p-nargs c-comb (length c-other)))
-         (fused-body (compose-binding-bodies (binding-scalar-body producer p-comb) p-nargs
+         ;; The producer's value is rounded to its dtype, as storing it
+         ;; would round it, so that the fused binding computes what the
+         ;; two bindings computed.  Storing a flonum as f64 changes nothing.
+         (p-dtype (ssa-binding-dtype producer))
+         (p-body  (let ((b (binding-scalar-body producer p-comb)))
+                    (if (eq? p-dtype 'f64) b `(cast ,p-dtype ,b))))
+         (fused-body (compose-binding-bodies p-body p-nargs
                                              (binding-scalar-body consumer c-comb)))
+         (fused-comb (scalar-expr->procedure fused-body (length fused-inputs)))
          (base-meta (filter (lambda (kv)
                                  (not (memq (car kv) '(combiner index-fn fused? body))))
                                (ssa-binding-meta consumer)))
@@ -1221,7 +1237,7 @@
       ;; Apply MoA psi-composition fusion to the full joint forward+backward program.
       ;; Cross-AD-boundary fusion is automatic: backward element-wise bindings
       ;; with use-count=1 are eligible under the same rules as forward ones.
-      (ssa-element-wise-fusion-pass
+      ((if (segop-fusion) ssa-element-wise-fusion-pass (lambda (p) p))
        (make-ssa-program
         (ssa-program-constants fwd-prog)
         (ssa-program-morph-to-val fwd-prog)

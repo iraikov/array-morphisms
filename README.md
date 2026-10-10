@@ -321,6 +321,13 @@ The kernels compute exactly what that Scheme code computes, so registering
 a backend changes speed, not results. Bindings produced by the element-wise
 fusion pass have a composed body and never use a kernel.
 
+The fusion pass does not change results either. A fused binding rounds
+each intermediate value to its dtype, as storing it in an array would
+(`(cast f32 ...)` in its body), so an `'f32` chain computes exactly what
+the separate bindings compute. The parameter `segop-fusion`
+(`array-morphisms-ssa`) turns the pass off: `(segop-fusion #f)` globally,
+or `(parameterize ((segop-fusion #f)) ...)` around `ssa-vjp`.
+
 No activation backend is registered by default. The `array-morphisms-crunch`
 egg provides two backends; the threaded one splits large arrays across
 threads:

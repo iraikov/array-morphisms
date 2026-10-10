@@ -1357,11 +1357,14 @@
                                        (else #f))
                                      '(relu (in 0))))
                 segs))
+         ;; an f32 producer's value is rounded to f32 inside the fused body
          (test-assert (sprintf "~A: the fused negate and exp have a composed body" dtype)
            (any (lambda (ts) (equal? (cases segop (cdr ts)
                                        (seg-map (space ins outs bodies fallback) (car bodies))
                                        (else #f))
-                                     '(exp (negate (in 0)))))
+                                     (if (eq? dtype 'f32)
+                                         '(exp (cast f32 (negate (in 0))))
+                                         '(exp (negate (in 0))))))
                 segs))
          (test-assert (sprintf "~A: the checker ran on every segop execution" dtype)
            (>= checks (* 2 (length segs))))
@@ -2314,6 +2317,114 @@
                              (list (map (lambda (j) (+ (exp (list-ref av j)) (exp (list-ref av (+ j 3)))))
                                         (iota 3)))
                              1e-12))))))
+
+
+;;;; ============================================================
+;;;; Fusion oracle
+;;;;
+;;;; A fused binding rounds each producer value to the producer's dtype,
+;;;; as storing it would, so a program computes the same results with and
+;;;; without the fusion pass.  Each graph is traced and replayed with fusion
+;;;; on and off, under the checking backend.
+;;;; ============================================================
+
+;; (list trace replay mismatches fused-bodies) for make-loss with fusion
+;; on or off.
+(define (fo-run make-loss fusion?)
+  (parameterize ((segop-fusion fusion?))
+    (let-values (((r checks mismatches)
+                  (with-segop-checker
+                   (lambda ()
+                     (let-values (((joint trace replay) (seg-trace-and-replay make-loss)))
+                       (list joint trace replay))))))
+      (list (cadr r) (caddr r) mismatches
+            (map (lambda (b) (cdr (assq 'body (ssa-binding-meta b)))) (fused-bindings (car r)))))))
+
+(define (fo-has-cast? e dt)
+  (and (pair? e)
+       (or (and (eq? (car e) 'cast) (eq? (cadr e) dt))
+           (any (lambda (x) (fo-has-cast? x dt)) (cdr e)))))
+
+(define (fo-vals n seed) (map (lambda (i) (* 0.7 (sin (+ (* 1.3 i) seed)))) (iota n)))
+
+(define fo-graphs
+  (list
+   (list "mlp f32" 'f32 (lambda () (seg-mlp-loss 'f32)))
+   (list "mlp f64" 'f64 (lambda () (seg-mlp-loss 'f64)))
+   (list "row normalization f32" 'f32
+         (lambda ()
+           (let* ((X   (seg-var (fo-vals 12 0.1) '(3 4) 'f32 #t))
+                  (g   (seg-var (fo-vals 4 0.2) '(4) 'f32 #t))
+                  (eps (seg-var '(1e-5) '(1) 'f32 #f))
+                  (ms  (am:var-mean (am:var* X X) '(1) #t))
+                  (Y   (am:var* (am:var/ X (am:var-sqrt (am:var+ ms eps))) g)))
+             (values (am:var-mean (am:var* Y Y)) (list X g)))))
+   (list "tanh(x*y + z) f32" 'f32
+         (lambda ()
+           (let* ((x (seg-var (fo-vals 6 0.3) '(2 3) 'f32 #t))
+                  (y (seg-var (fo-vals 6 0.4) '(2 3) 'f32 #t))
+                  (z (seg-var (fo-vals 6 0.5) '(2 3) 'f32 #t))
+                  (v (am:var-tanh (am:var+ (am:var* x y) z))))
+             (values (am:var-sum (am:var* v v)) (list x y z)))))
+   (list "sigmoid(tanh(x*y)) f32" 'f32
+         (lambda ()
+           (let* ((x (seg-var (fo-vals 8 0.6) '(2 4) 'f32 #t))
+                  (y (seg-var (fo-vals 8 0.7) '(2 4) 'f32 #t))
+                  (w (seg-var (fo-vals 8 0.8) '(2 4) 'f32 #f)))
+             (values (am:var-sum (am:var* (am:var-sigmoid (am:var-tanh (am:var* x y))) w))
+                     (list x y)))))
+   (list "a long f32 chain" 'f32
+         (lambda ()
+           (let* ((x (seg-var (fo-vals 10 0.9) '(2 5) 'f32 #t))
+                  (y (seg-var (fo-vals 10 1.0) '(2 5) 'f32 #t))
+                  (c (am:var-exp (am:var-negate (am:var-sigmoid (am:var-tanh (am:var* x y)))))))
+             (values (am:var-mean (am:var* c c)) (list x y)))))
+   ;; no pair fuses here (the candidates differ in dtype); fusion must
+   ;; still leave the results unchanged
+   (list "mixed f32/f64" 'none
+         (lambda ()
+           (let ((x (seg-var '(-0.7 -0.4 -0.1 0.2 0.5 0.8) '(2 3) 'f32 #t))
+                 (y (seg-var '(0.2 0.3 0.4 0.5 0.6 0.7) '(2 3) 'f64 #t)))
+             (values (am:var-mean (am:var* (am:var-sigmoid x) (am:var+ x y))) (list x y)))))))
+
+(test-group "fusion oracle"
+  (for-each
+   (lambda (g)
+     (let* ((name (car g)) (dt (cadr g)) (make (caddr g))
+            (on  (fo-run make #t))
+            (off (fo-run make #f)))
+       (unless (eq? dt 'none)
+         (test-assert (string-append name ": the fusion pass fuses bindings") (pair? (list-ref on 3))))
+       (test-assert (string-append name ": no fusion without the pass") (null? (list-ref off 3)))
+       (test-assert (string-append name ": the trace is the same with and without fusion")
+         (equal? (car on) (car off)))
+       (test-assert (string-append name ": the replay is the same with and without fusion")
+         (equal? (cadr on) (cadr off)))
+       (test (string-append name ": fused executors agree with the interpreter") 0 (caddr on))
+       (case dt
+         ((f32) (test-assert (string-append name ": a fused body rounds to f32")
+                  (any (lambda (b) (fo-has-cast? b 'f32)) (list-ref on 3))))
+         ((f64) (test-assert (string-append name ": f64 bodies have no casts")
+                  (not (any (lambda (b) (fo-has-cast? b 'f64)) (list-ref on 3))))))))
+   fo-graphs)
+
+  ;; x*y rounds to f32 before z is added.  With x = y = 1 + 2^-12 the exact
+  ;; product 1 + 2^-11 + 2^-24 rounds to 1 + 2^-11, so x*y - 1 is 2^-11;
+  ;; adding in double precision without that rounding would give
+  ;; 2^-11 + 2^-24.
+  (let* ((x0 (+ 1.0 (expt 2.0 -12)))
+         (make (lambda ()
+                 (let ((x (seg-var (list x0) '(1) 'f32 #t))
+                       (y (seg-var (list x0) '(1) 'f32 #t))
+                       (z (seg-var '(-1.0) '(1) 'f32 #t)))
+                   (values (am:var-sum (am:var+ (am:var* x y) z)) (list x y z)))))
+         (on  (fo-run make #t))
+         (off (fo-run make #f)))
+    (test-assert "x*y + z fuses with a cast at the boundary"
+      (any (lambda (b) (fo-has-cast? b 'f32)) (list-ref on 3)))
+    (test "the fused x*y + z rounds the product to f32" (expt 2.0 -11) (car (car (cadr on))))
+    (test-assert "the fused x*y + z equals the unfused result"
+      (and (equal? (car on) (car off)) (equal? (cadr on) (cadr off))))))
 
 
 (test-end)
