@@ -37,7 +37,7 @@
    ssa-binding?
    ssa-binding-name ssa-binding-op ssa-binding-inputs
    ssa-binding-shape ssa-binding-dtype ssa-binding-meta
-   ssa-program?
+   make-ssa-program ssa-program?
    ssa-program-constants ssa-program-morph-to-val
    ssa-program-bindings ssa-program-outputs ssa-program-n-params
    ssa-program-replay-plan
@@ -70,6 +70,13 @@
    ssa-element-wise-fusion-pass
    segop-fusion
 
+   ;; Segop fusion
+   ssa-segop-fusion-pass
+   ssa-fusion-graph
+   segop-fusion-max-rounds
+   ssa-fusion-pass-stats
+   make-fused-ssa-binding
+
    ;; Segop lowering
    binding-scalar-body
    standard-reduction
@@ -91,7 +98,8 @@
           (only (chicken flonum) fp+ fp- fp* fp/ fp= fpexpt)
           (only (scheme time) current-jiffy jiffies-per-second)
           (only (scheme base) make-parameter)
-          (only srfi-1 iota fold filter map for-each append-map filter-map every any)
+          (only srfi-1 iota fold filter map for-each append-map filter-map every any
+                take drop list-index)
           (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
                 f32vector f32vector? f32vector-ref f32vector-set! f32vector-length
@@ -202,10 +210,14 @@
     (view-fn  procedure?)
     (in-ref   replay-ref?))
 
-  ;; Element-wise op lowered to a segop (see segop-lower.scm).  executor
+  ;; A binding lowered to a segop (see segop-lower.scm).  executor
   ;; computes the output into the pool buffer out-pool-idx; segop is the
-  ;; seg-map it was selected for, and tag names the backend pattern, for
-  ;; timing profiles and replay-plan-stats.
+  ;; segop it was selected for, and tag names the backend pattern, for
+  ;; timing profiles and replay-plan-stats.  extra-outs lists the outputs
+  ;; after the first of a fused binding with several results, each a
+  ;; vector #(val-idx pool-idx shape strides dtype): its position in the
+  ;; vector of values and its pool buffer.  The executor of such a segop
+  ;; takes their buffers as a third argument, a list.
   (ri-segop
     (out-pool-idx integer?)
     (out-shape    vector?)
@@ -213,7 +225,8 @@
     (out-dtype    symbol?)
     (segop        segop?)
     (executor     procedure?)
-    (tag          symbol?))
+    (tag          symbol?)
+    (extra-outs   list?))
 
   ;; Alias for the epilogue binding position after a GEMM segop with a
   ;; fused epilogue (tag segop/gemm-epilogue).
@@ -402,10 +415,13 @@
          (ssa-binding-has-combiner? producer)
          (ssa-binding-has-combiner? consumer))))
 
-;; True when ssa-vjp applies the element-wise fusion pass to the programs it
-;; builds.  Fusion does not change results, so turning it off gives the
-;; reference that fused programs are compared with.
-(define segop-fusion (make-parameter #t (lambda (x) (and x #t))))
+;; The fusion policy of ssa-vjp: #t (the default) fuses the bindings whose
+;; fusion is expected to be faster, all fuses every pair that may legally
+;; be fused, and #f runs no fusion pass.  Fusion does not change results,
+;; so a program run with all and with #f gives the same values, which
+;; tests use as an oracle.
+(define segop-fusion
+  (make-parameter #t (lambda (x) (cond ((eq? x 'all) 'all) (x #t) (else #f)))))
 
 (define (fuse-two-ssa-bindings producer consumer)
   "Fuse producer into consumer by composing their scalar bodies.  The fused
@@ -507,6 +523,343 @@
            (loop (cons fused (cddr bs)) result)))
         (else
          (loop (cdr bs) (cons (car bs) result)))))))
+
+;;; ============================================================
+;;; Segop fusion
+;;;
+;;; Fuses map bindings into the map bindings that consume them, before
+;;; the program is traced.  A fused binding has op fused and computes its
+;;; members in one seg-map, described by a fusion template (see
+;;; segop-lower.scm); it takes the place of its last member, the
+;;; consumer, whose name and result it keeps.
+;;;
+;;; The pass works on a graph of uses.  Every read of a binding's value is
+;;; an edge from the reader, with a kind: fusible when a map binding reads
+;;; the value at the iteration point itself (the value has the reader's
+;;; shape), infusible for any other read, and result when the value is a
+;;; program output.  A producer P is fused into a consumer C when P is a
+;;; map binding with a single output, its only use is a fusible edge from
+;;; C, and C's body reads it once.  The value of P then never exists: every
+;;; point of the fused binding computes it, once, from P's inputs, which
+;;; are read at C's position.
+;;;
+;;; The fused body is C's body with P's body in place of its reads of P,
+;;; rounded to P's dtype as storing P's value would round it, so fusion
+;;; never changes a result.  Inputs read by both bindings are read once.
+;;;
+;;; Legality (the graph conditions, the shapes of the inputs, bounds on
+;;; the number of inputs and the size of the body) is decided apart from
+;;; profitability.  The executors of fused segops run the compiled body
+;;; on the host, and measured slower than the separate passes they replace
+;;; (whose loops are specialized for each op, or run on backend kernels),
+;;; so no fusion is profitable under the default policy.  The policy all
+;;; (see segop-fusion) fuses every legal pair.
+;;;
+;;; The driver visits the bindings from last to first and fuses into each
+;;; consumer until nothing more fuses, so a chain collapses in one visit.
+;;; Rounds are repeated while they fuse something, at most
+;;; (segop-fusion-max-rounds) times.
+;;; ============================================================
+
+;; The largest number of rounds of the fusion driver.  Stopping at this
+;; bound leaves a correct, less fused program; ssa-fusion-pass-stats
+;; reports it.
+(define segop-fusion-max-rounds
+  (make-parameter 16 (lambda (n)
+                       (if (and (integer? n) (exact? n) (> n 0))
+                           n
+                           (error 'segop-fusion-max-rounds "not a positive integer" n)))))
+
+;; Statistics of the last run of ssa-segop-fusion-pass.
+(define *fusion-pass-stats* '())
+
+(define (ssa-fusion-pass-stats)
+  "An alist describing the last run of ssa-segop-fusion-pass: rounds (the
+   rounds run), fusions (the producers fused away) and bound-reached? (true
+   when the last round still fused and the round bound stopped the pass)."
+  *fusion-pass-stats*)
+
+;; Ops that never take part in a fusion: contractions, views and the
+;; convolution family read their operands in their own patterns.
+(define fusion-barrier-ops
+  '(matmul reshape transpose broadcast-expand slice
+    im2col col2im conv2d-fwd conv2d-bwd-data conv2d-bwd-weights attention))
+
+;; The largest number of nodes in a fused body, and of its inputs.
+(define fusion-max-body-size 64)
+(define fusion-max-inputs 8)
+
+(define (fused-binding? b) (eq? (ssa-binding-op b) 'fused))
+
+(define (fused-binding-template b)
+  (cdr (assq 'template (ssa-binding-meta b))))
+
+(define (fused-binding-outs b)
+  (fusion-template-outs (fused-binding-template b)))
+
+(define (binding-members b)
+  (if (fused-binding? b) (cdr (assq 'members (ssa-binding-meta b))) (list (ssa-binding-name b))))
+
+(define (make-fused-ssa-binding inputs space in-maps outs members)
+  "A fused binding reading inputs (ssa-vtab) through in-maps, logical
+   index maps from the iteration space space.  outs lists its outputs as
+   (name shape dtype body), the binding's own result first; each body
+   reads the inputs as (in 0) ... in the order of inputs.  members names
+   the bindings it computes, in program order."
+  (let* ((n   (length inputs))
+         (fos (map (lambda (o)
+                     (make-fused-out (car o) (cadr o) (caddr o) (cadddr o)
+                                     (scalar-expr->procedure (cadddr o) n)))
+                   outs))
+         (p   (car fos)))
+    (make-ssa-binding (fused-out-name p) 'fused inputs (fused-out-shape p) (fused-out-dtype p)
+                      `((template . ,(make-fusion-template space in-maps fos))
+                        (members . ,members)
+                        (body . ,(fused-out-body p))
+                        (combiner . ,(fused-out-combiner p))))))
+
+(define (fusion-map-binding? b)
+  "True when b computes one value per point of its shape from its inputs:
+   an element-wise binding with a combiner, or a fused binding with a
+   single output."
+  (let ((op (ssa-binding-op b)))
+    (cond ((eq? op 'fused) (null? (cdr (fused-binding-outs b))))
+          ((pair? op) #f)
+          ((memq op fusion-barrier-ops) #f)
+          (else (ssa-binding-has-combiner? b)))))
+
+;; Shape and dtype table of the values of prog: binding results, extra
+;; outputs of fused bindings and constants.
+(define (fusion-value-table prog)
+  (let ((t (make-hash-table eq?)))
+    (for-each (lambda (b)
+                (if (fused-binding? b)
+                    (for-each (lambda (o)
+                                (hash-table-set! t (fused-out-name o)
+                                                 (cons (fused-out-shape o) (fused-out-dtype o))))
+                              (fused-binding-outs b))
+                    (hash-table-set! t (ssa-binding-name b)
+                                     (cons (ssa-binding-shape b) (ssa-binding-dtype b)))))
+              (ssa-program-bindings prog))
+    (hash-table-walk (ssa-program-constants prog)
+      (lambda (k v) (hash-table-set! t k (cons (morph-shape v) (morph-dtype v)))))
+    t))
+
+(define (fusion-edge-kind c shape)
+  (if (and (fusion-map-binding? c) (equal? shape (ssa-binding-shape c))) 'fusible 'infusible))
+
+;; Adds to uses the edges of binding c's reads.
+(define (add-fusion-edges! uses c vtab)
+  (let loop ((vs (ssa-binding-inputs c)) (k 0))
+    (when (pair? vs)
+      (when (ssa-binding-ref? (car vs))
+        (let ((id (ssa-value-id (car vs))))
+          (hash-table-set! uses id
+                           (append (hash-table-ref/default uses id '())
+                                   (list (list (ssa-binding-name c) k
+                                               (fusion-edge-kind
+                                                c (car (hash-table-ref vtab id)))))))))
+      (loop (cdr vs) (+ k 1)))))
+
+(define (fusion-uses prog vtab)
+  (let ((uses (make-hash-table eq?)))
+    (for-each (lambda (b) (add-fusion-edges! uses b vtab)) (ssa-program-bindings prog))
+    (for-each (lambda (ov)
+                (when (ssa-binding-ref? ov)
+                  (let ((id (ssa-value-id ov)))
+                    (hash-table-set! uses id
+                                     (append (hash-table-ref/default uses id '())
+                                             (list (list #f #f 'result)))))))
+              (ssa-program-outputs prog))
+    uses))
+
+(define (ssa-fusion-graph prog)
+  "The uses of the values of prog, as an alist from the name of a value
+   to its uses in program order, each (consumer position kind).  kind is
+   fusible, infusible or result; a result use has no consumer or position."
+  (hash-table->alist (fusion-uses prog (fusion-value-table prog))))
+
+(define (can-fuse? uses p c k)
+  "True when the graph allows fusing producer p into consumer c, of which
+   p is input k: p is a map binding whose single use is a fusible read by
+   c, a map binding whose body reads input k once.  A body reading it
+   twice (after its inputs were merged) would compute p twice."
+  (and (fusion-map-binding? p)
+       (fusion-map-binding? c)
+       (let ((u (hash-table-ref/default uses (ssa-binding-name p) '())))
+         (and (= (length u) 1)
+              (eq? (car (car u)) (ssa-binding-name c))
+              (eq? (caddr (car u)) 'fusible)))
+       (= 1 (scalar-body-input-reads (binding-scalar-body c (ssa-binding-combiner c)) k))))
+
+;; The number of occurrences of (in k) in body e.
+(define (scalar-body-input-reads e k)
+  (cond ((not (pair? e)) 0)
+        ((eq? (car e) 'in) (if (eqv? (cadr e) k) 1 0))
+        ((eq? (car e) 'opaque) (fold + 0 (map (lambda (x) (scalar-body-input-reads x k)) (cddr e))))
+        ((eq? (car e) 'cast) (scalar-body-input-reads (caddr e) k))
+        ((eq? (car e) 'let*)
+         (+ (fold + 0 (map (lambda (b) (scalar-body-input-reads (cadr b) k)) (cadr e)))
+            (scalar-body-input-reads (caddr e) k)))
+        (else (fold + 0 (map (lambda (x) (scalar-body-input-reads x k)) (cdr e))))))
+
+(define (scalar-body-size e)
+  (cond ((not (pair? e)) 1)
+        ((eq? (car e) 'in) 1)
+        ((eq? (car e) 'opaque) (+ 1 (fold + 0 (map scalar-body-size (cddr e)))))
+        ((eq? (car e) 'cast) (+ 1 (scalar-body-size (caddr e))))
+        ((eq? (car e) 'let*)
+         (+ 1 (fold + 0 (map (lambda (b) (scalar-body-size (cadr b))) (cadr e)))
+            (scalar-body-size (caddr e))))
+        (else (+ 1 (fold + 0 (map scalar-body-size (cdr e)))))))
+
+(define (fused-result-legal? f vtab)
+  "True when every input of fused binding f has its shape, and its inputs
+   and body are within the size bounds."
+  (let ((shape (ssa-binding-shape f)))
+    (and (<= (length (ssa-binding-inputs f)) fusion-max-inputs)
+         (every (lambda (v) (equal? (car (hash-table-ref vtab (ssa-value-id v))) shape))
+                (ssa-binding-inputs f))
+         (<= (scalar-body-size (cdr (assq 'body (ssa-binding-meta f)))) fusion-max-body-size))))
+
+(define (fusion-profitable? p c f vtab)
+  "True when fusing producer p into consumer c, giving f, should be done
+   under the current policy: always under all; under the default policy
+   never, as the fused segop would run on the host executors, which are
+   slower than the separate bindings' (see above)."
+  (eq? (segop-fusion) 'all))
+
+;; ins without repeated values, in order of first occurrence.
+(define (distinct-values ins)
+  (let loop ((ins ins) (acc '()))
+    (cond ((null? ins) (reverse acc))
+          ((any (lambda (v) (eq? (ssa-value-id v) (ssa-value-id (car ins)))) acc)
+           (loop (cdr ins) acc))
+          (else (loop (cdr ins) (cons (car ins) acc))))))
+
+(define (fuse-into p c k vtab)
+  "The fused binding computing producer p and consumer c, of which p is
+   input k.  Its inputs are c's with p's in place of input k, each read
+   once; its body is c's body with p's body, rounded to p's dtype, for
+   (in k)."
+  (let* ((p-ins  (ssa-binding-inputs p))
+         (c-ins  (ssa-binding-inputs c))
+         (ins    (distinct-values (append (take c-ins k) p-ins (drop c-ins (+ k 1)))))
+         (pos    (lambda (v) (list-index (lambda (u) (eq? (ssa-value-id u) (ssa-value-id v))) ins)))
+         (renum  (lambda (vs) (lambda (j) `(in ,(pos (list-ref vs j))))))
+         (p-dtype (ssa-binding-dtype p))
+         (p-body (let ((b (binding-scalar-body p (ssa-binding-combiner p))))
+                   (if (eq? p-dtype 'f64) b `(cast ,p-dtype ,b))))
+         (p-body* (scalar-expr-substitute-inputs p-body (renum p-ins)))
+         (body   (scalar-expr-substitute-inputs
+                  (binding-scalar-body c (ssa-binding-combiner c))
+                  (lambda (j) (if (= j k) p-body* ((renum c-ins) j)))))
+         (shape  (ssa-binding-shape c))
+         (rank   (vector-length shape)))
+    (make-fused-ssa-binding
+     ins shape
+     (map (lambda (v) (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) rank))
+          ins)
+     (list (list (ssa-binding-name c) shape (ssa-binding-dtype c) body))
+     (append (binding-members p) (binding-members c)))))
+
+(define (ssa-segop-fusion-pass prog)
+  "Fuse the map bindings of prog into their consumers (see above).
+   Returns a new program; prog is not changed."
+  (let* ((bv     (list->vector (ssa-program-bindings prog)))
+         (n      (vector-length bv))
+         (pos    (make-hash-table eq?))
+         (vtab (fusion-value-table prog))
+         (uses   (fusion-uses prog vtab))
+         (max-rounds (segop-fusion-max-rounds)))
+    (do ((i 0 (+ i 1))) ((= i n))
+      (hash-table-set! pos (ssa-binding-name (vector-ref bv i)) i))
+
+    (define (binding-of v)
+      (and (ssa-binding-ref? v)
+           (let ((i (hash-table-ref/default pos (ssa-value-id v) #f)))
+             (and i (vector-ref bv i)))))
+
+    ;; Replaces p and c by f at c's position, updating the uses of their
+    ;; inputs.
+    (define (commit! p c f)
+      (let ((p-name (ssa-binding-name p)) (c-name (ssa-binding-name c)))
+        (for-each (lambda (v)
+                    (when (ssa-binding-ref? v)
+                      (let ((id (ssa-value-id v)))
+                        (hash-table-set! uses id
+                                         (filter (lambda (u) (not (memq (car u) (list p-name c-name))))
+                                                 (hash-table-ref/default uses id '()))))))
+                  (append (ssa-binding-inputs p) (ssa-binding-inputs c)))
+        (hash-table-set! uses p-name '())
+        (vector-set! bv (hash-table-ref pos p-name) #f)
+        (hash-table-set! pos p-name #f)
+        (vector-set! bv (hash-table-ref pos c-name) f)
+        (add-fusion-edges! uses f vtab)))
+
+    ;; Fuses one producer into the binding at position i; true if it did.
+    (define (fuse-one! i)
+      (let ((c (vector-ref bv i)))
+        (let loop ((vs (ssa-binding-inputs c)) (k 0))
+          (and (pair? vs)
+               (or (let ((p (binding-of (car vs))))
+                     (and p
+                          (can-fuse? uses p c k)
+                          (let ((f (fuse-into p c k vtab)))
+                            (and (fused-result-legal? f vtab)
+                                 (fusion-profitable? p c f vtab)
+                                 (begin (commit! p c f) #t)))))
+                   (loop (cdr vs) (+ k 1)))))))
+
+    (define (run-round)
+      (let loop ((i (- n 1)) (count 0))
+        (if (< i 0)
+            count
+            (let ((b (vector-ref bv i)))
+              (if (and b (fusion-map-binding? b))
+                  (let fuse ((count count))
+                    (if (fuse-one! i) (fuse (+ count 1)) (loop (- i 1) count)))
+                  (loop (- i 1) count))))))
+
+    (let rounds ((r 1) (total 0))
+      (let* ((fused (run-round)) (total (+ total fused)))
+        (if (or (= fused 0) (>= r max-rounds))
+            (set! *fusion-pass-stats*
+                  `((rounds . ,r) (fusions . ,total) (bound-reached? . ,(> fused 0))))
+            (rounds (+ r 1) total))))
+
+    (make-ssa-program
+     (ssa-program-constants prog)
+     (ssa-program-morph-to-val prog)
+     (filter (lambda (b) b) (vector->list bv))
+     (ssa-program-outputs prog)
+     (ssa-program-n-params prog)
+     #f #f #f)))
+
+(define (realize-fused-binding ctx b inputs)
+  "Realize fused binding b on the concrete arrays inputs, through its segop
+   executor, the one a replay plan would select.  The outputs are
+   allocated through context ctx, or as fresh arrays when ctx is #f.
+   Returns one array per output."
+  (let* ((tpl   (fused-binding-template b))
+         (outs  (fusion-template-outs tpl))
+         (in-v  (list->vector inputs))
+         (sg    (lower-fused-binding tpl inputs (iota (length inputs)) (iota (length outs))))
+         (exec  (cdr (or (select-segop-executor sg)
+                         (error "realize-fused-binding: no backend accepts the segop"
+                                (ssa-binding-name b)))))
+         (deref (lambda (k) (vector-ref in-v k)))
+         (run!  (lambda (bufs)
+                  (if (null? (cdr bufs))
+                      (exec deref (car bufs))
+                      (exec deref (car bufs) (cdr bufs)))))
+         (specs (map (lambda (o) (cons (fused-out-shape o) (fused-out-dtype o))) outs)))
+    (if ctx
+        (realize-segop/ctx ctx inputs specs run!)
+        (let ((bufs (map (lambda (s) (allocate-typed-vector (cdr s) (shape-size (car s)))) specs)))
+          (run! bufs)
+          (map (lambda (s buf) (concrete-array buf (car s) (compute-strides (car s)) 0 (cdr s) -1 -1))
+               specs bufs)))))
 
 
 ;;; ============================================================
@@ -1234,10 +1587,10 @@
                          param-const-vals))
            (all-outputs  (cons loss-out-val grad-vals))
            (all-bindings (append fwd-bindings (reverse (stack->list bwd-bindings-stack)))))
-      ;; Apply MoA psi-composition fusion to the full joint forward+backward program.
-      ;; Cross-AD-boundary fusion is automatic: backward element-wise bindings
-      ;; with use-count=1 are eligible under the same rules as forward ones.
-      ((if (segop-fusion) ssa-element-wise-fusion-pass (lambda (p) p))
+      ;; Fuse the joint forward+backward program.  Fusion crosses the AD
+      ;; boundary: backward element-wise bindings are fused under the same
+      ;; rules as forward ones.
+      ((if (segop-fusion) ssa-segop-fusion-pass (lambda (p) p))
        (make-ssa-program
         (ssa-program-constants fwd-prog)
         (ssa-program-morph-to-val fwd-prog)
@@ -1451,11 +1804,14 @@
     ;; Execute bindings in topological order
     (for-each
      (lambda (b)
-       (let* ((inputs (map (lambda (v)
-                             (hash-table-ref values (ssa-value-id v)))
-                           (ssa-binding-inputs b)))
-              (result (realize (rebuild-morphism b inputs))))
-         (hash-table-set! values (ssa-binding-name b) result)))
+       (let ((inputs (map (lambda (v)
+                            (hash-table-ref values (ssa-value-id v)))
+                          (ssa-binding-inputs b))))
+         (if (fused-binding? b)
+             (for-each (lambda (o r) (hash-table-set! values (fused-out-name o) r))
+                       (fused-binding-outs b) (realize-fused-binding #f b inputs))
+             (hash-table-set! values (ssa-binding-name b)
+                              (realize (rebuild-morphism b inputs))))))
      (ssa-program-bindings prog))
     ;; Collect outputs
     (map (lambda (ov)
@@ -1712,13 +2068,16 @@
 ;;; Replay Plan: compile-one-instruction
 ;;; ============================================================
 
-(define (compile-one-instruction b in-refs pool-idx trace-info-env constants)
+(define (compile-one-instruction b in-refs pool-idx trace-info-env constants
+                                 #!optional (extra-outs '()))
   "Compile one SSA binding into a replay-instruction.
    b:               ssa-binding
    in-refs:         list of replay-ref? (already compiled from inputs)
    pool-idx:        integer (physical buffer slot) or -1 (zero-copy)
    trace-info-env:  morph-env bid-sym -> (concrete-array . is-pool?)
-   constants:       hash-table cid-sym -> concrete-array"
+   constants:       hash-table cid-sym -> concrete-array
+   extra-outs:      for a fused binding with several outputs, the outputs
+                    after the first (see ri-segop)"
   (let* ((op        (ssa-binding-op b))
          (meta      (ssa-binding-meta b))
          (shape     (ssa-binding-shape b))
@@ -1763,6 +2122,12 @@
                                    op meta)))))))))
 
     (cond
+      ;; Fused binding: its template lowered against the trace-time inputs.
+      ((fused-binding? b)
+       (compile-fused-segop (fused-binding-template b)
+                            (map trace-arr-of (ssa-binding-inputs b))
+                            in-refs pool-idx extra-outs shape strides dtype))
+
       ;; Zero-copy view: any op where the trace did not allocate (counter not incremented).
       ;; Only transpose and reshape produce zero-copy views in practice.
       ((not is-pool?)
@@ -2008,12 +2373,23 @@
          (constants   (ssa-program-constants prog))
          (trace-info  (ssa-program-trace-info prog))
          (plan-vec    (make-vector n #f))
-         ;; Map binding name -> 0-based position in bindings list
+         ;; Map binding name -> 0-based position in bindings list.  The
+         ;; outputs after the first of fused bindings take the positions
+         ;; after the bindings'.
          (name->pos-eb (let ((eb (make-env-builder)))
                          (let loop ((bs bindings) (i 0))
                            (unless (null? bs)
                              (env-builder-extend! eb (ssa-binding-name (car bs)) i)
                              (loop (cdr bs) (+ i 1))))
+                         (let loop ((bs bindings) (j n))
+                           (unless (null? bs)
+                             (loop (cdr bs)
+                                   (if (fused-binding? (car bs))
+                                       (fold (lambda (o j)
+                                               (env-builder-extend! eb (fused-out-name o) j)
+                                               (+ j 1))
+                                             j (cdr (fused-binding-outs (car bs))))
+                                       j))))
                          eb)))
     ;; Detect GEMM bindings whose only consumer is an adjacent element-wise
     ;; binding of the same shape and dtype that compiles to a flat unary or
@@ -2052,7 +2428,8 @@
                        (cases ssa-value in0
                          (binding-ref (bid) (eq? bid (ssa-binding-name g)))
                          (else #f)))
-                     (ssa-binding-elementwise? e))
+                     (ssa-binding-elementwise? e)
+                     (not (and (fused-binding? e) (pair? (cdr (fused-binding-outs e))))))
             ;; Try to compile e as a flat instruction
             (let* ((e-in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
                                     (ssa-binding-inputs e)))
@@ -2082,7 +2459,7 @@
               ;; of g's inputs; the pair is then left unfused.
               (unless (memv e-pool-idx (filter-map input-pool-idx (ssa-binding-inputs g)))
                 (cases replay-instruction e-instr
-                  (ri-segop (_ e-shape _ e-dtype e-sg _ tag)
+                  (ri-segop (_ e-shape _ e-dtype e-sg _ tag _)
                     ;; The product is stored in e's buffer, so e must have g's
                     ;; shape and dtype, as must a bias.
                     (when (and (memq tag '(segop/flat-unary segop/activation-unary
@@ -2099,7 +2476,7 @@
                                                           e-sg)))
                         (when (and fused
                                    (cases replay-instruction fused
-                                     (ri-segop (_ _ _ _ _ _ tag) (eq? tag 'segop/gemm-epilogue))
+                                     (ri-segop (_ _ _ _ _ _ tag _) (eq? tag 'segop/gemm-epilogue))
                                      (else #f)))
                           (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g) fused)
                           (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i)))))
@@ -2137,8 +2514,23 @@
                           (is-pool? (cdr info))
                           (pool-idx (if is-pool?
                                         (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
-                                        -1)))
-                     (compile-one-instruction b in-refs pool-idx trace-info constants))))))
+                                        -1))
+                          (extra-outs
+                           (if (fused-binding? b)
+                               (map (lambda (o)
+                                      (let* ((name  (fused-out-name o))
+                                             (oinfo (or (morph-env-lookup trace-info name)
+                                                        (error "compile-replay-plan: no trace-info for output"
+                                                               name)))
+                                             (shape (fused-out-shape o)))
+                                        (vector (env-builder-lookup name->pos-eb name)
+                                                (context-alloc->pool-idx
+                                                 ctx (concrete-alloc-id (car oinfo)))
+                                                shape (compute-strides shape) (fused-out-dtype o))))
+                                    (cdr (fused-binding-outs b)))
+                               '())))
+                     (compile-one-instruction b in-refs pool-idx trace-info constants
+                                              extra-outs))))))
           (vector-set! plan-vec i instr)
           (loop (cdr bs) (+ i 1)))))
 
@@ -2213,7 +2605,14 @@
    Returns:   vector of concrete-array, one per binding position."
   (let* ((n         (vector-length plan))
          (pool-bufs (buffer-pool-buffers pool))
-         (vals      (make-vector n #f))
+         ;; one value per instruction, then the outputs after the first of
+         ;; the segops with several outputs
+         (n-vals    (do ((i 0 (+ i 1))
+                         (m n (cases replay-instruction (vector-ref plan i)
+                                (ri-segop (_ _ _ _ _ _ _ extra-outs) (+ m (length extra-outs)))
+                                (else m))))
+                        ((= i n) m)))
+         (vals      (make-vector n-vals #f))
          ;; alloc-ctr mirrors the trace-time context counter so that pool-backed
          ;; bindings get the same alloc-id here as they did during the trace run.
          ;; Zero-copy (ri-view) bindings don't increment this, matching the trace.
@@ -2248,10 +2647,24 @@
                   (time-instr 'ri-view
                     (view-fn (deref in-ref))))
 
-                (ri-segop (pool-idx shape strides dtype sg executor tag)
+                (ri-segop (pool-idx shape strides dtype sg executor tag extra-outs)
                   (time-instr tag
-                    (executor deref (vector-ref pool-bufs pool-idx))
-                    (make-pool-arr pool-idx shape strides dtype)))
+                    (if (null? extra-outs)
+                        (begin
+                          (executor deref (vector-ref pool-bufs pool-idx))
+                          (make-pool-arr pool-idx shape strides dtype))
+                        ;; the outputs take alloc-ids in order, as in the trace
+                        (begin
+                          (executor deref (vector-ref pool-bufs pool-idx)
+                                    (map (lambda (e) (vector-ref pool-bufs (vector-ref e 1)))
+                                         extra-outs))
+                          (let ((first (make-pool-arr pool-idx shape strides dtype)))
+                            (for-each (lambda (e)
+                                        (vector-set! vals (vector-ref e 0)
+                                                     (make-pool-arr (vector-ref e 1) (vector-ref e 2)
+                                                                    (vector-ref e 3) (vector-ref e 4))))
+                                      extra-outs)
+                            first)))))
 
                 (ri-alias (pool-idx shape strides dtype in-ref)
                   ;; The epilogue was applied in place by the preceding GEMM segop.
@@ -2429,9 +2842,22 @@
          ;; Pre-populate constants (values is kept as hash-table: hot O(1) lookup path)
          (hash-table-walk constants
            (lambda (k v) (hash-table-set! values k v)))
-         ;; Execute each binding; record trace-info
+         ;; Execute each binding; record trace-info.  A fused binding runs
+         ;; its segop executor and allocates one buffer per output, each a
+         ;; value of its own.
          (for-each
           (lambda (b)
+           (if (fused-binding? b)
+            (let ((inputs (map (lambda (v) (hash-table-ref values (ssa-value-id v)))
+                               (ssa-binding-inputs b))))
+              (for-each
+               (lambda (o result)
+                 (let ((name (fused-out-name o)))
+                   (when (and trace-mode? (env-builder-lookup output-bids-eb name))
+                     (context-pin-output! ctx (concrete-alloc-id result)))
+                   (hash-table-set! values name result)
+                   (env-builder-extend! trace-info-eb name (cons result #t))))
+               (fused-binding-outs b) (realize-fused-binding ctx b inputs)))
             (let* ((inputs     (map (lambda (v) (hash-table-ref values (ssa-value-id v)))
                                     (ssa-binding-inputs b)))
                    (is-output? (env-builder-lookup output-bids-eb (ssa-binding-name b)))
@@ -2457,7 +2883,7 @@
                         result)))
               (hash-table-set! values (ssa-binding-name b) stored)
               ;; Record per-binding (concrete-array . is-pool?) for replay-plan compilation
-              (env-builder-extend! trace-info-eb (ssa-binding-name b) (cons result is-pool?))))
+              (env-builder-extend! trace-info-eb (ssa-binding-name b) (cons result is-pool?)))))
           bindings)
          ;; Save morph-env snapshot for lazy replay-plan compilation
          (ssa-program-trace-info-set! prog (env-builder-env trace-info-eb))
@@ -2504,7 +2930,7 @@
               (let* ((instr (vector-ref plan i))
                      (tag (cases replay-instruction instr
                             (ri-view             (_ _)                   'ri-view)
-                            (ri-segop            (_ shape _ _ sg _ tag)
+                            (ri-segop            (_ shape _ _ sg _ tag _)
                               (when (memq tag '(segop/strided-map segop/gather
                                                 segop/host-index-fn segop/interpreted))
                                 (stack-push! index-shapes (cons i shape)))

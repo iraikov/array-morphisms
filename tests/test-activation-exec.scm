@@ -283,14 +283,22 @@
         (list (plan-count joint 'segop/activation-unary)
               (> (plan-count joint 'segop/flat-unary) 0)))))
 
-  (test "sigmoid fused with its producer is not an activation-unary segop"
-    ;; negate's output feeds only sigmoid, so the fusion pass merges the
-    ;; two into one binding with op sigmoid and combiner sigmoid(-x).
-    ;; Only the backward sigmoid-deriv may use the activation instruction.
-    1
+  (test "sigmoid after negate keeps its activation-unary segop"
+    ;; Under the default fusion policy nothing is fused on the host, so
+    ;; sigmoid and the backward sigmoid-deriv both use the activation
+    ;; instruction.
+    2
     (let* ((xv (param-var '(0.5 -1.0 2.0) '(3) 'f64))
            (loss (am:var-mean (am:var-sigmoid (am:var-negate xv)))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
+        (plan-count joint 'segop/activation-unary))))
+
+  (test "under the fusion policy all, sigmoid(-x) and sigmoid-deriv are fused"
+    0
+    (let* ((xv (param-var '(0.5 -1.0 2.0) '(3) 'f64))
+           (loss (am:var-mean (am:var-sigmoid (am:var-negate xv)))))
+      (let-values (((joint _) (parameterize ((segop-fusion 'all))
+                                (trace-and-replay loss (list xv)))))
         (plan-count joint 'segop/activation-unary))))
 
   (test "an activation right after a matmul is still a GEMM epilogue"
@@ -388,8 +396,9 @@
             (count-of counts 'sigmoid)
             (count-of counts 'sigmoid-deriv))))
 
-  (test "fused sigmoid(-x) is computed by its combiner, not the sigmoid kernel"
+  (test "sigmoid(-x) keeps the sigmoid kernel when the backend has one"
     #t
+    ;; negate is not fused into sigmoid, so the kernel computes sigmoid
     (let* ((xs '(0.5 -1.0 2.0))
            (r (replay-both
                (lambda ()
@@ -398,9 +407,9 @@
                                      (list xv))))))
            (without (car r)) (with (cadr r)) (counts (caddr r))
            (expected-loss (/ (apply + (map (lambda (x) (ae-sigmoid (- x))) xs)) 3.0)))
-      (and (equal? without with)
-           (= 0 (count-of counts 'sigmoid))
-           (ae-approx= (car (car with)) expected-loss))))
+      (and (= 1 (count-of counts 'sigmoid))
+           (ae-approx= (car (car with)) expected-loss)
+           (ae-approx= (car (car without)) expected-loss))))
 
   (test "the kernel's output is what the replay returns"
     ;; With the marker backend, relu's forward values all become 42.0.

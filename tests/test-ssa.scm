@@ -15,7 +15,7 @@
 
 (import scheme (chicken base) (chicken format)
         test
-        (only srfi-1 iota every any map filter filter-map take drop fold)
+        (only srfi-1 iota every any map filter filter-map take drop fold delete-duplicates)
         (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!
               make-f32vector f32vector-ref f32vector-set! f32vector->list f64vector->list
               list->s32vector s32vector->list make-s32vector make-f64vector)
@@ -1053,7 +1053,7 @@
       ((>= i (vector-length plan)) #f)
       (else
        (cases replay-instruction (vector-ref plan i)
-         (ri-segop (_ _ _ _ _ _ tag)
+         (ri-segop (_ _ _ _ _ _ tag _)
            (or (eq? tag 'segop/gemm-epilogue) (loop (+ i 1))))
          (else (loop (+ i 1))))))))
 
@@ -1262,22 +1262,33 @@
                   (cons (car sel)
                         (if (eq? (segop-kind sg) 'seg-lib)
                             (cdr sel)
-                            (lambda (deref buf)
-                              ((cdr sel) deref buf)
-                              (let* ((out (car (segop-outputs sg)))
-                                     (dt  (segop-operand-dtype out))
-                                     (n   (shape-size (segop-operand-shape out)))
-                                     (ref (allocate-typed-vector dt n))
+                            ;; extra-bufs holds the buffers of the outputs
+                            ;; after the first, for a segop with several
+                            (lambda (deref buf #!optional (extra-bufs '()))
+                              (if (null? extra-bufs)
+                                  ((cdr sel) deref buf)
+                                  ((cdr sel) deref buf extra-bufs))
+                              (let* ((outs (segop-outputs sg))
+                                     (bufs (cons buf extra-bufs))
+                                     (refs (map (lambda (o)
+                                                  (allocate-typed-vector
+                                                   (segop-operand-dtype o)
+                                                   (shape-size (segop-operand-shape o))))
+                                                outs))
                                      (loose? (unspecified-order-tolerance sg)))
                                 (segop-interpret sg
                                                  (map (lambda (o) (array-data (deref (segop-operand-slot o))))
                                                       (segop-inputs sg))
-                                                 (list ref))
+                                                 refs)
                                 (set! checks (+ checks 1))
-                                (do ((i 0 (+ i 1))) ((= i n))
-                                  (unless (agree? (typed-vector-ref ref dt i)
-                                                  (typed-vector-ref buf dt i) loose?)
-                                    (set! mismatches (+ mismatches 1)))))))))))
+                                (for-each
+                                 (lambda (o ref buf)
+                                   (let ((dt (segop-operand-dtype o)))
+                                     (do ((i 0 (+ i 1))) ((= i (shape-size (segop-operand-shape o))))
+                                       (unless (agree? (typed-vector-ref ref dt i)
+                                                       (typed-vector-ref buf dt i) loose?)
+                                         (set! mismatches (+ mismatches 1))))))
+                                 outs refs bufs))))))))
     (parameterize ((segop-backends (cons (make-segop-backend 'test-checker select) others)))
       (let ((r (thunk))) (values r checks mismatches)))))
 
@@ -1294,7 +1305,7 @@
   (let ((plan (ssa-program-replay-plan joint)))
     (filter-map (lambda (instr)
                   (cases replay-instruction instr
-                    (ri-segop (_ _ _ _ sg _ tag) (cons tag sg))
+                    (ri-segop (_ _ _ _ sg _ tag _) (cons tag sg))
                     (else #f)))
                 (vector->list plan))))
 
@@ -1334,8 +1345,10 @@
      (let-values (((r checks mismatches)
                    (with-segop-checker
                     (lambda ()
+                      ;; the policy all, so that negate is fused into exp
                       (let-values (((joint trace replay)
-                                    (seg-trace-and-replay (lambda () (seg-mlp-loss dtype)))))
+                                    (parameterize ((segop-fusion 'all))
+                                      (seg-trace-and-replay (lambda () (seg-mlp-loss dtype))))))
                         (list joint trace replay))))))
        (let* ((joint (car r)) (trace (cadr r)) (replay (caddr r))
               (segs (plan-segops joint))
@@ -1440,7 +1453,21 @@
               a b)))
 
 (define (fused-bindings joint)
-  (filter (lambda (b) (assq 'fused? (ssa-binding-meta b))) (ssa-program-bindings joint)))
+  (filter (lambda (b) (or (eq? (ssa-binding-op b) 'fused) (assq 'fused? (ssa-binding-meta b))))
+          (ssa-program-bindings joint)))
+
+;; True when every input of every fused binding of joint has the binding's
+;; shape: fused bindings read their inputs at the iteration point.
+(define (fused-inputs-have-shape? joint)
+  (let ((shape-of (lambda (v)
+                    (cases ssa-value v
+                      (const-ref (cid) (morph-shape (hash-table-ref (ssa-program-constants joint) cid)))
+                      (binding-ref (bid)
+                        (ssa-binding-shape (car (filter (lambda (b) (eq? (ssa-binding-name b) bid))
+                                                        (ssa-program-bindings joint)))))))))
+    (every (lambda (b)
+             (every (lambda (v) (equal? (shape-of v) (ssa-binding-shape b))) (ssa-binding-inputs b)))
+           (fused-bindings joint))))
 
 (define (output-dtypes results)
   (map (lambda (m) (cases array-morphism m
@@ -1457,28 +1484,30 @@
                         (b (param-var '(100 200 300) '(3)))
                         (u (am:var+ (am:var* x y) b)))
                    (values (am:var-sum (am:var* u u)) (list x y b))))))
-    (let-values (((joint trace replay) (ssa-results make)))
-      (test "a product is not fused into an add with a broadcast input" '()
-        (filter (lambda (b) (memq 'add (list (ssa-binding-op b)))) (fused-bindings joint)))
+    (let-values (((joint trace replay) (parameterize ((segop-fusion 'all)) (ssa-results make))))
+      (test-assert "a product is not fused into an add with a broadcast input"
+        (fused-inputs-have-shape? joint))
       (test-assert "loss and gradients with a broadcast bias (trace)"
         (equal? '((295922.0) (202.0 404.0 606.0 432.0 840.0 1248.0)
                   (202.0 808.0 1818.0 864.0 2100.0 3744.0) (418.0 824.0 1230.0))
                 trace))
       (test-assert "replay gives the same values" (equal? trace replay))))
 
-  ;; tanh(x*y + z): the three-input fused binding x*y + z is not fused
-  ;; again into tanh, which compose-flat-combiners cannot express.
+  ;; Under the policy all, tanh(x*y + z) becomes one fused binding of
+  ;; three inputs, which runs on the flat three-input executor.
   (let* ((make (lambda ()
                  (let* ((x (param-var '(-0.7 -0.4 -0.1 0.2 0.5 0.8) '(2 3)))
                         (y (param-var '(0.2 0.3 0.4 0.5 0.6 0.7) '(2 3)))
                         (z (param-var '(1.0 0.75 0.5 0.25 0.0 -0.25) '(2 3)))
                         (v (am:var-tanh (am:var+ (am:var* x y) z))))
                    (values (am:var-sum (am:var* v v)) (list x y z))))))
-    (let-values (((joint trace replay) (ssa-results make)))
+    (let-values (((joint trace replay) (parameterize ((segop-fusion 'all)) (ssa-results make))))
       (test-assert "the chain compiles, with a three-input fused binding"
         (any (lambda (b) (= 3 (length (ssa-binding-inputs b)))) (fused-bindings joint)))
-      (test-assert "no fused binding has more than three inputs"
-        (every (lambda (b) (<= (length (ssa-binding-inputs b)) 3)) (fused-bindings joint)))
+      (test-assert "no fused binding reads an input twice"
+        (every (lambda (b) (= (length (ssa-binding-inputs b))
+                              (length (delete-duplicates (map ssa-value-id (ssa-binding-inputs b))))))
+               (fused-bindings joint)))
       (test-assert "trace agrees with the eager autodiff"
         (results-close? trace (eager-results make) 1e-12))
       (test-assert "replay gives the same values as the trace" (equal? trace replay))))
@@ -2328,10 +2357,10 @@
 ;;;; on and off, under the checking backend.
 ;;;; ============================================================
 
-;; (list trace replay mismatches fused-bodies) for make-loss with fusion
-;; on or off.
-(define (fo-run make-loss fusion?)
-  (parameterize ((segop-fusion fusion?))
+;; (list trace replay mismatches fused-bodies) for make-loss under the
+;; fusion policy fusion (all or #f).
+(define (fo-run make-loss fusion)
+  (parameterize ((segop-fusion fusion))
     (let-values (((r checks mismatches)
                   (with-segop-checker
                    (lambda ()
@@ -2379,9 +2408,9 @@
                   (y (seg-var (fo-vals 10 1.0) '(2 5) 'f32 #t))
                   (c (am:var-exp (am:var-negate (am:var-sigmoid (am:var-tanh (am:var* x y)))))))
              (values (am:var-mean (am:var* c c)) (list x y)))))
-   ;; no pair fuses here (the candidates differ in dtype); fusion must
-   ;; still leave the results unchanged
-   (list "mixed f32/f64" 'none
+   ;; the f32 sigmoid(x) is fused into the f64 product, through a cast
+   ;; to f32
+   (list "mixed f32/f64" 'f32
          (lambda ()
            (let ((x (seg-var '(-0.7 -0.4 -0.1 0.2 0.5 0.8) '(2 3) 'f32 #t))
                  (y (seg-var '(0.2 0.3 0.4 0.5 0.6 0.7) '(2 3) 'f64 #t)))
@@ -2391,7 +2420,7 @@
   (for-each
    (lambda (g)
      (let* ((name (car g)) (dt (cadr g)) (make (caddr g))
-            (on  (fo-run make #t))
+            (on  (fo-run make 'all))
             (off (fo-run make #f)))
        (unless (eq? dt 'none)
          (test-assert (string-append name ": the fusion pass fuses bindings") (pair? (list-ref on 3))))
@@ -2418,7 +2447,7 @@
                        (y (seg-var (list x0) '(1) 'f32 #t))
                        (z (seg-var '(-1.0) '(1) 'f32 #t)))
                    (values (am:var-sum (am:var+ (am:var* x y) z)) (list x y z)))))
-         (on  (fo-run make #t))
+         (on  (fo-run make 'all))
          (off (fo-run make #f)))
     (test-assert "x*y + z fuses with a cast at the boundary"
       (any (lambda (b) (fo-has-cast? b 'f32)) (list-ref on 3)))
@@ -2426,5 +2455,251 @@
     (test-assert "the fused x*y + z equals the unfused result"
       (and (equal? (car on) (car off)) (equal? (cadr on) (cadr off))))))
 
+
+;;;; ============================================================
+;;;; Segop fusion
+;;;;
+;;;; The fusion pass builds a graph of uses with fusible, infusible and
+;;;; result edges, fuses a map binding into its only consumer wherever the
+;;;; consumer is (not only the next binding), and realizes fused bindings
+;;;; through their segop executor, with one context allocation per output.
+;;;; ============================================================
+
+(define (sf-var lst shape) (am:make-var (morph-from-list lst (list->vector shape) 'f64) #f))
+
+(define (sf-binding prog op)
+  (car (filter (lambda (b) (equal? (ssa-binding-op b) op)) (ssa-program-bindings prog))))
+
+(define (sf-uses graph b)
+  (map (lambda (u) (list (if (car u) 'binding #f) (caddr u)))
+       (cdr (assq (ssa-binding-name b) graph))))
+
+;; Values of a forward program as lists: with ssa-realize, then traced and
+;; replayed through a context.
+(define (sf-run prog)
+  (let ((ctx (make-morphism-context)))
+    (let ((plain (map concrete->list (ssa-realize prog)))
+          (trace (map concrete->list (ssa-realize/ctx ctx prog))))
+      (finalize-context! ctx)
+      (reset-context! ctx)
+      (ssa-realize/ctx ctx prog)
+      (reset-context! ctx)
+      (list plain trace (map concrete->list (ssa-realize/ctx ctx prog))))))
+
+(define (sf-fused prog)
+  (filter (lambda (b) (eq? (ssa-binding-op b) 'fused)) (ssa-program-bindings prog)))
+
+(define (sf-members b) (cdr (assq 'members (ssa-binding-meta b))))
+
+(define sf-x '(0.5 -1.25 2.0 0.75 -0.5 1.5))
+
+(test-group "segop fusion"
+ ;; Under the default policy nothing is fused on the host, whose fused
+ ;; executors are slower than the separate bindings'.
+ (let-values (((loss params) (seg-mlp-loss 'f32)))
+   (let* ((fwd (morphism-to-ssa loss))
+          (pv  (filter-map (lambda (p) (ssa-constant-id fwd (am:var-value p))) params)))
+     (test "the default policy fuses nothing on the host" '()
+       (fused-bindings (ssa-vjp fwd pv (ssa-loss-binding-val fwd))))
+     (test "the policy all fuses" #t
+       (pair? (fused-bindings (parameterize ((segop-fusion 'all))
+                                (ssa-vjp fwd pv (ssa-loss-binding-val fwd))))))))
+ (test "segop-fusion takes #t, all and #f" '(#t all #f)
+   (map (lambda (v) (parameterize ((segop-fusion v)) (segop-fusion))) '(yes all #f)))
+
+ (parameterize ((segop-fusion 'all))
+  ;; e = exp(x) * y; u = e + q with q = exp(b) of shape [3], read through a
+  ;; broadcast; m = u W, a barrier; the loss sums m.
+  (let* ((x (sf-var sf-x '(2 3)))
+         (y (sf-var '(1.0 2.0 3.0 4.0 5.0 6.0) '(2 3)))
+         (b (sf-var '(0.1 0.2 0.3) '(3)))
+         (W (sf-var '(1.0 0.0 0.5 2.0 -1.0 1.0) '(3 2)))
+         (prog (morphism-to-ssa (am:make-var
+                                 (morph-reduce 'sum (morph-matmul (morph+ (morph* (morph-exp (am:var-value x))
+                                                                                  (am:var-value y))
+                                                                          (morph-exp (am:var-value b)))
+                                                                  (am:var-value W))
+                                               '(0 1) #f)
+                                 #f)))
+         (graph (ssa-fusion-graph prog))
+         (exps  (filter (lambda (b) (eq? (ssa-binding-op b) 'exp)) (ssa-program-bindings prog)))
+         (big   (car (filter (lambda (b) (equal? (ssa-binding-shape b) #(2 3))) exps)))
+         (small (car (filter (lambda (b) (equal? (ssa-binding-shape b) #(3))) exps))))
+    (test "a same-shape read by a map binding is fusible" '((binding fusible))
+      (sf-uses graph big))
+    (test "a broadcast read is infusible" '((binding infusible)) (sf-uses graph small))
+    (test "a matmul operand is infusible" '((binding infusible))
+      (sf-uses graph (sf-binding prog 'add)))
+    (test "a reduction source is infusible" '((binding infusible))
+      (sf-uses graph (sf-binding prog 'matmul)))
+    (test "a program output has a result use" '((#f result))
+      (sf-uses graph (sf-binding prog '(reduce sum))))
+    (let ((fused (ssa-segop-fusion-pass prog)))
+      (test "exp(x) is fused into the product, the broadcast exp(b) is not" 1
+        (length (sf-fused fused)))
+      (test-assert "the fused binding computes exp(x) and the product"
+        (= 2 (length (sf-members (car (sf-fused fused))))))
+      (test "the fused program computes the same values" (sf-run prog) (sf-run fused))))
+
+  ;; A producer that is also a program output keeps its value.
+  (let* ((x  (sf-var sf-x '(2 3)))
+         (fwd (morphism-to-ssa (am:make-var (morph-negate (morph-exp (am:var-value x))) #f)))
+         (e   (sf-binding fwd 'exp))
+         (two (make-ssa-program (ssa-program-constants fwd) (ssa-program-morph-to-val fwd)
+                                (ssa-program-bindings fwd)
+                                (append (ssa-program-outputs fwd) (list (binding-ref (ssa-binding-name e))))
+                                0 #f #f #f))
+         (fused (ssa-segop-fusion-pass two)))
+    (test "a producer that is a program output is not fused" '() (sf-fused fused))
+    (test "both outputs are computed" (sf-run two) (sf-run fused))
+    (test "without the second output, the producer is fused" 1
+      (length (sf-fused (ssa-segop-fusion-pass fwd)))))
+
+  ;; c = negate(e) + e with e = exp(x): negate is fused into the add, whose
+  ;; body then reads e twice, so e is not fused (it would be computed twice).
+  (let* ((x  (sf-var sf-x '(2 3)))
+         (ex (morph-exp (am:var-value x)))
+         (prog (morphism-to-ssa (am:make-var (morph+ (morph-negate ex) ex) #f)))
+         (fused (ssa-segop-fusion-pass prog))
+         (fb (sf-fused fused)))
+    (test "the negate is fused into the add" 1 (length fb))
+    (test-assert "a producer read twice by the fused body stays a binding"
+      (any (lambda (b) (eq? (ssa-binding-op b) 'exp)) (ssa-program-bindings fused)))
+    (test "the fused binding reads exp(x) once" 1 (length (ssa-binding-inputs (car fb))))
+    (test "the values are unchanged" (sf-run prog) (sf-run fused)))
+
+  ;; mul(e, e): one consumer reading e twice.
+  (let* ((x  (sf-var sf-x '(2 3)))
+         (ex (morph-exp (am:var-value x)))
+         (prog (morphism-to-ssa (am:make-var (morph* ex ex) #f))))
+    (test "a producer read twice by its consumer is not fused" '()
+      (sf-fused (ssa-segop-fusion-pass prog))))
+
+  ;; A matmul consumer is a barrier.
+  (let* ((x (sf-var sf-x '(2 3)))
+         (W (sf-var '(1.0 0.0 0.5 2.0 -1.0 1.0) '(3 2)))
+         (prog (morphism-to-ssa (am:make-var (morph-matmul (morph-exp (am:var-value x))
+                                                           (am:var-value W))
+                                             #f))))
+    (test "a matmul operand is not fused" '() (sf-fused (ssa-segop-fusion-pass prog))))
+
+  ;; e = exp(x) is consumed by a product after a matmul that does not read
+  ;; it: the old pass, which fuses only adjacent bindings, leaves it.
+  (let* ((x (sf-var sf-x '(2 3)))
+         (z (sf-var '(1.0 -1.0 0.5 0.25 2.0 -0.5) '(2 3)))
+         (W (sf-var '(1.0 0.0 0.5 0.0 1.0 -1.0 2.0 0.5 1.0) '(3 3)))
+         (prog (morphism-to-ssa (am:make-var (morph* (morph-exp (am:var-value x))
+                                                     (morph-matmul (am:var-value z) (am:var-value W)))
+                                             #f)))
+         (fused (ssa-segop-fusion-pass prog)))
+    (test "the old pass does not fuse across the matmul" '()
+      (filter (lambda (b) (assq 'fused? (ssa-binding-meta b)))
+              (ssa-program-bindings (ssa-element-wise-fusion-pass prog))))
+    (test "exp(x) is fused into the product past the matmul" 1 (length (sf-fused fused)))
+    (let-values (((r checks mismatches) (with-segop-checker (lambda () (sf-run fused)))))
+      (test-assert "non-adjacent fusion keeps the values" (equal? (sf-run prog) r))
+      (test "the fused executors agree with the interpreter" 0 mismatches)))
+
+  ;; x*y + x reads x once.
+  (let* ((x (sf-var sf-x '(2 3)))
+         (y (sf-var '(1.0 2.0 3.0 4.0 5.0 6.0) '(2 3)))
+         (prog (morphism-to-ssa (am:make-var (morph+ (morph* (am:var-value x) (am:var-value y))
+                                                     (am:var-value x))
+                                             #f)))
+         (fused (ssa-segop-fusion-pass prog)))
+    (test "x*y + x is one binding" 1 (length (ssa-program-bindings fused)))
+    (test "with two inputs" 2 (length (ssa-binding-inputs (car (ssa-program-bindings fused)))))
+    (test "and the same values" (sf-run prog) (sf-run fused)))
+
+  ;; A chain of five unary ops.
+  (let* ((x (sf-var sf-x '(2 3)))
+         (prog (morphism-to-ssa
+                (am:make-var (morph-negate (morph-exp (morph-sin (morph-cos (morph-abs (am:var-value x))))))
+                             #f))))
+    (let ((fused (ssa-segop-fusion-pass prog)))
+      (test "a chain of five collapses into one binding" 1 (length (ssa-program-bindings fused)))
+      (test "in one round, confirmed by a second"
+        '((rounds . 2) (fusions . 4) (bound-reached? . #f)) (ssa-fusion-pass-stats))
+      (test "the chain keeps its values" (sf-run prog) (sf-run fused)))
+    (let ((fused (parameterize ((segop-fusion-max-rounds 1)) (ssa-segop-fusion-pass prog))))
+      (test-assert "a bound of one round is reported as reached"
+        (cdr (assq 'bound-reached? (ssa-fusion-pass-stats))))
+      (test "the values are still correct" (sf-run prog) (sf-run fused))))
+
+  ;; Allocation counts and pool size on the two-layer network.
+  (let* ((run (lambda (fusion?)
+                (parameterize ((segop-fusion (and fusion? 'all)))
+                  (let-values (((loss params) (seg-mlp-loss 'f32)))
+                    (let ((ctx (make-morphism-context)))
+                      (let-values (((joint trace) (compile-and-realize/ctx ctx loss params)))
+                        (let ((n-fused (if fusion? (cdr (assq 'fusions (ssa-fusion-pass-stats))) 0))
+                              (allocs (cdr (assq 'allocations (context-stats ctx)))))
+                          (finalize-context! ctx)
+                          (reset-context! ctx)
+                          (let ((replay (ssa-realize/ctx ctx joint)))
+                            (list allocs n-fused
+                                  (cdr (assq 'bytes (context-stats ctx)))
+                                  (map get-allocation-id trace)
+                                  (map get-allocation-id replay))))))))))
+         (on (run #t)) (off (run #f)))
+    (test "each fused-away producer saves one trace allocation"
+      (- (car off) (cadr on)) (car on))
+    (test "replay outputs keep their trace allocation ids" (list-ref on 3) (list-ref on 4))
+    ;; the greedy allocator does not guarantee a smaller pool for fewer
+    ;; allocations on every graph; the size is reported for benchmarks
+    (test-assert "context-stats reports the pool size in bytes"
+      (and (> (caddr on) 0) (> (caddr off) 0))))
+
+  ;; A fused binding with two outputs, built by hand: a = exp(x) and
+  ;; b = sin(x); d = b * a; the program outputs are d and b.
+  (let* ((xm  (morph-from-list sf-x #(2 3) 'f64))
+         (cid (gensym 'cid-))
+         (consts (let ((h (make-hash-table))) (hash-table-set! h cid xm) h))
+         (fb  (make-fused-ssa-binding (list (const-ref cid)) #(2 3) (list (identity-index-map 2))
+                                      '((bid-a #(2 3) f64 (exp (in 0)))
+                                        (bid-b #(2 3) f64 (sin (in 0))))
+                                      '(bid-a bid-b)))
+         (db  (make-ssa-binding 'bid-d 'mul (list (binding-ref 'bid-b) (binding-ref 'bid-a))
+                                #(2 3) 'f64 `((combiner . ,*))))
+         (mk  (lambda () (make-ssa-program consts #f (list fb db)
+                                           (list (binding-ref 'bid-d) (binding-ref 'bid-b))
+                                           0 #f #f #f)))
+         (expect (list (map (lambda (v) (* (sin v) (exp v))) sf-x) (map sin sf-x)))
+         (prog (mk))
+         (ctx  (make-morphism-context)))
+    (let-values (((r checks mismatches)
+                  (with-segop-checker
+                   (lambda ()
+                     (let ((trace (ssa-realize/ctx ctx prog)))
+                       (let ((n-allocs (context-counter ctx)))
+                         (finalize-context! ctx)
+                         (reset-context! ctx)
+                         (let* ((r1 (map concrete->list (ssa-realize/ctx ctx prog)))
+                                (_  (reset-context! ctx))
+                                (r2 (map concrete->list (ssa-realize/ctx ctx prog)))
+                                (_  (reset-context! ctx))
+                                ;; a program without trace-info runs the
+                                ;; binding loop on the finalized context
+                                (r3 (map concrete->list (ssa-realize/ctx ctx (mk)))))
+                           (list (map concrete->list trace) r1 r2 r3 n-allocs))))))))
+      (test "ssa-realize computes both outputs" expect (map concrete->list (ssa-realize prog)))
+      (test "the trace computes both outputs" expect (car r))
+      (test "replay reproduces the trace" expect (cadr r))
+      (test "a second replay too" expect (caddr r))
+      (test "the binding loop on a finalized context too" expect (cadddr r))
+      (test "one allocation per output, and one for d" 3 (list-ref r 4))
+      (test "the executors agree with the interpreter" 0 mismatches)
+      (test-assert "the checker compared the two-output segop" (> checks 0)))
+    (let* ((plan (ssa-program-replay-plan prog))
+           (asg  (buffer-pool-assignment (morphism-context-pool ctx))))
+      (test "the fused binding compiles to a segop with one extra output" 1
+        (cases replay-instruction (vector-ref plan 0)
+          (ri-segop (_ _ _ _ _ _ _ extra-outs) (length extra-outs))
+          (else #f)))
+      (test-assert "its outputs have distinct pool buffers"
+        (not (= (vector-ref asg 0) (vector-ref asg 1))))
+      (test-assert "the extra output, a program output, is not reused by d"
+        (not (= (vector-ref asg 1) (vector-ref asg 2)))))))
+)
 
 (test-end)

@@ -29,6 +29,9 @@
    ;; Output pinning
    context-pin-output!
 
+   ;; Multi-output realization
+   realize-segop/ctx
+
    ;; Pool accessors (for replay-plan compilation)
    morphism-context-pool
    buffer-pool-assignment
@@ -193,12 +196,62 @@
         ((trace)
          `((mode . trace) (allocations . ,n)))
         ((replay)
-         (let ((n-bufs (vector-length
-                        (buffer-pool-buffers (morphism-context-pool ctx)))))
+         (let* ((pool   (morphism-context-pool ctx))
+                (n-bufs (vector-length (buffer-pool-buffers pool))))
            `((mode . replay)
              (allocations . ,n)
-             (buffers . ,n-bufs))))
+             (buffers . ,n-bufs)
+             (bytes . ,(pool-bytes pool)))))
         (else `((mode . ,mode))))))
+
+  ;; Total size in bytes of the pool's buffers.
+  (define (pool-bytes pool)
+    (let ((dtypes (buffer-pool-dtypes pool)) (sizes (buffer-pool-sizes pool)))
+      (let loop ((i 0) (total 0))
+        (if (= i (vector-length sizes))
+            total
+            (loop (+ i 1)
+                  (+ total (* (vector-ref sizes i)
+                              (case (vector-ref dtypes i)
+                                ((f64 s64 u64) 8)
+                                ((f32 s32 u32) 4)
+                                ((s16 u16) 2)
+                                (else 1)))))))))
+
+  (define (realize-segop/ctx ctx inputs outs run!)
+    "Realize a computation with several outputs through context ctx.
+    inputs are the concrete arrays it reads and outs a list of (shape .
+    dtype), one per output.  Each output takes the next allocation id and
+    its buffer: a fresh one in trace mode, the pool's in replay mode.  In
+    trace mode each allocation is recorded as reading the inputs and the
+    earlier outputs, so that no output shares a buffer with an input or
+    with another output.  (run! bufs) then fills the buffers; the result
+    is the list of row-major concrete arrays."
+    (let* ((mode      (morphism-context-mode ctx))
+           (input-ids (map get-allocation-id inputs)))
+      (let loop ((outs outs) (prev-ids '()) (arrs '()) (bufs '()))
+        (if (null? outs)
+            (let ((bufs (reverse bufs)))
+              (run! bufs)
+              (reverse arrs))
+            (let* ((shape (caar outs))
+                   (dtype (cdar outs))
+                   (size  (shape-size shape))
+                   (id    (morphism-context-counter ctx))
+                   (buf   (case mode
+                            ((trace)  (allocate-typed-vector dtype size))
+                            ((replay) (get-workspace-buffer (morphism-context-pool ctx)
+                                                            id dtype size))
+                            (else (error "realize-segop/ctx: unknown mode" mode)))))
+              (morphism-context-counter-set! ctx (+ id 1))
+              (when (eq? mode 'trace)
+                (morphism-context-allocs-set!
+                 ctx (cons (make-allocation-rec id dtype size shape id
+                                                (append input-ids prev-ids) 'normal)
+                           (morphism-context-allocs ctx))))
+              (loop (cdr outs) (cons id prev-ids)
+                    (cons (concrete-array buf shape (compute-strides shape) 0 dtype id -1) arrs)
+                    (cons buf bufs)))))))
 
   (define (context-counter ctx)
     "Return the current allocation counter.

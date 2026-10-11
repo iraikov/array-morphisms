@@ -318,15 +318,35 @@ realized, not only during replay. When no backend is registered, no kernel
 exists for that op and dtype, or the operand and output dtypes differ, the
 same Scheme code runs as before.
 The kernels compute exactly what that Scheme code computes, so registering
-a backend changes speed, not results. Bindings produced by the element-wise
-fusion pass have a composed body and never use a kernel.
+a backend changes speed, not results.
 
-The fusion pass does not change results either. A fused binding rounds
-each intermediate value to its dtype, as storing it in an array would
-(`(cast f32 ...)` in its body), so an `'f32` chain computes exactly what
-the separate bindings compute. The parameter `segop-fusion`
-(`array-morphisms-ssa`) turns the pass off: `(segop-fusion #f)` globally,
-or `(parameterize ((segop-fusion #f)) ...)` around `ssa-vjp`.
+`ssa-vjp` runs a fusion pass on the program it builds. The pass can fuse
+an element-wise binding into the element-wise binding that consumes it,
+anywhere later in the program, when that consumer is the binding's only use
+and reads it once. A program output counts as a use, so a binding whose
+value is an output is never fused away. A fused binding (op `fused`)
+computes both bindings in one segop and never stores the intermediate
+value. Chains are fused to the end in one pass, and an input that both
+bindings read is read once.
+
+Whether a legal fusion is made depends on the policy, the value of the
+parameter `segop-fusion` (`array-morphisms-ssa`):
+
+- `#t` (the default) fuses only what is expected to be faster. Fused
+  segops run their body as compiled Scheme closures on the host. That was
+  measured to be slower than the separate bindings' specialized loops and
+  backend kernels, so on the host the default fuses nothing.
+- `'all` fuses every legal pair.
+- `#f` runs no fusion pass.
+
+Fusion does not change results. A fused binding rounds each intermediate
+value to its dtype, as storing it in an array would (`(cast f32 ...)` in its
+body), so an `'f32` chain computes exactly what the separate bindings
+compute, and a program gives the same values under `'all` and `#f`.
+Set the policy globally, as in `(segop-fusion 'all)`, or around `ssa-vjp`
+with `(parameterize ((segop-fusion #f)) ...)`.
+`segop-fusion-max-rounds` bounds the number of rounds of the pass (16 by
+default), and `ssa-fusion-pass-stats` reports the last run.
 
 No activation backend is registered by default. The `array-morphisms-crunch`
 egg provides two backends; the threaded one splits large arrays across

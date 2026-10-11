@@ -127,6 +127,43 @@
           combiner))))
 
 ;;; ------------------------------------------------------------
+;;; Fused bindings
+;;; ------------------------------------------------------------
+;;;
+;;; A fused binding (op fused) computes several bindings in one seg-map.
+;;; Its template holds the iteration space, one logical index map per
+;;; external input (from the space to that input's index, without a
+;;; layout) and its outputs, the first being the binding's own result.
+;;; Each output is written at every point of the space, in row-major
+;;; order.  Layouts are attached when the template is lowered against
+;;; arrays: the trace-time arrays of the inputs when a plan is compiled,
+;;; the input arrays themselves when the trace realizes the binding.
+
+(define-record fusion-template space in-maps outs)
+(define-record fused-out name shape dtype body combiner)
+
+(define (lower-fused-binding tpl in-arrs in-slots out-slots)
+  "The seg-map of fusion template tpl reading the concrete arrays in-arrs
+   (for their layouts), found at in-slots, and writing out-slots, one slot
+   per output.  A single output keeps its compiled body as the fallback."
+  (let ((space (fusion-template-space tpl))
+        (outs  (fusion-template-outs tpl)))
+    (make-seg-map
+     space
+     (map (lambda (arr slot m)
+            (cases array-morphism arr
+              (concrete-array (_ s st off dt _ _) (make-segop-operand slot dt s st off m))
+              (else (error "lower-fused-binding: input not concrete" arr))))
+          in-arrs in-slots (fusion-template-in-maps tpl))
+     (map (lambda (o slot)
+            (let ((shape (fused-out-shape o)))
+              (make-segop-operand slot (fused-out-dtype o) shape (compute-strides shape) 0
+                                  (identity-index-map (vector-length shape)))))
+          outs out-slots)
+     (map fused-out-body outs)
+     (and (null? (cdr outs)) (fused-out-combiner (car outs))))))
+
+;;; ------------------------------------------------------------
 ;;; Operand patterns
 ;;; ------------------------------------------------------------
 
@@ -674,17 +711,16 @@
                    (else #f)))))
     (else #f)))
 
-;; The last resort: evaluate a single-output seg-map or a single-result
-;; seg-red with the reference interpreter.
+;; The last resort: evaluate a seg-map or a seg-red with the reference
+;; interpreter.  The executor of a segop with several outputs takes the
+;; buffers of the outputs after the first as a list.
 (define (interpreted-select sg)
-  (let ((outs (segop-outputs sg)))
-    (and (memq (segop-kind sg) '(seg-map seg-red))
-         (= (length outs) 1)
-         (let ((refs (map segop-operand-slot (segop-inputs sg))))
-           (cons 'segop/interpreted
-                 (lambda (deref buf)
-                   (segop-interpret sg (map (lambda (r) (operand-data 'interpreted (deref r))) refs)
-                                    (list buf))))))))
+  (and (memq (segop-kind sg) '(seg-map seg-red))
+       (let ((refs (map segop-operand-slot (segop-inputs sg))))
+         (cons 'segop/interpreted
+               (lambda (deref buf #!optional (extra-bufs '()))
+                 (segop-interpret sg (map (lambda (r) (operand-data 'interpreted (deref r))) refs)
+                                  (cons buf extra-bufs)))))))
 
 ;;; ------------------------------------------------------------
 ;;; Contractions
@@ -882,11 +918,23 @@
 (register-segop-backend! (make-segop-backend 'registry registry-select) 'last)
 (register-segop-backend! (make-segop-backend 'scheme scheme-select) 'last)
 
-;; The ri-segop of sg, or #f when no backend accepts it.
-(define (segop-instruction sg pool-idx shape strides dtype)
+;; The ri-segop of sg, or #f when no backend accepts it.  extra-outs
+;; describes the outputs after the first (see ri-segop).
+(define (segop-instruction sg pool-idx shape strides dtype #!optional (extra-outs '()))
   (and sg
        (let ((sel (select-segop-executor sg)))
-         (and sel (ri-segop pool-idx shape strides dtype sg (cdr sel) (car sel))))))
+         (and sel (ri-segop pool-idx shape strides dtype sg (cdr sel) (car sel) extra-outs)))))
+
+(define (compile-fused-segop tpl in-traces in-refs pool-idx extra-outs shape strides dtype)
+  "The ri-segop instruction of a fused binding with template tpl, whose
+   inputs had the trace-time arrays in-traces and are found at in-refs.
+   The first output goes to pool slot pool-idx, the others as extra-outs
+   describes."
+  (or (segop-instruction
+       (lower-fused-binding tpl in-traces in-refs
+                            (cons pool-idx (map (lambda (e) (vector-ref e 1)) extra-outs)))
+       pool-idx shape strides dtype extra-outs)
+      (error "compile-fused-segop: no backend accepts the fused segop")))
 
 (define (compile-elementwise-segop b combiner in-traces in-refs pool-idx shape strides dtype)
   "The ri-segop instruction of element-wise binding b, or #f when the

@@ -8,6 +8,7 @@
 (import scheme chicken.base)
 (import test)
 (import (only srfi-1 every iota))
+(import (only srfi-4 f64vector-ref f64vector-set!))
 (import array-morphisms-core)
 (import array-morphisms-index-fn)
 (import array-morphisms-basic-ops)
@@ -442,5 +443,49 @@
       (finalize-context! ctx)
       (print-context-plan ctx)
       #t)))
+
+
+;;; ============================================================
+;;; Multi-output realization
+;;; ============================================================
+
+;; Realizes x = a + a, then two outputs computed from x (x + 1 and 2x),
+;; then y = 2x + a.  Returns the list (x out1 out2 y).
+(define (multi-output-run ctx a)
+  (let* ((x    (realize/ctx ctx (morph+ a a)))
+         (outs (realize-segop/ctx
+                ctx (list x) (list (cons #(2) 'f64) (cons #(2) 'f64))
+                (lambda (bufs)
+                  (let ((xd (concrete-data/row-major x)))
+                    (do ((i 0 (+ i 1))) ((= i 2))
+                      (f64vector-set! (car bufs) i (+ (f64vector-ref xd i) 1.0))
+                      (f64vector-set! (cadr bufs) i (* 2.0 (f64vector-ref xd i))))))))
+         (y    (realize/ctx ctx (morph+ (cadr outs) a))))
+    (list x (car outs) (cadr outs) y)))
+
+(test-group "multi-output realization"
+  (let* ((ctx (make-morphism-context))
+         (a   (morph-from-list '(1.0 2.0) #(2) 'f64))
+         (r   (multi-output-run ctx a)))
+    (test "each output takes the next allocation id" '(0 1 2 3)
+      (map get-allocation-id r))
+    (test "the counter advances once per output" 4 (context-counter ctx))
+    (test "the outputs hold their values" '((3.0 5.0) (4.0 8.0))
+      (map morph->flat (list (cadr r) (caddr r))))
+    (finalize-context! ctx)
+    (let ((asg (buffer-pool-assignment (morphism-context-pool ctx))))
+      (test-assert "an output does not share the buffer of its input"
+        (not (= (vector-ref asg 0) (vector-ref asg 1))))
+      (test-assert "the two outputs have distinct buffers"
+        (not (= (vector-ref asg 1) (vector-ref asg 2)))))
+    (test "the pool size in bytes is reported"
+      (* 8 2 (stats-ref (context-stats ctx) 'buffers))
+      (stats-ref (context-stats ctx) 'bytes))
+    (reset-context! ctx)
+    (let ((r2 (multi-output-run ctx a)))
+      (test "replay gives the same allocation ids" '(0 1 2 3) (map get-allocation-id r2))
+      ;; x is dead after the outputs are computed, so y may reuse its
+      ;; buffer; the outputs and y are compared
+      (test "replay gives the same values" (map morph->flat (cdr r)) (map morph->flat (cdr r2))))))
 
 (test-exit)
