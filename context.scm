@@ -419,13 +419,17 @@
       (allocator-state-active-set!
        st (active-set active dtype still-live))))
 
-  ;; Find a free same-dtype buffer with capacity >= size, remove it from
-  ;; the free list, and grow its recorded max size if needed.
-  ;; Returns the buf-id, or #f when no reusable buffer exists.
+  ;; Find the smallest free same-dtype buffer with capacity >= size,
+  ;; remove it from the free list, and grow its recorded max size if
+  ;; needed.  Returns the buf-id, or #f when no reusable buffer exists.
   (define (take-reusable-buffer! st dtype size)
     (let* ((dtype-free (free-get (allocator-state-free st) dtype))
-           (reusable   (find (lambda (e) (>= (cdr e) size))
-                             dtype-free)))
+           (reusable   (fold (lambda (e best)
+                               (if (and (>= (cdr e) size)
+                                        (or (not best) (< (cdr e) (cdr best))))
+                                   e
+                                   best))
+                             #f dtype-free)))
       (and reusable
            (let ((bid (car reusable)))
              ;; Update max-size in buf-info if current size is larger
