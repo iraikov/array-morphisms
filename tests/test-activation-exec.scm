@@ -180,7 +180,25 @@
         (register-activation-backend! #f)
         (list was (active-activation-backend)))))
   (test-error "register-activation-backend! rejects other values"
-    (register-activation-backend! 'not-a-backend)))
+    (register-activation-backend! 'not-a-backend))
+  (test "fused kernels are found by canonical body and dtype, misses give #f"
+    '(#t #f #f #f)
+    (let* ((be   (make-activation-backend 'fused))
+           (body '(mul (in 0) (cast f32 (relu-deriv (in 1)))))
+           (k    (lambda (n ins out) #f)))
+      (activation-backend-add-fused-kernel! be body 'f32 k)
+      (list (eq? k (lookup-fused-kernel be body 'f32))
+            (lookup-fused-kernel be body 'f64)
+            (lookup-fused-kernel be '(mul (in 0) (relu-deriv (in 1))) 'f32)
+            (lookup-fused-kernel #f body 'f32))))
+  (test "the fused patterns of a backend are listed"
+    '(((add (in 0) (in 1)) . f64))
+    (let ((be (make-activation-backend 'fused2)))
+      (activation-backend-add-fused-kernel! be '(add (in 0) (in 1)) 'f64 (lambda (n ins out) #f))
+      (activation-backend-fused-patterns be)))
+  (test-error "only f32 and f64 fused kernels are accepted"
+    (activation-backend-add-fused-kernel! (make-activation-backend 'x) '(in 0) 's32
+                                          (lambda (n ins out) #f))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 2 - execute-activation-unary-compute: kernel use and fallback

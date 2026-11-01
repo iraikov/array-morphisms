@@ -42,6 +42,14 @@
 ;;;     strides (Scheme vectors) and the offset of its first element, into
 ;;;     dst in row-major order.
 ;;;
+;;;   * Fused kernels, (body . dtype) -> (size ins out), each computing a
+;;;     whole scalar body (see segop.scm) at every element: out[i] is the
+;;;     body applied to element i of the vectors in the list ins, which
+;;;     are read as the body's inputs (in 0), (in 1), ...  body is in the
+;;;     canonical form of canonical-scalar-body, under which the fusion
+;;;     pass and the segop registry look kernels up.  A kernel must round
+;;;     exactly as the body's casts and its output dtype say.
+;;;
 ;;; This registry is separate from the blas-backend record of blas-exec.scm
 ;;; because the set of activation ops is open-ended and every kernel has the
 ;;; same calling convention, whereas blas-backend is a fixed record whose
@@ -89,7 +97,12 @@
 
    ;; Strided copy kernels
    activation-backend-add-copy-kernel!
-   lookup-copy-kernel)
+   lookup-copy-kernel
+
+   ;; Fused kernels
+   activation-backend-add-fused-kernel!
+   lookup-fused-kernel
+   activation-backend-fused-patterns)
 
   (import scheme (chicken base))
   (import (only srfi-69
@@ -104,23 +117,25 @@
   ;; equal?, so they hash by content rather than by address.
   ;; binary-table, reduction-table and copy-table hold the binary,
   ;; reduction and strided-copy kernels in the same way.
-  ;; broadcast-table holds the broadcast binary kernels.
+  ;; broadcast-table holds the broadcast binary kernels, and fused-table
+  ;; the fused kernels, keyed by (body . dtype).
   (define-record-type activation-backend
     (%make-activation-backend name table binary-table reduction-table copy-table
-                              broadcast-table)
+                              broadcast-table fused-table)
     activation-backend?
     (name            activation-backend-name)
     (table           activation-backend-table)
     (binary-table    activation-backend-binary-table)
     (reduction-table activation-backend-reduction-table)
     (copy-table      activation-backend-copy-table)
-    (broadcast-table activation-backend-broadcast-table))
+    (broadcast-table activation-backend-broadcast-table)
+    (fused-table     activation-backend-fused-table))
 
   (define (make-activation-backend name)
     "Create an activation backend called name (a symbol) with no kernels."
     (%make-activation-backend name (make-hash-table equal?) (make-hash-table equal?)
                               (make-hash-table equal?) (make-hash-table equal?)
-                              (make-hash-table equal?)))
+                              (make-hash-table equal?) (make-hash-table equal?)))
 
   (define (check-kernel who dtype kernel)
     (unless (memq dtype '(f32 f64))
@@ -189,6 +204,25 @@
     "The strided copy kernel bkend holds for dtype arrays, or #f."
     (and bkend
          (hash-table-ref/default (activation-backend-copy-table bkend) dtype #f)))
+
+  (define (activation-backend-add-fused-kernel! bkend body dtype kernel)
+    "Installs kernel, a procedure (size ins out) -> void computing the
+    scalar body body at each of the first size elements, as the backend's
+    fused kernel for body on dtype arrays.  ins is the list of input
+    vectors, read as (in 0), (in 1), ...; body must be in canonical form
+    (see canonical-scalar-body in segop.scm)."
+    (check-kernel 'activation-backend-add-fused-kernel! dtype kernel)
+    (hash-table-set! (activation-backend-fused-table bkend) (cons body dtype) kernel))
+
+  (define (lookup-fused-kernel bkend body dtype)
+    "The fused kernel bkend holds for the canonical body body on dtype
+    arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-fused-table bkend) (cons body dtype) #f)))
+
+  (define (activation-backend-fused-patterns bkend)
+    "The (body . dtype) pairs of the fused kernels bkend holds."
+    (hash-table-keys (activation-backend-fused-table bkend)))
 
   (define (activation-backend-add-kernel! bkend op dtype kernel)
     "Installs kernel, a procedure (size in out) -> void, as the backend's

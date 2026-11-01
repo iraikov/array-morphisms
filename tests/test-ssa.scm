@@ -2619,7 +2619,7 @@
     (let ((fused (ssa-segop-fusion-pass prog)))
       (test "a chain of five collapses into one binding" 1 (length (ssa-program-bindings fused)))
       (test "in one round, confirmed by a second"
-        '((rounds . 2) (fusions . 4) (bound-reached? . #f)) (ssa-fusion-pass-stats))
+        '((rounds . 2) (fusions . 4) (bound-reached? . #f)) (take (ssa-fusion-pass-stats) 3))
       (test "the chain keeps its values" (sf-run prog) (sf-run fused)))
     (let ((fused (parameterize ((segop-fusion-max-rounds 1)) (ssa-segop-fusion-pass prog))))
       (test-assert "a bound of one round is reported as reached"
@@ -2701,5 +2701,132 @@
       (test-assert "the extra output, a program output, is not reused by d"
         (not (= (vector-ref asg 1) (vector-ref asg 2)))))))
 )
+
+;;;; ============================================================
+;;;; Fused-kernel catalogues
+;;;;
+;;;; Under the default policy a fusion is made when a segop backend reports
+;;;; that it would run the fused segop natively.  The registry backend
+;;;; answers from the fused kernels of the active activation backend.  The
+;;;; mock catalogue below holds Scheme kernels for y * exp(x), which count
+;;;; their calls.
+;;;; ============================================================
+
+(define fk-calls 0)
+
+;; A fused kernel computing canonical body over n inputs on dtype arrays,
+;; storing as the flat executors do.
+(define (fk-kernel body n dtype)
+  (let ((proc (scalar-expr->procedure body n)))
+    (lambda (size ins out)
+      (set! fk-calls (+ fk-calls 1))
+      (do ((i 0 (+ i 1))) ((= i size))
+        (typed-vector-set! out dtype i
+                           (exact->inexact
+                            (apply proc (map (lambda (v) (typed-vector-ref v dtype i)) ins))))))))
+
+(define fk-f32-body '(mul (in 0) (cast f32 (exp (in 1)))))
+(define fk-f64-body '(mul (in 0) (exp (in 1))))
+
+(define (make-mock-catalogue dtypes)
+  (let ((be (make-activation-backend 'mock-catalogue)))
+    (when (memq 'f32 dtypes) (activation-backend-add-fused-kernel! be fk-f32-body 'f32 (fk-kernel fk-f32-body 2 'f32)))
+    (when (memq 'f64 dtypes) (activation-backend-add-fused-kernel! be fk-f64-body 'f64 (fk-kernel fk-f64-body 2 'f64)))
+    be))
+
+;; The forward program of m.
+(define (fk-prog m) (morphism-to-ssa (am:make-var m #f)))
+
+(define (fk-arr lst shape dtype) (morph-from-list lst (list->vector shape) dtype))
+
+(define fk-x '(0.5 -1.25 2.0 0.75 -0.5 1.5))
+(define fk-y '(1.0 -2.0 3.0 0.25 4.0 -0.75))
+
+;; (values fused-program results tags fused-placement) for the forward
+;; program of m under the default policy with catalogue be active.
+(define (fk-run m be)
+  (register-activation-backend! be)
+  (let* ((prog  (fk-prog m))
+         (fused (ssa-segop-fusion-pass prog))
+         (res   (sf-run fused))
+         (tags  (map car (plan-segops fused)))
+         (place (cdr (assq 'fused (replay-plan-stats fused)))))
+    (register-activation-backend! #f)
+    (values fused res tags place)))
+
+(test-group "fused-kernel catalogues"
+  (for-each
+   (lambda (dtype)
+     (let ((x (fk-arr fk-x '(2 3) dtype)) (y (fk-arr fk-y '(2 3) dtype)))
+       (let-values (((fused res tags place) (fk-run (morph* y (morph-exp x)) #f)))
+         (test (sprintf "~A: without a catalogue the default fuses nothing" dtype) '()
+           (sf-fused fused)))
+       (set! fk-calls 0)
+       (let-values (((fused res tags place) (fk-run (morph* y (morph-exp x)) (make-mock-catalogue '(f32 f64)))))
+         (test (sprintf "~A: with the catalogue, y * exp(x) is fused" dtype) 1 (length (sf-fused fused)))
+         (test-assert (sprintf "~A: and runs as the fused kernel" dtype) (memq 'segop/fused-kernel tags))
+         (test-assert (sprintf "~A: the kernel was called" dtype) (> fk-calls 0))
+         (test (sprintf "~A: the plan counts it as native" dtype) '((native . 1) (host . 0)) (values place))
+         (test (sprintf "~A: the values are those of the unfused program" dtype)
+           (sf-run (fk-prog (morph* y (morph-exp x)))) (values res)))
+       (let-values (((fused res tags place) (fk-run (morph* (morph-exp x) y) (make-mock-catalogue '(f32 f64)))))
+         (test-assert (sprintf "~A: exp(x) * y matches the same entry" dtype)
+           (memq 'segop/fused-kernel tags))
+         (test (sprintf "~A: with the same values" dtype)
+           (sf-run (fk-prog (morph* (morph-exp x) y))) (values res)))
+       (let-values (((fused res tags place) (fk-run (morph* y (morph-negate x)) (make-mock-catalogue '(f32 f64)))))
+         (test (sprintf "~A: a body without an entry is not fused" dtype) '() (sf-fused fused)))))
+   '(f32 f64))
+
+  (let ((x (fk-arr fk-x '(2 3) 'f64)) (y (fk-arr fk-y '(2 3) 'f64)))
+    (let-values (((fused res tags place) (fk-run (morph* y (morph-exp x)) (make-mock-catalogue '(f32)))))
+      (test "an f32 entry is not used for f64" '() (sf-fused fused))))
+
+  ;; y is a transposed view: its layout is not flat, so the fused segop
+  ;; could not run as the kernel.
+  (let* ((x  (fk-arr fk-x '(2 3) 'f32))
+         (yt (morph-transpose (fk-arr fk-y '(3 2) 'f32) '(1 0))))
+    (let-values (((fused res tags place) (fk-run (morph* yt (morph-exp x)) (make-mock-catalogue '(f32)))))
+      (test "an input that is a view is not expected flat, so nothing is fused" '() (sf-fused fused))))
+
+  ;; The catalogue is consulted again when the step runs: without it, the
+  ;; fused segop runs on the host and computes the same values.
+  (let* ((x (fk-arr fk-x '(2 3) 'f32)) (y (fk-arr fk-y '(2 3) 'f32))
+         (m (morph* y (morph-exp x)))
+         (be (make-mock-catalogue '(f32))))
+    (register-activation-backend! be)
+    (let* ((fused (ssa-segop-fusion-pass (fk-prog m)))
+           (ctx   (make-morphism-context)))
+      (ssa-realize/ctx ctx fused)
+      (finalize-context! ctx)
+      (reset-context! ctx)
+      (let ((with-kernel (map concrete->list (ssa-realize/ctx ctx fused))))
+        (register-activation-backend! #f)
+        (reset-context! ctx)
+        (test "a missing kernel at run time falls back to the host, with the same values"
+          with-kernel (map concrete->list (ssa-realize/ctx ctx fused))))))
+
+  ;; The executors agree with the interpreter, and the candidates are
+  ;; reported.
+  (let* ((x (fk-arr fk-x '(2 3) 'f32)) (y (fk-arr fk-y '(2 3) 'f32)))
+    (let-values (((r checks mismatches)
+                  (with-segop-checker
+                   (lambda ()
+                     (let-values (((fused res tags place)
+                                   (fk-run (morph* y (morph-exp x)) (make-mock-catalogue '(f32)))))
+                       tags)))))
+      (test-assert "the checker saw the fused kernel" (memq 'segop/fused-kernel r))
+      (test "the fused kernel agrees with the interpreter" 0 mismatches))
+    (parameterize ((segop-fusion 'all))
+      (ssa-segop-fusion-pass (fk-prog (morph* y (morph-negate (morph-exp x))))))
+    (test "the pass reports the bodies it formed"
+      '(((mul (in 0) (cast f32 (negate (cast f32 (exp (in 1)))))) f32 1 6))
+      (cdr (assq 'candidates (ssa-fusion-pass-stats))))
+    (parameterize ((segop-fusion 'all))
+      (let ((fused (ssa-segop-fusion-pass (fk-prog (morph* y (morph-negate x))))))
+        (sf-run fused)
+        (test "a fused binding without a kernel is counted as host" '((native . 0) (host . 1))
+          (cdr (assq 'fused (replay-plan-stats fused))))))))
+
 
 (test-end)

@@ -13,7 +13,7 @@
 ;;;   Group 6 - Construction checks
 ;;;   Group 7 - Backend registry
 
-(import scheme (chicken base) test
+(import scheme (chicken base) (chicken format) test
         (only srfi-1 every iota fold make-list filter)
         srfi-4
         datatype
@@ -668,5 +668,84 @@
   (test-error "(acc) is not supported" (scalar-expr->procedure '(acc) 0))
   (test-error "an invalid body is rejected" (scalar-expr->procedure '(relu (in 0) (in 1)) 2))
   (test-error "an input beyond the arity is rejected" (scalar-expr->procedure '(in 2) 2)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Canonical bodies, templates and backend kinds
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (canon body #!optional n)
+  (call-with-values (lambda () (canonical-scalar-body body n)) list))
+
+;; True when body and its canonical form agree on the inputs in-vals,
+;; given to the canonical body in the order of the permutation.
+(define (canon-agrees? body in-vals)
+  (let* ((r (canon body (length in-vals)))
+         (c (car r)) (perm (cadr r))
+         (read-orig (lambda (k) (list-ref in-vals k)))
+         (read-canon (lambda (i) (list-ref in-vals (list-ref perm i)))))
+    (sg-same? (eval-scalar-expr body read-orig) (eval-scalar-expr c read-canon))))
+
+(test-group "canonical bodies"
+  (test "an input comes first in a product"
+    '((mul (in 0) (cast f32 (relu-deriv (in 1)))) (1 0))
+    (canon '(mul (cast f32 (relu-deriv (in 0))) (in 1))))
+  (test "a canonical body is unchanged"
+    '((mul (in 0) (cast f32 (relu-deriv (in 1)))) (0 1))
+    (canon '(mul (in 0) (cast f32 (relu-deriv (in 1))))))
+  (test "inputs are renumbered by first occurrence"
+    '((add (in 0) (cast f32 (mul (in 1) (in 2)))) (2 0 1))
+    (canon '(add (cast f32 (mul (in 0) (in 1))) (in 2))))
+  (test "two inputs of an add keep their order, then are renumbered"
+    '((add (in 0) (in 1)) (1 0))
+    (canon '(add (in 1) (in 0))))
+  (test "operands are ordered by structure"
+    (car (canon '(mul (exp (in 0)) (abs (in 1)))))
+    (car (canon '(mul (abs (in 1)) (exp (in 0))))))
+  (test "a non-commutative op keeps its operands" '((sub (exp (in 0)) (in 1)) (0 1))
+    (canon '(sub (exp (in 0)) (in 1))))
+  (test "nested casts to one dtype are merged" '((cast f32 (exp (in 0))) (0))
+    (canon '(cast f32 (cast f32 (exp (in 0))))))
+  (test "casts to different dtypes are kept" '((cast f64 (cast f32 (in 0))) (0))
+    (canon '(cast f64 (cast f32 (in 0)))))
+  (test "unread inputs come last" '((exp (in 0)) (2 0 1)) (canon '(exp (in 2)) 3))
+  (for-each
+   (lambda (body)
+     (test-assert (sprintf "canonical form is idempotent: ~S" body)
+       (let ((c (car (canon body)))) (equal? c (car (canon c)))))
+     (test-assert (sprintf "canonical form computes the same value: ~S" body)
+       (canon-agrees? body '(0.75 -1.5 2.25))))
+   '((mul (cast f32 (sigmoid-deriv (in 0))) (in 1))
+     (add (cast f32 (mul (in 1) (in 0))) (in 2))
+     (mul (in 2) (add (in 1) (exp (in 0))))
+     (if (gt (in 0) (in 1)) (mul (in 1) (in 2)) (sub (in 0) (in 2)))
+     (let* ((t (mul (in 0) (in 1)))) (add t (in 2))))))
+
+(test-group "templates and backend kinds"
+  (let* ((tin (make-template-input 'f32 (identity-index-map 2) #t))
+         (tpl (make-segop-template #(2 3) (list tin)
+                                   (list (make-template-output 'f32 '(exp (in 0)))))))
+    (test "a template keeps its space" #(2 3) (segop-template-space tpl))
+    (test "and its inputs" '((f32 #t)) (map (lambda (i) (list (template-input-dtype i) (template-input-flat? i)))
+                                         (segop-template-ins tpl)))
+    (test "and its outputs" '((f32 (exp (in 0))))
+      (map (lambda (o) (list (template-output-dtype o) (template-output-body o)))
+           (segop-template-outs tpl)))
+    (let ((plain (make-segop-backend 'plain (lambda (sg) #f)))
+          (cat   (make-segop-backend 'cat (lambda (sg) #f) kind: 'catalogue
+                                     native?: (lambda (t) (equal? (segop-template-space t) #(2 3))))))
+      (test "a backend is a host backend by default" 'host (segop-backend-kind plain))
+      (test "and has no native query" #f (segop-backend-native? plain))
+      (test "a catalogue backend has its kind" 'catalogue (segop-backend-kind cat))
+      (test "no backend: no native backend" #f
+        (parameterize ((segop-backends (list plain))) (segop-native? tpl)))
+      (test "the backend whose query accepts the template is returned" 'cat
+        (parameterize ((segop-backends (list plain cat)))
+          (segop-backend-name (segop-native? tpl))))
+      (test "a query that refuses gives #f" #f
+        (parameterize ((segop-backends (list cat)))
+          (segop-native? (make-segop-template #(4) (list tin) '())))))
+    (test-error "an unknown kind is an error"
+      (make-segop-backend 'x (lambda (sg) #f) kind: 'gpu))))
+
 
 (test-exit)

@@ -549,11 +549,15 @@
 ;;;
 ;;; Legality (the graph conditions, the shapes of the inputs, bounds on
 ;;; the number of inputs and the size of the body) is decided apart from
-;;; profitability.  The executors of fused segops run the compiled body
-;;; on the host, and measured slower than the separate passes they replace
-;;; (whose loops are specialized for each op, or run on backend kernels),
-;;; so no fusion is profitable under the default policy.  The policy all
-;;; (see segop-fusion) fuses every legal pair.
+;;; profitability.  The host executors of fused segops run the compiled
+;;; body as Scheme procedures, and measured slower than the separate passes
+;;; they replace (whose loops are specialized for each op, or run on
+;;; backend kernels).  Under the default policy a fusion is therefore made
+;;; only when some segop backend reports that it would run the fused segop
+;;; natively, such as a catalogue of compiled fused kernels; the query is
+;;; asked of a layout-free template, with each input's layout predicted
+;;; (values of views are not expected to be flat).  The policy all (see
+;;; segop-fusion) fuses every legal pair.
 ;;;
 ;;; The driver visits the bindings from last to first and fuses into each
 ;;; consumer until nothing more fuses, so a chain collapses in one visit.
@@ -575,9 +579,37 @@
 
 (define (ssa-fusion-pass-stats)
   "An alist describing the last run of ssa-segop-fusion-pass: rounds (the
-   rounds run), fusions (the producers fused away) and bound-reached? (true
-   when the last round still fused and the round bound stopped the pass)."
+   rounds run), fusions (the producers fused away), bound-reached? (true
+   when the last round still fused and the round bound stopped the pass)
+   and candidates, the bodies of the fused bindings made, each a list
+   (canonical-body dtype count elements): how many bindings have that
+   body and dtype, and their total number of elements."
   *fusion-pass-stats*)
+
+;; Views: their values share the buffer of their source, in a layout that
+;; is in general not flat.
+(define fusion-view-ops '(transpose reshape broadcast-expand slice))
+
+;; The candidates entry of ssa-fusion-pass-stats for bindings bs.
+(define (fusion-candidates bs)
+  (let ((table (make-hash-table equal?)))
+    (for-each
+     (lambda (b)
+       (when (fused-binding? b)
+         (for-each
+          (lambda (o)
+            (let* ((key (cons (call-with-values
+                                  (lambda () (canonical-scalar-body (fused-out-body o)
+                                                                    (length (ssa-binding-inputs b))))
+                                (lambda (c perm) c))
+                              (fused-out-dtype o)))
+                   (old (hash-table-ref/default table key '(0 . 0))))
+              (hash-table-set! table key (cons (+ 1 (car old))
+                                               (+ (shape-size (fused-out-shape o)) (cdr old))))))
+          (fused-binding-outs b))))
+     bs)
+    (map (lambda (kv) (list (caar kv) (cdar kv) (cadr kv) (cddr kv)))
+         (hash-table->alist table))))
 
 ;; Ops that never take part in a fusion: contractions, views and the
 ;; convolution family read their operands in their own patterns.
@@ -722,12 +754,28 @@
                 (ssa-binding-inputs f))
          (<= (scalar-body-size (cdr (assq 'body (ssa-binding-meta f)))) fusion-max-body-size))))
 
-(define (fusion-profitable? p c f vtab)
-  "True when fusing producer p into consumer c, giving f, should be done
-   under the current policy: always under all; under the default policy
-   never, as the fused segop would run on the host executors, which are
+(define (fused-binding-query f vtab flat?)
+  "The segop template of fused binding f: its space, the dtype, logical
+   map and predicted layout of each input (flat? tells whether an input
+   value is expected to be stored flat), and the dtype and body of each
+   output."
+  (let ((tpl (fused-binding-template f)))
+    (make-segop-template
+     (fusion-template-space tpl)
+     (map (lambda (v m)
+            (make-template-input (cdr (hash-table-ref vtab (ssa-value-id v))) m (flat? v)))
+          (ssa-binding-inputs f) (fusion-template-in-maps tpl))
+     (map (lambda (o) (make-template-output (fused-out-dtype o) (fused-out-body o)))
+          (fusion-template-outs tpl)))))
+
+(define (fusion-profitable? f vtab flat?)
+  "True when making fused binding f should be done under the current
+   policy: always under all; under the default policy when some segop
+   backend would run f natively (see segop-native?).  A fused segop that
+   no backend runs natively would run on the host executors, which are
    slower than the separate bindings' (see above)."
-  (eq? (segop-fusion) 'all))
+  (or (eq? (segop-fusion) 'all)
+      (and (segop-native? (fused-binding-query f vtab flat?)) #t)))
 
 ;; ins without repeated values, in order of first occurrence.
 (define (distinct-values ins)
@@ -771,7 +819,21 @@
          (pos    (make-hash-table eq?))
          (vtab (fusion-value-table prog))
          (uses   (fusion-uses prog vtab))
+         (views  (let ((h (make-hash-table eq?)))
+                   (for-each (lambda (b)
+                               (when (memq (ssa-binding-op b) fusion-view-ops)
+                                 (hash-table-set! h (ssa-binding-name b) #t)))
+                             (ssa-program-bindings prog))
+                   h))
          (max-rounds (segop-fusion-max-rounds)))
+
+    ;; True when value v is expected to be stored row-major, at offset 0:
+    ;; a constant with that layout, or the result of a binding that is not
+    ;; a view (bindings that allocate write row-major pool buffers).
+    (define (flat? v)
+      (cases ssa-value v
+        (const-ref (cid) (concrete-row-major? (hash-table-ref (ssa-program-constants prog) cid)))
+        (binding-ref (bid) (not (hash-table-ref/default views bid #f)))))
     (do ((i 0 (+ i 1))) ((= i n))
       (hash-table-set! pos (ssa-binding-name (vector-ref bv i)) i))
 
@@ -807,7 +869,7 @@
                           (can-fuse? uses p c k)
                           (let ((f (fuse-into p c k vtab)))
                             (and (fused-result-legal? f vtab)
-                                 (fusion-profitable? p c f vtab)
+                                 (fusion-profitable? f vtab flat?)
                                  (begin (commit! p c f) #t)))))
                    (loop (cdr vs) (+ k 1)))))))
 
@@ -825,7 +887,8 @@
       (let* ((fused (run-round)) (total (+ total fused)))
         (if (or (= fused 0) (>= r max-rounds))
             (set! *fusion-pass-stats*
-                  `((rounds . ,r) (fusions . ,total) (bound-reached? . ,(> fused 0))))
+                  `((rounds . ,r) (fusions . ,total) (bound-reached? . ,(> fused 0))
+                    (candidates . ,(fusion-candidates (filter (lambda (b) b) (vector->list bv))))))
             (rounds (+ r 1) total))))
 
     (make-ssa-program
@@ -2913,6 +2976,19 @@
 
     ))
 
+  ;; How many fused bindings of a plan run as a native fused kernel and how
+  ;; many on the host executors, as ((native . n) (host . m)).
+  (define (fused-placement plan bindings)
+    (let loop ((bs bindings) (i 0) (native 0) (host 0))
+      (cond ((null? bs) `((native . ,native) (host . ,host)))
+            ((fused-binding? (car bs))
+             (if (cases replay-instruction (vector-ref plan i)
+                   (ri-segop (_ _ _ _ _ _ tag _) (eq? tag 'segop/fused-kernel))
+                   (else #f))
+                 (loop (cdr bs) (+ i 1) (+ native 1) host)
+                 (loop (cdr bs) (+ i 1) native (+ host 1))))
+            (else (loop (cdr bs) (+ i 1) native host)))))
+
   (define (replay-plan-stats prog)
     "Return alist with:
        (counts . alist-of-tag.count)
@@ -2948,7 +3024,9 @@
                                  (+ (hash-table-ref/default counts tag 0) 1))))
             `((counts . ,(hash-table->alist counts))
               (ri-index-shapes . ,(reverse (stack->list index-shapes)))
-              (ri-reduce-specs . ,(reverse (stack->list reduce-specs)))))))
+              (ri-reduce-specs . ,(reverse (stack->list reduce-specs)))
+              (fused . ,(fused-placement plan (ssa-program-bindings prog)))))))
+
     )
 
 ) ; end module array-morphisms-ssa

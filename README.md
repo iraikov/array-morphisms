@@ -313,10 +313,12 @@ to a segop (see below). A binding that applies one of these ops directly to
 row-major operands of the output's shape gets the `segop/activation-unary`
 or `segop/activation-binary` executor, which uses the backend's kernel for
 its op and dtype at execution time.
+
 Reductions and strided copies use their kernels wherever arrays are
 realized, not only during replay. When no backend is registered, no kernel
 exists for that op and dtype, or the operand and output dtypes differ, the
 same Scheme code runs as before.
+
 The kernels compute exactly what that Scheme code computes, so registering
 a backend changes speed, not results.
 
@@ -332,12 +334,37 @@ bindings read is read once.
 Whether a legal fusion is made depends on the policy, the value of the
 parameter `segop-fusion` (`array-morphisms-ssa`):
 
-- `#t` (the default) fuses only what is expected to be faster. Fused
-  segops run their body as compiled Scheme closures on the host. That was
-  measured to be slower than the separate bindings' specialized loops and
-  backend kernels, so on the host the default fuses nothing.
+- `#t` (the default) fuses only what some segop backend can run natively,
+  as one compiled kernel. On the host, a fused segop runs its body as
+  compiled Scheme closures, which was measured to be slower than the
+  separate bindings' specialized loops and backend kernels. So the default
+  fuses a pair only when the active activation backend holds a *fused
+  kernel* for the body the fusion would make (see below). With no such
+  backend, it fuses nothing.
 - `'all` fuses every legal pair.
 - `#f` runs no fusion pass.
+
+Segop backends say what they can run natively. Each one has a kind: `host`
+(Scheme executors only), `catalogue` (a fixed set of compiled kernels) or
+`codegen` (backends that compile any body; none exist yet). Each may also
+answer a native-capability query, `native?`, on a layout-free segop
+template (`make-segop-template`). The fusion pass asks this query, through
+`segop-native?`, before it fuses, and predicts each input's layout: values
+of views are not expected to be flat. The registry backend is a catalogue
+backend. It answers from the fused kernels of the active activation
+backend, which are keyed by the body's canonical form
+(`canonical-scalar-body`): commutative operands in a fixed order, inputs
+numbered by first occurrence. It runs a matching segop as
+`segop/fused-kernel` when every input is flat and of the output's dtype.
+
+An activation backend holds fused kernels through
+`activation-backend-add-fused-kernel!`. The crunch backends of
+`array-morphisms-crunch` hold kernels for the bodies the pass forms most
+often in backward passes, such as `g * relu-deriv(x)`. `replay-plan-stats`
+reports under `fused` how many fused bindings run as a native kernel and how
+many on the host. Under `'all`, `ssa-fusion-pass-stats` also lists the
+bodies the pass formed (`candidates`), which shows which fused kernels would
+be worth adding.
 
 Fusion does not change results. A fused binding rounds each intermediate
 value to its dtype, as storing it in an array would (`(cast f32 ...)` in its

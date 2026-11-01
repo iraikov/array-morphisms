@@ -45,6 +45,12 @@
 ;;;
 ;;; The registry backend also takes the GEMMs (segop/gemm, gemm-strided and
 ;;; gemm-epilogue, see Contractions below) and the axis-0/1 reductions.
+;;;
+;;; The registry backend is a catalogue backend (see segop.scm): it runs
+;;; natively the bodies for which the active activation backend holds a
+;;; fused kernel (fused-kernel below), and it answers the fusion pass's
+;;; native-capability queries from the same table.  The scheme backend is
+;;; a host backend.
 
 ;;; ------------------------------------------------------------
 ;;; Binding bodies
@@ -899,11 +905,99 @@
                          (else (error "gemm epilogue: bias not concrete"))))))))))))
 
 ;;; ------------------------------------------------------------
+;;; Fused kernels
+;;; ------------------------------------------------------------
+;;;
+;;; A seg-map whose body has a fused kernel in the active activation
+;;; backend (see activation-backend-add-fused-kernel!) runs as that kernel
+;;; (tag segop/fused-kernel) when it has one output and one to three
+;;; inputs, all flat and of the output's dtype, f32 or f64.  Kernels are
+;;; keyed by canonical bodies; the inputs are passed in the order of the
+;;; canonical body.  When the active backend holds no such kernel at the
+;;; time the step runs, the segop's fallback computes it on the host.
+
+;; The canonical body of body over n inputs, and the permutation taking
+;; canonical inputs to body's.
+(define (canonical-body+perm body n)
+  (call-with-values (lambda () (canonical-scalar-body body n)) cons))
+
+(define (fused-kernel-dtype? dt) (memq dt '(f32 f64)))
+
+;; True when index map m reads, at each point of space, the operand element
+;; with the same coordinates (a dimension of extent 1 may be read at 0).
+(define (space-identity-map? m space)
+  (let ((exprs (index-map-exprs m)))
+    (and exprs
+         (not (index-map-guard m))
+         (= (vector-length exprs) (vector-length space))
+         (let loop ((d 0))
+           (or (= d (vector-length space))
+               (let ((e (vector-ref exprs d)))
+                 (and (or (equal? e `(dim ,d))
+                          (and (eqv? e 0) (= (vector-ref space d) 1)))
+                      (loop (+ d 1)))))))))
+
+(define (registry-native? tpl)
+  "The native-capability query of the registry backend: true when the
+   segop template tpl has one output and one to three flat inputs read at
+   the iteration point, all of the output's dtype, f32 or f64, and the
+   active activation backend holds a fused kernel for its canonical body."
+  (let ((ins (segop-template-ins tpl)) (outs (segop-template-outs tpl))
+        (space (segop-template-space tpl)))
+    (and (= (length outs) 1)
+         (<= 1 (length ins) 3)
+         (let ((dt (template-output-dtype (car outs))))
+           (and (fused-kernel-dtype? dt)
+                (every (lambda (i) (and (template-input-flat? i)
+                                        (eq? (template-input-dtype i) dt)
+                                        (space-identity-map? (template-input-map i) space)))
+                       ins)
+                (lookup-fused-kernel (active-activation-backend)
+                                     (car (canonical-body+perm (template-output-body (car outs))
+                                                               (length ins)))
+                                     dt)
+                #t)))))
+
+(define (fused-kernel-executor body perm fallback refs size dtype)
+  (let ((crefs (map (lambda (k) (list-ref refs k)) perm)))
+    (lambda (deref buf)
+      (let ((kernel (lookup-fused-kernel (active-activation-backend) body dtype)))
+        (if kernel
+            (kernel size (map (lambda (r) (operand-data 'fused-kernel (deref r))) crefs) buf)
+            (let ((datas (map (lambda (r) (operand-data 'fused-kernel (deref r))) refs)))
+              (case (length datas)
+                ((1) (execute-flat-unary-compute fallback (car datas) dtype buf size dtype))
+                ((2) (execute-flat-binary-compute fallback (car datas) dtype (cadr datas) dtype
+                                                  buf size dtype))
+                (else ((flat-ternary-executor fallback 0 1 2 size dtype)
+                       (lambda (k) (concrete-array (list-ref datas k) (vector size)
+                                                   (vector 1) 0 dtype -1 -1))
+                       buf)))))))))
+
+(define (registry-fused-select sg)
+  (with-single-output-seg-map sg
+    (lambda (space ins out body fallback)
+      (let ((dtype (segop-operand-dtype out)) (n (length ins)))
+        (and (fused-kernel-dtype? dtype)
+             (<= 1 n 3)
+             (operand-flat? out space)
+             (every (lambda (o) (and (operand-flat? o space) (eq? (segop-operand-dtype o) dtype)
+                                     (space-identity-map? (segop-operand-map o) space)))
+                    ins)
+             (let ((cp (canonical-body+perm body n)))
+               (and (lookup-fused-kernel (active-activation-backend) (car cp) dtype)
+                    (cons 'segop/fused-kernel
+                          (fused-kernel-executor (car cp) (cdr cp) fallback
+                                                 (map segop-operand-slot ins)
+                                                 (shape-size space) dtype)))))))))
+
+;;; ------------------------------------------------------------
 ;;; Backend registration and instruction compilation
 ;;; ------------------------------------------------------------
 
 (define (registry-select sg)
   (or (registry-gemm-select sg)
+      (registry-fused-select sg)
       (registry-elementwise-select sg)
       (select-standard-reduction sg '(axis0 axis1))
       (registry-gather-select sg)))
@@ -915,7 +1009,9 @@
       (host-index-fn-select sg)
       (interpreted-select sg)))
 
-(register-segop-backend! (make-segop-backend 'registry registry-select) 'last)
+(register-segop-backend! (make-segop-backend 'registry registry-select
+                                             kind: 'catalogue native?: registry-native?)
+                         'last)
 (register-segop-backend! (make-segop-backend 'scheme scheme-select) 'last)
 
 ;; The ri-segop of sg, or #f when no backend accepts it.  extra-outs

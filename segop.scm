@@ -85,6 +85,7 @@
    scalar-expr-inputs
    scalar-expr-opaque?
    scalar-expr->procedure
+   canonical-scalar-body
 
    ;; Reductions
    make-combine-spec
@@ -106,11 +107,25 @@
    segop-fallback
    segop-interpret
 
+   ;; Query templates
+   make-segop-template
+   segop-template?
+   segop-template-space segop-template-ins segop-template-outs
+   make-template-input
+   template-input?
+   template-input-dtype template-input-map template-input-flat?
+   make-template-output
+   template-output?
+   template-output-dtype template-output-body
+
    ;; Backends
    make-segop-backend
    segop-backend?
    segop-backend-name
    segop-backend-select
+   segop-backend-kind
+   segop-backend-native?
+   segop-native?
    register-segop-backend!
    unregister-segop-backend!
    segop-backends
@@ -725,6 +740,88 @@
                 (node #f #f #f (list->vector args))))))))
 
 
+;; The canonical form of a body, under which bodies that compute the same
+;; function of their inputs, up to the order of the inputs, are equal.
+;; Kernel catalogues are keyed by canonical bodies.
+
+;; Table ops whose two operands may be exchanged without changing the
+;; result: IEEE addition and multiplication are commutative.
+(define commutative-ops '(add mul))
+
+(define (input-ref? e) (and (pair? e) (eq? (car e) 'in)))
+
+;; A string describing the structure of e with the input numbers left out,
+;; used to order the operands of commutative ops.
+(define (structure-key e)
+  (cond ((input-ref? e) "i")
+        ((number? e) (number->string e))
+        ((symbol? e) (symbol->string e))
+        ((procedure? e) "p")
+        ((pair? e)
+         (let loop ((xs e) (acc "("))
+           (if (null? xs)
+               (string-append acc ")")
+               (loop (cdr xs) (string-append acc " " (structure-key (car xs)))))))
+        (else "?")))
+
+;; e with commutative operands in canonical order and directly nested casts
+;; to the same dtype merged, from the leaves up.
+(define (normalize-scalar-expr e)
+  (cond ((not (pair? e)) e)
+        ((memq (car e) '(in param idx acc)) e)
+        ((eq? (car e) 'cast)
+         (let ((x (normalize-scalar-expr (caddr e))))
+           (if (and (pair? x) (eq? (car x) 'cast) (eq? (cadr x) (cadr e)))
+               x
+               `(cast ,(cadr e) ,x))))
+        ((eq? (car e) 'let*)
+         `(let* ,(map (lambda (b) (list (car b) (normalize-scalar-expr (cadr b)))) (cadr e))
+            ,(normalize-scalar-expr (caddr e))))
+        ((eq? (car e) 'opaque)
+         `(opaque ,(cadr e) ,@(map normalize-scalar-expr (cddr e))))
+        (else
+         (let ((args (map normalize-scalar-expr (cdr e))))
+           (if (and (memq (car e) commutative-ops) (= (length args) 2))
+               (let ((a (car args)) (b (cadr args)))
+                 ;; an input comes first; otherwise the smaller structure,
+                 ;; and equal structures keep their order
+                 (if (and (not (input-ref? a))
+                          (or (input-ref? b) (string<? (structure-key b) (structure-key a))))
+                     (list (car e) b a)
+                     (list (car e) a b)))
+               (cons (car e) args))))))
+
+;; The input numbers of e in the order of their first occurrence.
+(define (input-order e)
+  (define (walk e acc)
+    (cond ((not (pair? e)) acc)
+          ((eq? (car e) 'in) (if (memv (cadr e) acc) acc (cons (cadr e) acc)))
+          ((memq (car e) '(param idx acc)) acc)
+          ((eq? (car e) 'cast) (walk (caddr e) acc))
+          ((eq? (car e) 'let*)
+           (walk (caddr e) (fold (lambda (b acc) (walk (cadr b) acc)) acc (cadr e))))
+          ((eq? (car e) 'opaque) (fold walk acc (cddr e)))
+          (else (fold walk acc (cdr e)))))
+  (reverse (walk e '())))
+
+(define (canonical-scalar-body body #!optional (n-inputs #f))
+  "The canonical form of scalar expression body, and the permutation of
+   its inputs, as two values.  In the canonical body the two operands of
+   add and mul are ordered by their structure (an input first), directly
+   nested casts to one dtype are merged, and inputs are numbered in the
+   order in which they first occur.  The permutation is a list whose
+   element i is the number in body of canonical input i; inputs that body
+   does not read, when n-inputs is given, come last in increasing order."
+  (let* ((norm  (normalize-scalar-expr body))
+         (order (input-order norm))
+         (order (if n-inputs
+                    (append order (filter (lambda (k) (not (memv k order))) (iota n-inputs)))
+                    order))
+         (canon (scalar-expr-substitute-inputs
+                 norm (lambda (k) `(in ,(list-index (lambda (j) (= j k)) order))))))
+    (values canon order)))
+
+
 ;;;; ============================================================
 ;;;; Reductions
 ;;;; ============================================================
@@ -1090,6 +1187,20 @@
 
 
 ;;;; ============================================================
+;;;; Segop templates
+;;;; ============================================================
+
+;; A layout-free description of a seg-map, for the questions that are
+;; asked before the arrays exist, such as whether a backend could run it
+;; natively.  ins lists one template-input per input: its dtype, the
+;; index map from the space to its logical index, and whether its layout
+;; is expected to be flat (row-major, of the input's shape, at offset 0).
+;; outs lists one template-output per output: its dtype and its body.
+(define-record segop-template space ins outs)
+(define-record template-input dtype map flat?)
+(define-record template-output dtype body)
+
+;;;; ============================================================
 ;;;; Backends
 ;;;; ============================================================
 
@@ -1098,11 +1209,50 @@
 ;; executor's calling convention is set by the code that runs the segops
 ;; (for replay plans, see ssa.scm); tag names the pattern for profiles.
 ;;
+;; kind says what the backend can run natively, that is, as compiled code
+;; rather than as Scheme procedures on the host:
+;;
+;;   host       nothing; the backend runs segops with Scheme executors
+;;   catalogue  a fixed set of precompiled kernels, which may include
+;;              kernels for bodies that fuse several ops
+;;   codegen    any body of its grammar, compiled when a plan is compiled
+;;
+;; native?, when given, is a procedure (native? template) that is true when
+;; the backend would run the segop that template describes natively.  It
+;; is asked before layouts are known (see segop templates above), so that
+;; the fusion pass can fuse exactly the bindings some backend can run as
+;; one native kernel.
+;;
 ;; The backends in use are the value of the parameter segop-backends, a
 ;; list tried in order.  (segop-backends) reads it, (segop-backends list)
 ;; sets it, and (parameterize ((segop-backends list)) ...) replaces it for
 ;; a dynamic extent only.
-(define-record segop-backend name select)
+(define-record-type segop-backend
+  (%make-segop-backend name select kind native?)
+  segop-backend?
+  (name    segop-backend-name)
+  (select  segop-backend-select)
+  (kind    segop-backend-kind)
+  (native? segop-backend-native?))
+
+(define (make-segop-backend name select #!key (kind 'host) (native? #f))
+  "A segop backend called name, selecting executors with select, of the
+   given kind (host, catalogue or codegen), with the native-capability
+   query native? or none."
+  (unless (memq kind '(host catalogue codegen))
+    (error 'make-segop-backend "kind must be host, catalogue or codegen" kind))
+  (unless (or (not native?) (procedure? native?))
+    (error 'make-segop-backend "native? must be a procedure or #f" native?))
+  (%make-segop-backend name select kind native?))
+
+(define (segop-native? tpl)
+  "The first backend in (segop-backends) whose native-capability query
+   accepts segop template tpl, or #f."
+  (let loop ((bs (segop-backends)))
+    (cond ((null? bs) #f)
+          ((and (segop-backend-native? (car bs)) ((segop-backend-native? (car bs)) tpl))
+           (car bs))
+          (else (loop (cdr bs))))))
 
 (define (check-backend-list who bs)
   (unless (and (list? bs) (every segop-backend? bs))
