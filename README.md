@@ -322,14 +322,20 @@ same Scheme code runs as before.
 The kernels compute exactly what that Scheme code computes, so registering
 a backend changes speed, not results.
 
-`ssa-vjp` runs a fusion pass on the program it builds. The pass can fuse
-an element-wise binding into the element-wise binding that consumes it,
+`ssa-vjp` runs a fusion pass on the program it builds. A forward program
+from `morphism-to-ssa` is fused by `ssa-realize/ctx` at its first trace, in
+place, under the policy and the backends in effect then;
+`ssa-program-fused?` tells whether a program has been through the pass.
+Differentiate a forward program before realizing it through a context:
+`ssa-vjp` refuses a program with fused bindings. The pass can fuse an
+element-wise binding into the element-wise binding that consumes it,
 anywhere later in the program, when that consumer is the binding's only use
-and reads it once. A program output counts as a use, so a binding whose
-value is an output is never fused away. A fused binding (op `fused`)
-computes both bindings in one segop and never stores the intermediate
-value. Chains are fused to the end in one pass, and an input that both
-bindings read is read once.
+and reads it once. Either binding may read inputs that broadcast to its
+shape; a broadcast read of the binding itself is not fused. A program
+output counts as a use, so a binding whose value is an output is never
+fused away. A fused binding (op `fused`) computes both bindings in one
+segop and never stores the intermediate value. Chains are fused to the end
+in one pass, and an input that both bindings read is read once.
 
 Whether a legal fusion is made depends on the policy, the value of the
 parameter `segop-fusion` (`array-morphisms-ssa`):
@@ -349,8 +355,9 @@ Segop backends say what they can run natively. Each one has a kind: `host`
 `codegen` (backends that compile any body; none exist yet). Each may also
 answer a native-capability query, `native?`, on a layout-free segop
 template (`make-segop-template`). The fusion pass asks this query, through
-`segop-native?`, before it fuses, and predicts each input's layout: values
-of views are not expected to be flat. The registry backend is a catalogue
+`segop-native?`, before it fuses, and predicts each input's layout: the
+values of bindings that allocate, and reshapes of such values, are
+expected to be flat; other views are not. The registry backend is a catalogue
 backend. It answers from the fused kernels of the active activation
 backend, which are keyed by the body's canonical form
 (`canonical-scalar-body`): commutative operands in a fixed order, inputs
@@ -360,11 +367,15 @@ numbered by first occurrence. It runs a matching segop as
 An activation backend holds fused kernels through
 `activation-backend-add-fused-kernel!`. The crunch backends of
 `array-morphisms-crunch` hold kernels for the bodies the pass forms most
-often in backward passes, such as `g * relu-deriv(x)`. `replay-plan-stats`
-reports under `fused` how many fused bindings run as a native kernel and how
-many on the host. Under `'all`, `ssa-fusion-pass-stats` also lists the
-bodies the pass formed (`candidates`), which shows which fused kernels would
-be worth adding.
+often in backward passes, such as `g * relu-deriv(x)`, and for Llama's
+`b * silu(a)`. `replay-plan-stats` reports under `fused` how many fused
+bindings run as a native kernel and how many on the host.
+`ssa-fusion-pass-stats` lists the bodies the pass formed (`candidates`),
+which under `'all` shows which fused kernels would be worth adding, and
+counts the pairs left unfused by reason (`missed`): no native backend for
+the fused segop (`not-native`), the same with a broadcast input
+(`broadcast-input`), the size bounds (`size-cap`), or a producer read
+through a reshape or transpose (`view`), which the pass does not fuse.
 
 Fusion does not change results. A fused binding rounds each intermediate
 value to its dtype, as storing it in an array would (`(cast f32 ...)` in its
@@ -468,6 +479,12 @@ row-major matrix, and strided copy), and `scheme` handles the rest with
 Scheme loops; as a last resort it evaluates a segop with the reference
 interpreter. Replay results are the same as those of the instructions they
 replaced, bit for bit.
+
+The computed values of a replay live in the context's pool buffers, and
+an output that the trace produced as a strided view is copied into a
+buffer that the plan owns. The next replay of the program overwrites
+these buffers, so a caller that keeps an output across replays copies it.
+Once the plan is compiled, the arrays of the trace run are released.
 
 The timing profile (`replay-timing-results`) and `replay-plan-stats` name
 each segop instruction by its pattern:

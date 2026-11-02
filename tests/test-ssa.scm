@@ -747,6 +747,53 @@
         ;; dW gradient for W comes through transpose -> non-row-major -> must copy
         (= (output-alloc-id (cadr trace-results)) -1))))
 
+  ;; A strided output is copied, at every replay, into one buffer that the
+  ;; plan holds, rather than into a fresh vector per run.
+  (let* ((ctx  (make-morphism-context))
+         (X-mv (input-var '(1.0 2.0 3.0 4.0 5.0 6.0) '(3 2)))
+         (W-mv (param-var '(0.1 0.2 0.3 0.4) '(2 2)))
+         (loss-mv (am:var-mean (am:var-matmul X-mv (am:var-transpose W-mv '(1 0))))))
+    (let-values (((joint trace-results)
+                  (compile-and-realize/ctx ctx loss-mv (list W-mv))))
+      (let ((trace-dW (concrete->list (cadr trace-results)))
+            (data-of  (lambda (a) (cases array-morphism a
+                                    (concrete-array (data _ _ _ _ _ _) data)
+                                    (else #f)))))
+        (finalize-context! ctx)
+        (reset-context! ctx)
+        (let* ((r1 (ssa-realize/ctx ctx joint))
+               (dW1 (concrete->list (cadr r1)))
+               (data1 (data-of (cadr r1))))
+          (reset-context! ctx)
+          (let* ((r2 (ssa-realize/ctx ctx joint)))
+            (test-assert "replay: strided output is row-major with the trace values"
+              (and (concrete-row-major? (cadr r1)) (lists-approx= trace-dW dW1)))
+            (test-assert "replay: strided output reuses the same plan buffer each run"
+              (and (eq? data1 (data-of (cadr r2)))
+                   (lists-approx= trace-dW (concrete->list (cadr r2))))))))))
+
+  ;; Once the plan is compiled the trace arrays are released; later calls
+  ;; still run the plan (each plan run counts as a timing step) and give
+  ;; the trace values.
+  (test-assert "replay keeps running the plan after the trace arrays are released"
+    (let* ((ctx  (make-morphism-context))
+           (W-mv (param-var '(1.0 2.0 3.0 4.0) '(4)))
+           (x-mv (input-var '(0.1 0.2 0.3 0.4) '(4)))
+           (loss-mv (am:var-sum (am:var* W-mv x-mv))))
+      (let-values (((joint trace-results)
+                    (compile-and-realize/ctx ctx loss-mv (list W-mv))))
+        (let ((trace-dW (concrete->list (cadr trace-results))))
+          (finalize-context! ctx)
+          (replay-timing-reset!)
+          (let loop ((i 0) (ok #t))
+            (if (= i 3)
+                (and ok (= 3 (cdr (assq 'steps (replay-timing-results)))))
+                (begin
+                  (reset-context! ctx)
+                  (loop (+ i 1)
+                        (and ok (lists-approx= trace-dW
+                                               (concrete->list (cadr (ssa-realize/ctx ctx joint)))))))))))))
+
   (test-assert "pinning: numerical values identical trace vs replay (row-major case)"
     (let* ((ctx  (make-morphism-context))
            (W-mv (param-var '(1.0 2.0 3.0 4.0) '(4)))
@@ -1460,11 +1507,12 @@
 ;; shape: fused bindings read their inputs at the iteration point.
 (define (fused-inputs-have-shape? joint)
   (let ((shape-of (lambda (v)
-                    (cases ssa-value v
-                      (const-ref (cid) (morph-shape (hash-table-ref (ssa-program-constants joint) cid)))
-                      (binding-ref (bid)
-                        (ssa-binding-shape (car (filter (lambda (b) (eq? (ssa-binding-name b) bid))
-                                                        (ssa-program-bindings joint)))))))))
+                    (let ((c (hash-table-ref/default (ssa-program-constants joint) (ssa-value-id v) #f)))
+                      (if c
+                          (morph-shape c)
+                          (ssa-binding-shape (car (filter (lambda (b) (eq? (ssa-binding-name b)
+                                                                           (ssa-value-id v)))
+                                                          (ssa-program-bindings joint)))))))))
     (every (lambda (b)
              (every (lambda (v) (equal? (shape-of v) (ssa-binding-shape b))) (ssa-binding-inputs b)))
            (fused-bindings joint))))
@@ -1476,8 +1524,8 @@
        results))
 
 (test-group "fusion legality and gradient dtypes"
-  ;; u = x*y + b with a bias b of shape [3]: x*y must not be fused into the
-  ;; add, whose other input is broadcast.
+  ;; u = x*y + b with a bias b of shape [3]: x*y is fused into the add,
+  ;; which reads b through its broadcast map.
   (let* ((make (lambda ()
                  (let* ((x (param-var '(1 2 3 4 5 6) '(2 3)))
                         (y (param-var '(1 1 1 2 2 2) '(2 3)))
@@ -1485,8 +1533,8 @@
                         (u (am:var+ (am:var* x y) b)))
                    (values (am:var-sum (am:var* u u)) (list x y b))))))
     (let-values (((joint trace replay) (parameterize ((segop-fusion 'all)) (ssa-results make))))
-      (test-assert "a product is not fused into an add with a broadcast input"
-        (fused-inputs-have-shape? joint))
+      (test-assert "a product is fused into an add with a broadcast input"
+        (and (pair? (fused-bindings joint)) (not (fused-inputs-have-shape? joint))))
       (test-assert "loss and gradients with a broadcast bias (trace)"
         (equal? '((295922.0) (202.0 404.0 606.0 432.0 840.0 1248.0)
                   (202.0 808.0 1818.0 864.0 2100.0 3744.0) (418.0 824.0 1230.0))
@@ -2476,8 +2524,20 @@
 
 ;; Values of a forward program as lists: with ssa-realize, then traced and
 ;; replayed through a context.
-(define (sf-run prog)
-  (let ((ctx (make-morphism-context)))
+;; prog as it is: prog itself when the fusion policy has been applied to
+;; it, otherwise a copy that ssa-realize/ctx does not fuse at its first
+;; trace.
+(define (sf-as-given prog)
+  (if (ssa-program-fused? prog)
+      prog
+      (make-ssa-program (ssa-program-constants prog) (ssa-program-morph-to-val prog)
+                        (ssa-program-bindings prog) (ssa-program-outputs prog)
+                        (ssa-program-n-params prog) #f #f #f #t)))
+
+;; The results of prog, as it is, from ssa-realize, the trace and two
+;; replays.
+(define (sf-run prog*)
+  (let ((ctx (make-morphism-context)) (prog (sf-as-given prog*)))
     (let ((plain (map concrete->list (ssa-realize prog)))
           (trace (map concrete->list (ssa-realize/ctx ctx prog))))
       (finalize-context! ctx)
@@ -2535,10 +2595,10 @@
     (test "a program output has a result use" '((#f result))
       (sf-uses graph (sf-binding prog '(reduce sum))))
     (let ((fused (ssa-segop-fusion-pass prog)))
-      (test "exp(x) is fused into the product, the broadcast exp(b) is not" 1
+      (test "exp(x), the product and the add are fused, the broadcast exp(b) is not" 1
         (length (sf-fused fused)))
-      (test-assert "the fused binding computes exp(x) and the product"
-        (= 2 (length (sf-members (car (sf-fused fused))))))
+      (test-assert "the fused binding computes exp(x), the product and the add"
+        (= 3 (length (sf-members (car (sf-fused fused))))))
       (test "the fused program computes the same values" (sf-run prog) (sf-run fused))))
 
   ;; A producer that is also a program output keeps its value.
@@ -2789,6 +2849,32 @@
     (let-values (((fused res tags place) (fk-run (morph* yt (morph-exp x)) (make-mock-catalogue '(f32)))))
       (test "an input that is a view is not expected flat, so nothing is fused" '() (sf-fused fused))))
 
+  ;; y is a reshape of a flat value, which keeps its row-major layout.
+  (let* ((x  (fk-arr fk-x '(2 3) 'f32))
+         (yr (morph-reshape (fk-arr fk-y '(3 2) 'f32) (vector 2 3)))
+         (m  (lambda () (morph* yr (morph-exp x)))))
+    (let-values (((fused res tags place) (fk-run (m) (make-mock-catalogue '(f32)))))
+      (test "an input that is a reshape of a flat value is fused" 1 (length (sf-fused fused)))
+      (test "and runs as the fused kernel" '((native . 1) (host . 0)) (values place))
+      (test "with the values of the unfused program" (sf-run (fk-prog (m))) (values res))))
+
+  ;; The pairs left unfused, by reason.
+  (let* ((x (fk-arr fk-x '(2 3) 'f32)) (y (fk-arr fk-y '(2 3) 'f32))
+         (b (fk-arr '(0.5 -1.0 2.0) '(1 3) 'f32))
+         (missed (lambda (m policy)
+                   (parameterize ((segop-fusion policy))
+                     (ssa-segop-fusion-pass (fk-prog m)))
+                   (cdr (assq 'missed (ssa-fusion-pass-stats))))))
+    (test "a pair with no native backend is missed as not-native" '((not-native . 1))
+      (missed (morph* y (morph-exp x)) #t))
+    (test "under all it is fused" '() (missed (morph* y (morph-exp x)) 'all))
+    (test "a fusion reading a broadcast input is missed as broadcast-input"
+      '((not-native . 1) (broadcast-input . 1))
+      (missed (morph* y (morph-exp (morph+ x b))) #t))
+    (test "under all it is fused" '() (missed (morph* y (morph-exp (morph+ x b))) 'all))
+    (test "a producer read through a view is missed as view" '((view . 1))
+      (missed (morph* y (morph-reshape (morph-exp (fk-arr fk-x '(3 2) 'f32)) (vector 2 3))) 'all)))
+
   ;; The catalogue is consulted again when the step runs: without it, the
   ;; fused segop runs on the host and computes the same values.
   (let* ((x (fk-arr fk-x '(2 3) 'f32)) (y (fk-arr fk-y '(2 3) 'f32))
@@ -2827,6 +2913,109 @@
         (sf-run fused)
         (test "a fused binding without a kernel is counted as host" '((native . 0) (host . 1))
           (cdr (assq 'fused (replay-plan-stats fused))))))))
+
+;;;; ============================================================
+;;;; Broadcast inputs
+;;;;
+;;;; A producer or a consumer may read an input that broadcasts to its
+;;;; shape; the fused segop reads it through its broadcast map.
+;;;; ============================================================
+
+(test-group "fusion with broadcast inputs"
+  (for-each
+   (lambda (dtype)
+     (let ((x (fk-arr fk-x '(2 3) dtype)) (y (fk-arr fk-y '(2 3) dtype)))
+       (for-each
+        (lambda (name b)
+          (let* ((m (lambda () (morph* y (morph-exp (morph- x b)))))
+                 (fused (parameterize ((segop-fusion 'all)) (ssa-segop-fusion-pass (fk-prog (m))))))
+            (let-values (((r checks mismatches) (with-segop-checker (lambda () (sf-run fused)))))
+              (test (sprintf "~A, ~A input: the chain is one fused binding" dtype name)
+                1 (length (sf-fused fused)))
+              (test (sprintf "~A, ~A input: the values are those of the unfused program" dtype name)
+                (sf-run (fk-prog (m))) (values r))
+              (test (sprintf "~A, ~A input: the executors agree with the interpreter" dtype name)
+                0 mismatches)
+              (test-assert (sprintf "~A, ~A input: not run by the interpreter" dtype name)
+                (not (memq 'segop/interpreted (map car (plan-segops fused))))))))
+        '("scalar" "row" "column" "rank-1")
+        (list (fk-arr '(0.25) '(1 1) dtype)
+              (fk-arr '(0.5 -1.0 2.0) '(1 3) dtype)
+              (fk-arr '(1.5 -0.25) '(2 1) dtype)
+              (fk-arr '(0.5 -1.0 2.0) '(3) dtype)))))
+   '(f32 f64))
+
+  ;; A broadcast read of the producer itself is not fused.
+  (let* ((x (fk-arr '(0.5 -1.25 2.0) '(1 3) 'f32)) (y (fk-arr fk-y '(2 3) 'f32))
+         (fused (parameterize ((segop-fusion 'all))
+                  (ssa-segop-fusion-pass (fk-prog (morph* y (morph-exp x)))))))
+    (test "a producer read through a broadcast is not fused" '() (sf-fused fused))))
+
+;;;; ============================================================
+;;;; Forward programs
+;;;;
+;;;; A program from morphism-to-ssa is fused by ssa-realize/ctx at its first
+;;;; trace, in place, under the policy and the backends in effect then.
+;;;; ============================================================
+
+;; The results of the trace and two replays of prog through a fresh
+;; context, prog itself being realized.
+(define (fp-run prog)
+  (let* ((ctx (make-morphism-context))
+         (trace (map concrete->list (ssa-realize/ctx ctx prog))))
+    (finalize-context! ctx)
+    (reset-context! ctx)
+    (let ((r1 (map concrete->list (ssa-realize/ctx ctx prog))))
+      (reset-context! ctx)
+      (list trace r1 (map concrete->list (ssa-realize/ctx ctx prog))))))
+
+(test-group "forward programs"
+  (let* ((x (fk-arr fk-x '(2 3) 'f32)) (y (fk-arr fk-y '(2 3) 'f32))
+         (m (lambda () (morph* y (morph-negate (morph-exp x)))))
+         (expect (map concrete->list (ssa-realize (fk-prog (m))))))
+    (let ((prog (fk-prog (m))))
+      (test-assert "a new forward program is not marked fused" (not (ssa-program-fused? prog)))
+      (let ((r (parameterize ((segop-fusion 'all)) (fp-run prog))))
+        (test-assert "it is marked fused after the first trace" (ssa-program-fused? prog))
+        (test "its bindings were fused in place" 1 (length (sf-fused prog)))
+        (test "the trace and the replays give the unfused values"
+          (list expect expect expect) (values r))
+        (let ((bs (ssa-program-bindings prog)))
+          (parameterize ((segop-fusion 'all)) (fp-run prog))
+          (test-assert "a second trace does not fuse again" (eq? bs (ssa-program-bindings prog))))))
+    (let ((prog (fk-prog (m))))
+      (let ((bs (ssa-program-bindings prog)))
+        (parameterize ((segop-fusion #f)) (fp-run prog))
+        (test-assert "with fusion off the bindings are kept" (eq? bs (ssa-program-bindings prog)))
+        (test-assert "and the program is marked" (ssa-program-fused? prog))))
+    (let ((prog (fk-prog (m))))
+      (fp-run prog)
+      (test "without a native backend the default fuses nothing" '() (sf-fused prog))))
+
+  ;; With the mock catalogue active at the first trace, the default fuses
+  ;; y * exp(x) and runs it as the fused kernel.
+  (let* ((x (fk-arr fk-x '(2 3) 'f32)) (y (fk-arr fk-y '(2 3) 'f32))
+         (prog (fk-prog (morph* y (morph-exp x)))))
+    (register-activation-backend! (make-mock-catalogue '(f32)))
+    (let ((r (fp-run prog)))
+      (test "the default fuses the catalogue pattern at the first trace" 1 (length (sf-fused prog)))
+      (test "it runs natively" '((native . 1) (host . 0))
+        (cdr (assq 'fused (replay-plan-stats prog))))
+      (register-activation-backend! #f)
+      (test "with the unfused values"
+        (let ((v (map concrete->list (ssa-realize (fk-prog (morph* y (morph-exp x))))))) (list v v v))
+        (values r))))
+
+  ;; Joint programs are fused by ssa-vjp, and differentiating a fused
+  ;; forward program is refused.
+  (let* ((x (fk-arr fk-x '(2 3) 'f64)) (y (fk-arr fk-y '(2 3) 'f64))
+         (prog (fk-prog (morph-reduce 'sum (morph* y (morph-negate (morph-exp x))) '(0 1) #f))))
+    (let* ((fwd (fk-prog (morph-reduce 'sum (morph* y (morph-negate (morph-exp x))) '(0 1) #f)))
+           (joint (ssa-vjp fwd '() (ssa-loss-binding-val fwd))))
+      (test-assert "a joint program from ssa-vjp is marked fused" (ssa-program-fused? joint)))
+    (parameterize ((segop-fusion 'all)) (fp-run prog))
+    (test-error "ssa-vjp refuses a forward program with fused bindings"
+      (ssa-vjp prog '() (ssa-loss-binding-val prog)))))
 
 
 (test-end)

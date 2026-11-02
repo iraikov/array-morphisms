@@ -40,7 +40,7 @@
    make-ssa-program ssa-program?
    ssa-program-constants ssa-program-morph-to-val
    ssa-program-bindings ssa-program-outputs ssa-program-n-params
-   ssa-program-replay-plan
+   ssa-program-replay-plan ssa-program-fused?
 
    ;; Compilation
    morphism-to-ssa
@@ -178,11 +178,31 @@
 ;;   outputs     : list of ssa-value  (loss first, then param grads)
 ;;   n-params    : count of trainable parameter constants
 ;;   replay-plan   : #f until compiled; vector of replay-instruction (one per binding)
-;;   trace-info    : #f until trace; morph-env bid-sym -> (concrete-array . is-pool?)
-;;   output-specs  : #f until compiled; list of (integer | concrete-array) per output
-;;                   integer = index into vals vector; concrete-array = const-ref value
-(define-record ssa-program constants morph-to-val bindings outputs n-params
-               replay-plan trace-info output-specs)
+;;   trace-info    : #f until trace; morph-env bid-sym -> (concrete-array . is-pool?);
+;;                   released (#f again) once the replay-plan is compiled
+;;   output-specs  : #f until compiled; list of (integer | (pos . buffer) | concrete-array)
+;;                   per output: integer = index into vals vector; (pos . buffer) = the
+;;                   same, copied into buffer when strided; concrete-array = const-ref value
+;;   fused?        : true once the fusion policy has been applied to the bindings
+;;                   (by ssa-vjp, or by ssa-realize/ctx at the first trace)
+(define-record-type ssa-program
+  (%make-ssa-program constants morph-to-val bindings outputs n-params
+                     replay-plan trace-info output-specs fused?)
+  ssa-program?
+  (constants    ssa-program-constants)
+  (morph-to-val ssa-program-morph-to-val)
+  (bindings     ssa-program-bindings ssa-program-bindings-set!)
+  (outputs      ssa-program-outputs)
+  (n-params     ssa-program-n-params)
+  (replay-plan  ssa-program-replay-plan ssa-program-replay-plan-set!)
+  (trace-info   ssa-program-trace-info ssa-program-trace-info-set!)
+  (output-specs ssa-program-output-specs ssa-program-output-specs-set!)
+  (fused?       ssa-program-fused? ssa-program-fused?-set!))
+
+(define (make-ssa-program constants morph-to-val bindings outputs n-params
+                          replay-plan trace-info output-specs #!optional (fused? #f))
+  (%make-ssa-program constants morph-to-val bindings outputs n-params
+                     replay-plan trace-info output-specs fused?))
 
 
 ;;; ============================================================
@@ -528,7 +548,9 @@
 ;;; Segop fusion
 ;;;
 ;;; Fuses map bindings into the map bindings that consume them, before
-;;; the program is traced.  A fused binding has op fused and computes its
+;;; the program is traced: ssa-vjp runs the pass on the joint program it
+;;; builds, and ssa-realize/ctx on a forward program at its first trace.
+;;; A fused binding has op fused and computes its
 ;;; members in one seg-map, described by a fusion template (see
 ;;; segop-lower.scm); it takes the place of its last member, the
 ;;; consumer, whose name and result it keeps.
@@ -541,7 +563,9 @@
 ;;; map binding with a single output, its only use is a fusible edge from
 ;;; C, and C's body reads it once.  The value of P then never exists: every
 ;;; point of the fused binding computes it, once, from P's inputs, which
-;;; are read at C's position.
+;;; are read at C's position.  Either binding may read inputs that
+;;; broadcast to its shape; the fused binding reads them through their
+;;; broadcast maps.
 ;;;
 ;;; The fused body is C's body with P's body in place of its reads of P,
 ;;; rounded to P's dtype as storing P's value would round it, so fusion
@@ -556,8 +580,9 @@
 ;;; only when some segop backend reports that it would run the fused segop
 ;;; natively, such as a catalogue of compiled fused kernels; the query is
 ;;; asked of a layout-free template, with each input's layout predicted
-;;; (values of views are not expected to be flat).  The policy all (see
-;;; segop-fusion) fuses every legal pair.
+;;; (values of bindings that allocate, and reshapes of them, are expected
+;;; to be flat; other views are not).  The policy all (see segop-fusion)
+;;; fuses every legal pair.
 ;;;
 ;;; The driver visits the bindings from last to first and fuses into each
 ;;; consumer until nothing more fuses, so a chain collapses in one visit.
@@ -581,9 +606,16 @@
   "An alist describing the last run of ssa-segop-fusion-pass: rounds (the
    rounds run), fusions (the producers fused away), bound-reached? (true
    when the last round still fused and the round bound stopped the pass)
-   and candidates, the bodies of the fused bindings made, each a list
+   candidates, the bodies of the fused bindings made, each a list
    (canonical-body dtype count elements): how many bindings have that
-   body and dtype, and their total number of elements."
+   body and dtype, and their total number of elements; and missed, an
+   alist from reason to the number of pairs the last round left unfused
+   for that reason: not-native (the policy found no backend to run the
+   fused segop natively), broadcast-input (the same, for a fused segop
+   that reads a broadcast input), size-cap (the fused body or its inputs
+   exceed the bounds)
+   or view (the producer reaches the consumer through a reshape or a
+   transpose)."
   *fusion-pass-stats*)
 
 ;; Views: their values share the buffer of their source, in a layout that
@@ -746,11 +778,12 @@
         (else (+ 1 (fold + 0 (map scalar-body-size (cdr e)))))))
 
 (define (fused-result-legal? f vtab)
-  "True when every input of fused binding f has its shape, and its inputs
+  "True when every input of fused binding f has its shape or broadcasts to
+   it (the input is then read through its broadcast map), and its inputs
    and body are within the size bounds."
   (let ((shape (ssa-binding-shape f)))
     (and (<= (length (ssa-binding-inputs f)) fusion-max-inputs)
-         (every (lambda (v) (equal? (car (hash-table-ref vtab (ssa-value-id v))) shape))
+         (every (lambda (v) (broadcastable? (car (hash-table-ref vtab (ssa-value-id v))) shape))
                 (ssa-binding-inputs f))
          (<= (scalar-body-size (cdr (assq 'body (ssa-binding-meta f)))) fusion-max-body-size))))
 
@@ -819,21 +852,26 @@
          (pos    (make-hash-table eq?))
          (vtab (fusion-value-table prog))
          (uses   (fusion-uses prog vtab))
-         (views  (let ((h (make-hash-table eq?)))
-                   (for-each (lambda (b)
-                               (when (memq (ssa-binding-op b) fusion-view-ops)
-                                 (hash-table-set! h (ssa-binding-name b) #t)))
-                             (ssa-program-bindings prog))
-                   h))
+         (layouts (make-hash-table eq?))
          (max-rounds (segop-fusion-max-rounds)))
 
     ;; True when value v is expected to be stored row-major, at offset 0:
-    ;; a constant with that layout, or the result of a binding that is not
-    ;; a view (bindings that allocate write row-major pool buffers).
+    ;; a constant with that layout, the result of a binding that allocates
+    ;; (pool buffers are row-major), or a reshape of such a value, which
+    ;; keeps its buffer and its row-major order.  Other views are not
+    ;; expected to be flat.
     (define (flat? v)
       (cases ssa-value v
         (const-ref (cid) (concrete-row-major? (hash-table-ref (ssa-program-constants prog) cid)))
-        (binding-ref (bid) (not (hash-table-ref/default views bid #f)))))
+        (binding-ref (bid) (hash-table-ref/default layouts bid #t))))
+    (for-each (lambda (b)
+                (let ((op (ssa-binding-op b)))
+                  (cond ((eq? op 'reshape)
+                         (hash-table-set! layouts (ssa-binding-name b)
+                                          (flat? (car (ssa-binding-inputs b)))))
+                        ((memq op fusion-view-ops)
+                         (hash-table-set! layouts (ssa-binding-name b) #f)))))
+              (ssa-program-bindings prog))
     (do ((i 0 (+ i 1))) ((= i n))
       (hash-table-set! pos (ssa-binding-name (vector-ref bv i)) i))
 
@@ -859,6 +897,44 @@
         (vector-set! bv (hash-table-ref pos c-name) f)
         (add-fusion-edges! uses f vtab)))
 
+    ;; The reasons for which the current round left pairs unfused, as an
+    ;; alist from reason to count.
+    (define missed '())
+    (define (miss! reason)
+      (let ((e (assq reason missed)))
+        (if e (set-cdr! e (+ (cdr e) 1)) (set! missed (cons (cons reason 1) missed)))))
+
+    ;; True when the only use of the value named name is a fusible read by
+    ;; the binding named c-name.
+    (define (single-fusible-use? name c-name)
+      (let ((u (hash-table-ref/default uses name '())))
+        (and (= (length u) 1)
+             (eq? (car (car u)) c-name)
+             (eq? (caddr (car u)) 'fusible))))
+
+    ;; Records why the fusion of p into c, of which p is input k, is not
+    ;; made, when p is a candidate that the rules or the policy refuse.
+    (define (note-missed! p c k)
+      (cond ((can-fuse? uses p c k)
+             (let ((f (fuse-into p c k vtab)))
+               (cond ((not (fused-result-legal? f vtab)) (miss! 'size-cap))
+                     ((fusion-profitable? f vtab flat?))
+                     ((every (lambda (v) (equal? (car (hash-table-ref vtab (ssa-value-id v)))
+                                                 (ssa-binding-shape f)))
+                             (ssa-binding-inputs f))
+                      (miss! 'not-native))
+                     (else (miss! 'broadcast-input)))))
+            ((and (memq (ssa-binding-op p) '(reshape transpose))
+                  (fusion-map-binding? c)
+                  (single-fusible-use? (ssa-binding-name p) (ssa-binding-name c))
+                  (let ((q (binding-of (car (ssa-binding-inputs p)))))
+                    (and q
+                         (fusion-map-binding? q)
+                         (let ((u (hash-table-ref/default uses (ssa-binding-name q) '())))
+                           (and (= (length u) 1)
+                                (eq? (car (car u)) (ssa-binding-name p)))))))
+             (miss! 'view))))
+
     ;; Fuses one producer into the binding at position i; true if it did.
     (define (fuse-one! i)
       (let ((c (vector-ref bv i)))
@@ -866,14 +942,16 @@
           (and (pair? vs)
                (or (let ((p (binding-of (car vs))))
                      (and p
-                          (can-fuse? uses p c k)
-                          (let ((f (fuse-into p c k vtab)))
-                            (and (fused-result-legal? f vtab)
-                                 (fusion-profitable? f vtab flat?)
-                                 (begin (commit! p c f) #t)))))
+                          (or (and (can-fuse? uses p c k)
+                                   (let ((f (fuse-into p c k vtab)))
+                                     (and (fused-result-legal? f vtab)
+                                          (fusion-profitable? f vtab flat?)
+                                          (begin (commit! p c f) #t))))
+                              (begin (note-missed! p c k) #f))))
                    (loop (cdr vs) (+ k 1)))))))
 
     (define (run-round)
+      (set! missed '())
       (let loop ((i (- n 1)) (count 0))
         (if (< i 0)
             count
@@ -888,7 +966,8 @@
         (if (or (= fused 0) (>= r max-rounds))
             (set! *fusion-pass-stats*
                   `((rounds . ,r) (fusions . ,total) (bound-reached? . ,(> fused 0))
-                    (candidates . ,(fusion-candidates (filter (lambda (b) b) (vector->list bv))))))
+                    (candidates . ,(fusion-candidates (filter (lambda (b) b) (vector->list bv))))
+                    (missed . ,(reverse missed))))
             (rounds (+ r 1) total))))
 
     (make-ssa-program
@@ -897,7 +976,7 @@
      (filter (lambda (b) b) (vector->list bv))
      (ssa-program-outputs prog)
      (ssa-program-n-params prog)
-     #f #f #f)))
+     #f #f #f #t)))
 
 (define (realize-fused-binding ctx b inputs)
   "Realize fused binding b on the concrete arrays inputs, through its segop
@@ -1025,7 +1104,13 @@
   "Compute symbolic VJP of fwd-prog with respect to params.
    param-const-vals: list of (const-ref cid) ssa-values for trainable params.
    loss-binding-val: (binding-ref bid) ssa-value for the loss node.
-   Returns extended ssa-program."
+   Returns extended ssa-program.  fwd-prog must not contain fused
+   bindings, which have no derivative rule: a forward program realized
+   through a context is fused at its first trace, so differentiate it
+   before realizing it, or build it again with morphism-to-ssa."
+
+  (when (any fused-binding? (ssa-program-bindings fwd-prog))
+    (error "ssa-vjp: the forward program contains fused bindings"))
 
   (let* (;; Build shape/dtype lookup from forward bindings (single env-builder)
          (fwd-bindings  (ssa-program-bindings fwd-prog))
@@ -1660,7 +1745,7 @@
         all-bindings
         all-outputs
         (length param-const-vals)
-        #f #f #f)))))
+        #f #f #f #t)))))
 
 
 ;;; Helper: find a forward binding by its bid-symbol
@@ -2002,8 +2087,16 @@
 (define (copy-concrete-array m)
   (cases array-morphism m
     (concrete-array (data shape strides offset dtype alloc-id batch-axis)
+      (copy-concrete-array-into m (allocate-typed-vector dtype (shape-size shape))))
+    (else (error "copy-concrete-array: not a concrete-array" m))))
+
+;; Copy the elements of concrete array m, in row-major order, into the
+;; typed vector new-data, which holds at least as many elements as m, and
+;; return a row-major array over new-data (alloc-id -1).
+(define (copy-concrete-array-into m new-data)
+  (cases array-morphism m
+    (concrete-array (data shape strides offset dtype alloc-id batch-axis)
       (let* ((size     (shape-size shape))
-             (new-data (allocate-typed-vector dtype size))
              (new-strs (compute-strides shape))
              (rank     (vector-length shape)))
          (cond
@@ -2016,7 +2109,7 @@
           (else
            (%copy-concrete-array-slow data shape strides offset dtype new-data size)))
         (concrete-array new-data shape new-strs 0 dtype -1 batch-axis)))
-    (else (error "copy-concrete-array: not a concrete-array" m))))
+    (else (error "copy-concrete-array-into: not a concrete-array" m))))
 
 ;;; ============================================================
 ;;; Replay Plan: compile-time classification helpers
@@ -2598,13 +2691,26 @@
           (loop (cdr bs) (+ i 1)))))
 
     ;; Pre-compute output specs to eliminate name->idx hash-table rebuild per replay step.
-    ;; Each spec is either an integer (0-based position in vals for binding-refs)
-    ;; or a concrete-array (the constant value itself for const-refs).
+    ;; Each spec is one of
+    ;;   an integer       the 0-based position in vals of a binding-ref output;
+    ;;   (pos . buffer)   the same for an output that the trace produced as a
+    ;;                    strided view, with a buffer of the plan that each
+    ;;                    replay copies it into in row-major order;
+    ;;   a concrete-array the constant value itself, for const-refs.
     (let ((output-specs
            (map (lambda (ov)
                   (cases ssa-value ov
-                    (binding-ref (bid) (or (env-builder-lookup name->pos-eb bid)
-                                           (error "compile-replay-plan: output binding not found" bid)))
+                    (binding-ref (bid)
+                      (let ((pos  (or (env-builder-lookup name->pos-eb bid)
+                                      (error "compile-replay-plan: output binding not found" bid)))
+                            (info (morph-env-lookup trace-info bid)))
+                        (if (and info (concrete-array? (car info))
+                                 (not (concrete-row-major? (car info))))
+                            (cases array-morphism (car info)
+                              (concrete-array (_ shape _ _ dtype _ _)
+                                (cons pos (allocate-typed-vector dtype (shape-size shape))))
+                              (else pos))
+                            pos)))
                     (const-ref   (cid) (hash-table-ref constants cid))))
                 (ssa-program-outputs prog))))
       (ssa-program-output-specs-set! prog output-specs))
@@ -2875,11 +2981,26 @@
 
    First replay call (context in replay mode, no plan yet):
      Lazily compiles the replay-plan from trace-info + finalized pool, then
-     executes it via execute-replay-plan.
+     executes it via execute-replay-plan.  The trace-info, and with it the
+     arrays of the trace run, is released once the plan exists.
 
    Subsequent replay calls:
      Executes the pre-compiled replay-plan directly.  No morphism rebuilding,
-     no BLAS-compat re-evaluation, no context-vector allocation per binding."
+     no BLAS-compat re-evaluation, no context-vector allocation per binding.
+
+   The outputs of a replay call live in pool buffers, or, for an output
+   that is a strided view, in a buffer of the plan that receives its
+   row-major copy; the next replay call of the program overwrites them, so
+   a caller that keeps an output across calls copies it first.
+
+   A program to which the fusion policy has not been applied yet (a
+   forward program from morphism-to-ssa) is fused at its first trace,
+   under the policy and the backends in effect then; its bindings are
+   replaced by the fused ones."
+  (when (and (eq? (context-mode ctx) 'trace) (not (ssa-program-fused? prog)))
+    (when (segop-fusion)
+      (ssa-program-bindings-set! prog (ssa-program-bindings (ssa-segop-fusion-pass prog))))
+    (ssa-program-fused?-set! prog #t))
   (let* ((mode        (context-mode ctx))
          (trace-mode? (eq? mode 'trace))
          (constants   (ssa-program-constants prog))
@@ -2887,13 +3008,15 @@
 
     (cond
       ;; ---- BINDING-LOOP PATH ----
-      ;; Used for the trace run AND for any replay call where trace-info is
-      ;; missing (e.g., when the caller's joint-program state table missed a
-      ;; lookup due to GC-invalidated eq?-hash keys and created a fresh
-      ;; program).  In both cases we run every binding via realize/ctx, collect
-      ;; trace-info, and return the outputs.  Output pinning via
-      ;; context-pin-output! is only performed in true trace mode.
-      ((or trace-mode? (not (ssa-program-trace-info prog)))
+      ;; Used for the trace run AND for any replay call of a program that
+      ;; has neither a replay plan nor trace-info (e.g., when the caller's
+      ;; joint-program state table missed a lookup due to GC-invalidated
+      ;; eq?-hash keys and created a fresh program).  In both cases we run
+      ;; every binding via realize/ctx, collect trace-info, and return the
+      ;; outputs.  Output pinning via context-pin-output! is only performed
+      ;; in true trace mode.
+      ((or trace-mode?
+           (not (or (ssa-program-replay-plan prog) (ssa-program-trace-info prog))))
        (let* ((values       (make-hash-table))
               (trace-info-eb (make-env-builder))
               (output-bids-eb (make-env-builder)))
@@ -2956,22 +3079,29 @@
 
       ;; ---- REPLAY RUN ----
       (else
-       ;; Lazily compile replay-plan on first replay call (pool is now available)
+       ;; Lazily compile replay-plan on first replay call (pool is now
+       ;; available).  The trace arrays are not needed once the plan exists.
        (unless (ssa-program-replay-plan prog)
-         (ssa-program-replay-plan-set! prog (compile-replay-plan prog ctx)))
+         (ssa-program-replay-plan-set! prog (compile-replay-plan prog ctx))
+         (ssa-program-trace-info-set! prog #f))
        ;; Execute the pre-compiled plan directly
        (let* ((plan  (ssa-program-replay-plan prog))
               (pool  (morphism-context-pool ctx))
               (vals  (execute-replay-plan plan pool constants))
               ;; output-specs pre-computed by compile-replay-plan: list of
-              ;; (integer | concrete-array) -- no hash-table rebuild per step.
+              ;; (integer | (pos . buffer) | concrete-array) -- no hash-table
+              ;; rebuild per step.
               (specs (ssa-program-output-specs prog)))
            (time-instr 'ri-output-mapping
              (map (lambda (spec)
-                    (if (integer? spec)
-                        (let ((v (vector-ref vals spec)))
-                          (if (concrete-row-major? v) v (copy-concrete-array v)))
-                        spec))   ; const-ref: direct concrete-array from constants
+                    (cond
+                     ((integer? spec)
+                      (let ((v (vector-ref vals spec)))
+                        (if (concrete-row-major? v) v (copy-concrete-array v))))
+                     ((pair? spec)
+                      (let ((v (vector-ref vals (car spec))))
+                        (if (concrete-row-major? v) v (copy-concrete-array-into v (cdr spec)))))
+                     (else spec)))   ; const-ref: direct concrete-array from constants
                   specs)))))
 
     ))
