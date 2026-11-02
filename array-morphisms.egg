@@ -43,7 +43,8 @@
 
              (extension array-morphisms-realization (source "realization.scm") (csc-options "-O3" "-d1")
                         (component-dependencies array-morphisms-micro-blas-backend
-                                                array-morphisms-activation-exec))
+                                                array-morphisms-activation-exec
+                                                array-morphisms-scalar-ops))
              (extension array-morphisms-context     (source "context.scm")     (csc-options "-O2" "-d1"))
              (extension array-morphisms-batch-ops   (source "batch-ops.scm")   (csc-options "-O2" "-d1"))
              (extension array-morphisms-grad        (source "grad.scm")        (csc-options "-O2" "-d1"))

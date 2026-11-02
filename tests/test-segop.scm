@@ -196,9 +196,9 @@
              (let* ((a (in 0)) (b (* a a))) (if (> b 1.0) b a)))))
   (test-assert "invalid bodies"
     (not (any-of (lambda (e) (scalar-expr-valid? e 2 3))
-                 '((in 2) (idx 3) (relu (in 0) (in 1)) (foo (in 0)) (acc) unbound-var
+                 '((in 2) (idx 3) (relu (in 0) (in 1)) (foo (in 0)) (reduced) unbound-var
                    (let* ((a)) a)))))
-  (test-assert "(acc) is valid in a finalize body" (scalar-expr-valid? '(/ (acc) 4.0) 0 0 acc?: #t))
+  (test-assert "(reduced) is valid in a finalize body" (scalar-expr-valid? '(/ (reduced) 4.0) 0 0 reduced?: #t))
   (test-assert "opaque bodies are valid" (scalar-expr-valid? (list 'opaque sqrt '(in 0)) 1 1))
   (test "table ops are evaluated from their expressions" 0.0
     (eval-scalar-expr '(relu (in 0)) (sg-reader -3.0)))
@@ -209,7 +209,7 @@
                       (sg-reader) params: #(0.0 4.0) coords: #(9 7)))
   (test "opaque parts call their procedure" 5.0
     (eval-scalar-expr (list 'opaque (lambda (x y) (+ x y)) '(in 0) 2.0) (sg-reader 3.0)))
-  (test "acc in a finalize body" 2.5 (eval-scalar-expr '(/ (acc) 4.0) (sg-reader) acc: 10.0))
+  (test "reduced in a finalize body" 2.5 (eval-scalar-expr '(/ (reduced) 4.0) (sg-reader) reduced: 10.0))
   (test-assert "every table op evaluates as its combiner on flonums"
     (every (lambda (op)
              (let ((f (scalar-op-combiner op)) (n (scalar-op-arity op)))
@@ -236,7 +236,7 @@
          (not (scalar-expr-opaque? '(relu (in 0))))))
   ;; (cast dtype e) rounds as a store to dtype would
   (test-assert "casts are valid with a known dtype"
-    (and (scalar-expr-valid? '(relu (cast f32 (acc))) 0 0 acc?: #t)
+    (and (scalar-expr-valid? '(relu (cast f32 (reduced))) 0 0 reduced?: #t)
          (scalar-expr-valid? '(cast s64 (in 1)) 2 0)))
   (test-assert "invalid casts"
     (not (any-of (lambda (e) (scalar-expr-valid? e 2 0))
@@ -250,7 +250,7 @@
     (every (lambda (x) (sg-same? x (eval-scalar-expr '(cast f64 (in 0)) (sg-reader x)))) sg-values))
   (test "a cast to s32 truncates" -2 (eval-scalar-expr '(cast s32 (in 0)) (sg-reader -2.7)))
   (test "a cast inside a finalize body" (round-to-f32 (/ 1.0 3.0))
-    (eval-scalar-expr '(cast f32 (/ (acc) 3.0)) (sg-reader) acc: 1.0))
+    (eval-scalar-expr '(cast f32 (/ (reduced) 3.0)) (sg-reader) reduced: 1.0))
   (test "substitution rewrites under a cast and keeps its dtype"
     '(cast f32 (relu (in 3)))
     (scalar-expr-substitute-inputs '(cast f32 (relu (in 0))) (lambda (k) '(in 3))))
@@ -405,7 +405,7 @@
 
   (let* ((data (sg-f64 '(1 2 3 4 5 6)))  ; [2 3]
          (out (make-f64vector 3)))
-    (segop-interpret (sg-col-sum 'f64 2 3 (make-combine-spec 'add 0.0 'f64) '(/ (acc) 2.0))
+    (segop-interpret (sg-col-sum 'f64 2 3 (make-combine-spec 'add 0.0 'f64) '(/ (reduced) 2.0))
                      (list data) (list out))
     (test "mean over axis 0 as a finalize step" '(2.5 3.5 4.5) (f64vector->list out)))
 
@@ -462,7 +462,7 @@
                            (list (make-red-result (sg-op 'f64 #(2 2) (identity-index-map 2))
                                                   '(mul (in 0) (in 1))
                                                   (make-combine-spec 'add 0.0 'f64 'unspecified)
-                                                  '(relu (add (acc) (in 2))))))))
+                                                  '(relu (add (reduced) (in 2))))))))
     (segop-interpret sr (list A B bias) (list out))
     (test "a GEMM with a bias and relu epilogue" '(0.0 0.0 5.5 0.0)
       (f64vector->list out)))
@@ -553,7 +553,7 @@
     (test-error "a finalize input may not use a reduced dimension"
       (make-seg-red #(2 3) 1 (list (id2))
                     (list (make-red-result (sg-op 'f64 #(2) (identity-index-map 1)) '(in 0)
-                                           (make-combine-spec 'add 0.0 'f64) '(add (acc) (in 0))))))
+                                           (make-combine-spec 'add 0.0 'f64) '(add (reduced) (in 0))))))
     (test-error "an unknown combine op" (make-combine-spec 'avg 0.0 'f64))
     (test-error "the blocked order needs a block size" (make-combine-spec 'add 0.0 'f64 'blocked))
     (test-error "an unknown accumulator dtype" (make-combine-spec 'add 0.0 'f16))
@@ -628,6 +628,21 @@
                        (bc-compiled (cons op (map (lambda (k) `(in ,k)) (iota (length args)))) args))))
            (filter scalar-op-generic? (filter (lambda (op) (not (memq op '(div pow log sqrt))))
                                               (scalar-op-names)))))
+  (test-assert "binary table ops on signed zeros agree with the combiner and the interpreter"
+    (every (lambda (op)
+             (every (lambda (args)
+                      (let ((body (list op '(in 0) '(in 1))))
+                        (and (sg-same? (apply (scalar-op-combiner op) args) (bc-compiled body args))
+                             (sg-same? (bc-evaluated body args) (bc-compiled body args)))))
+                    '((0.0 0.0) (0.0 -0.0) (-0.0 0.0) (-0.0 -0.0))))
+           (filter (lambda (op) (= (scalar-op-arity op) 2)) (scalar-op-names))))
+  (test-assert "add of -0.0 and -0.0 is -0.0, compiled and interpreted, as op and as +"
+    (every (lambda (body)
+             (and (eqv? -0.0 (bc-compiled body '(-0.0 -0.0)))
+                  (eqv? -0.0 (bc-evaluated body '(-0.0 -0.0)))))
+           '((add (in 0) (in 1)) (+ (in 0) (in 1)))))
+  (test "the add combiner gives -0.0 for -0.0 and -0.0" -0.0 ((scalar-op-combiner 'add) -0.0 -0.0))
+  (test "the add combiner adds integers exactly" 4 ((scalar-op-combiner 'add) 7 -3))
   (test-assert "nested bodies agree with eval-scalar-expr"
     (every (lambda (case)
              (sg-same? (bc-evaluated (car case) (cdr case)) (bc-compiled (car case) (cdr case))))
@@ -665,7 +680,23 @@
     ((scalar-expr->procedure '(in 0) 4) 1.0 2.0))
   (test-error "(param k) is not supported" (scalar-expr->procedure '(param 0) 0))
   (test-error "(idx d) is not supported" (scalar-expr->procedure '(idx 0) 0))
-  (test-error "(acc) is not supported" (scalar-expr->procedure '(acc) 0))
+  (test-error "(reduced) needs reduced?" (scalar-expr->procedure '(reduced) 0))
+  (test "(reduced) alone is the reduced value" 2.5
+        ((scalar-expr->procedure '(reduced) 0 reduced?: #t) 2.5))
+  (test-assert "a finalize body agrees with eval-scalar-expr for 0, 2 and 4 inputs"
+    (every (lambda (case)
+             (let* ((body (car case)) (args (cdr case)) (r -1.25)
+                    (f (scalar-expr->procedure body (length args) reduced?: #t)))
+               (sg-same? (eval-scalar-expr body (lambda (k) (list-ref args k)) reduced: r)
+                         (apply f (append args (list r))))))
+           (list (cons '(sigmoid (cast f32 (reduced))) '())
+                 (cons '(relu (add (reduced) (in 1))) '(0.5 3.0))
+                 (cons '(add (mul (in 3) (reduced)) (in 0)) '(1.0 2.0 3.0 4.0)))))
+  (test-error "the old form (acc) is not a valid body"
+    (scalar-expr->procedure '(acc) 0 reduced?: #t))
+  (test "scalar-expr-substitute-reduced replaces every (reduced)"
+        '(add (in 0) (mul (cast f32 (in 1)) (cast f32 (in 1))))
+        (scalar-expr-substitute-reduced '(add (in 0) (mul (reduced) (reduced))) '(cast f32 (in 1))))
   (test-error "an invalid body is rejected" (scalar-expr->procedure '(relu (in 0) (in 1)) 2))
   (test-error "an input beyond the arity is rejected" (scalar-expr->procedure '(in 2) 2)))
 
@@ -708,6 +739,9 @@
   (test "casts to different dtypes are kept" '((cast f64 (cast f32 (in 0))) (0))
     (canon '(cast f64 (cast f32 (in 0)))))
   (test "unread inputs come last" '((exp (in 0)) (2 0 1)) (canon '(exp (in 2)) 3))
+  (test "(reduced) is a leaf of a canonical body"
+    '((mul (in 0) (reduced)) (0))
+    (canon '(mul (reduced) (in 0))))
   (for-each
    (lambda (body)
      (test-assert (sprintf "canonical form is idempotent: ~S" body)
@@ -745,7 +779,21 @@
         (parameterize ((segop-backends (list cat)))
           (segop-native? (make-segop-template #(4) (list tin) '())))))
     (test-error "an unknown kind is an error"
-      (make-segop-backend 'x (lambda (sg) #f) kind: 'gpu))))
+      (make-segop-backend 'x (lambda (sg) #f) kind: 'gpu)))
+  (test "a template without nred describes a seg-map" 0
+    (segop-template-nred (make-segop-template #(2) '() '())))
+  (test "an output without a combine spec is a map output" '(#f #f #f)
+    (let ((o (make-template-output 'f32 '(in 0))))
+      (list (template-output-combine o) (template-output-finalize o) (template-output-map o))))
+  (let* ((spec (make-combine-spec 'add 0.0 'f32))
+         (m    (permutation-index-map '(1 0)))
+         (o    (make-template-output 'f32 '(in 0) spec '(sqrt (reduced)) m))
+         (tpl  (make-segop-template #(3 4) '() (list o) 1)))
+    (test "a reduction template keeps nred" 1 (segop-template-nred tpl))
+    (test-assert "a reduced output keeps its combine spec, finalize and map"
+      (and (eq? spec (template-output-combine o))
+           (equal? '(sqrt (reduced)) (template-output-finalize o))
+           (eq? m (template-output-map o))))))
 
 
 (test-exit)

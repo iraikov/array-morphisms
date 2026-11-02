@@ -15,10 +15,12 @@
 
 (import scheme (chicken base) (chicken format)
         test
-        (only srfi-1 iota every any map filter filter-map take drop fold delete-duplicates)
+        (only srfi-1 iota every any map filter filter-map take drop fold delete-duplicates list-index
+              append-map)
         (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!
               make-f32vector f32vector-ref f32vector-set! f32vector->list f64vector->list
-              list->s32vector s32vector->list make-s32vector make-f64vector)
+              list->s32vector s32vector->list make-s32vector make-f64vector
+              s32vector-set! s32vector-ref)
         srfi-69
         datatype
         array-morphisms-core
@@ -1409,7 +1411,7 @@
                               segop/flat-broadcast segop/reduce-1d segop/reduce-axis0
                               segop/gemm segop/gemm-strided segop/gemm-epilogue
                               segop/reduce-axis1 segop/reduce-general segop/gather
-                              segop/strided-map)))
+                              segop/strided-map segop/strided-red)))
                   tags))
          (test-assert (sprintf "~A: relu keeps its symbolic body" dtype)
            (any (lambda (ts) (equal? (cases segop (cdr ts)
@@ -1417,10 +1419,14 @@
                                        (else #f))
                                      '(relu (in 0))))
                 segs))
-         ;; an f32 producer's value is rounded to f32 inside the fused body
+         ;; an f32 producer's value is rounded to f32 inside the fused body,
+         ;; which is the body of the mean the exp is fused into
          (test-assert (sprintf "~A: the fused negate and exp have a composed body" dtype)
            (any (lambda (ts) (equal? (cases segop (cdr ts)
                                        (seg-map (space ins outs bodies fallback) (car bodies))
+                                       (seg-red (space nred ins results map-outs fallback)
+                                         (let ((b (red-result-body (car results))))
+                                           (if (and (pair? b) (eq? (car b) 'cast)) (caddr b) b)))
                                        (else #f))
                                      (if (eq? dtype 'f32)
                                          '(exp (cast f32 (negate (in 0))))
@@ -1457,7 +1463,7 @@
       (test-assert "broadcast segops were checked" (> checks 0))))
 
   (test "the body of a plain binding names its op" '(add (in 0) (in 1))
-    (binding-scalar-body (make-ssa-binding* 'add 2 '()) +))
+    (binding-scalar-body (make-ssa-binding* 'add 2 '()) (scalar-op-combiner 'add)))
   (test-assert "a binding whose combiner is not its op's gets an opaque body"
     (let ((body (binding-scalar-body (make-ssa-binding* 'add 2 '()) -)))
       (and (eq? (car body) 'opaque) (eq? (cadr body) -))))
@@ -1835,6 +1841,160 @@
       (test "an opaque map is interpreted" 'segop/interpreted (car ex))
       ((cdr ex) (deref-of `((a . ,a))) buf)
       (test "the interpreted gather reads the second row" '(4.0 5.0 6.0) (f64vector->list buf)))))
+
+;;;; ============================================================
+;;;; The strided seg-red executor
+;;;;
+;;;; Seg-reds that are not standard reductions (two inputs, a body other
+;;;; than (in 0), map outputs, finalize bodies with inputs) run on the
+;;;; strided reduction executor, which must write exactly what
+;;;; segop-interpret writes.
+;;;; ============================================================
+
+(define (e4-map . es) (make-index-map (list->vector es) #f 0.0 #f))
+
+;; A concrete array over data with the given shape and strides.
+(define (e4-arr data shape strides dtype) (concrete-array data shape strides 0 dtype -1 -1))
+
+(define (e4-data arr)
+  (cases array-morphism arr
+    (concrete-array (data _ _ _ _ _ _) data)
+    (else (error "e4-data: not concrete" arr))))
+
+;; An operand at slot reading array arr (of the given dtype) through map m.
+(define (e4-op slot arr dtype m)
+  (cases array-morphism arr
+    (concrete-array (_ s st off _ _ _) (make-segop-operand slot dtype s st off m))
+    (else (error "e4-op: not concrete" arr))))
+
+;; A row-major output operand of the given shape, written through m.
+(define (e4-out dtype shape m) (make-segop-operand #f dtype shape (compute-strides shape) 0 m))
+
+;; Runs seg-red sg on the arrays of arrs (an alist from slot to array)
+;; with its selected executor and with segop-interpret, each into fresh
+;; output buffers of the given (dtype size) specs.  Returns the tag and
+;; whether every output element is the same in both, NaNs included.
+(define (e4-run sg arrs outs)
+  (let* ((ex    (select-segop-executor sg))
+         (mk    (lambda () (map (lambda (o) (allocate-typed-vector (car o) (cadr o))) outs)))
+         (b1    (mk))
+         (b2    (mk))
+         (deref (lambda (s) (cdr (assq s arrs)))))
+    ((cdr ex) deref (car b1) (cdr b1))
+    (segop-interpret sg (map (lambda (o) (e4-data (deref (segop-operand-slot o)))) (segop-inputs sg)) b2)
+    (list (car ex)
+          (every (lambda (o x y)
+                   (every (lambda (i)
+                            (let ((u (typed-vector-ref x (car o) i)) (v (typed-vector-ref y (car o) i)))
+                              (if (and (flonum? u) (flonum? v) (nan? u) (nan? v)) #t (eqv? u v))))
+                          (iota (cadr o))))
+                 outs b1 b2)
+          b1)))
+
+(define e4-specials (list +nan.0 +inf.0 -inf.0 -0.0 0.0 1e8 1.0 -2.5 3.25e-3 0.1 7.0 -1e-7))
+
+(define (e4-values n dtype)
+  (let ((v (allocate-typed-vector dtype n)))
+    (do ((i 0 (+ i 1))) ((= i n) v)
+      (typed-vector-set! v dtype i (list-ref e4-specials (modulo (* 5 i) (length e4-specials)))))))
+
+(define (e4-ints n)
+  (let ((v (make-s32vector n)))
+    (do ((i 0 (+ i 1))) ((= i n) v) (s32vector-set! v i (- (* 7 (modulo (* 3 i) 11)) 30)))))
+
+(test-group "strided seg-red executor"
+  ;; Sum over axis 0 of x*y, with x*y kept as a map output sharing the body.
+  (let* ((x (e4-arr (e4-values 15 'f32) #(5 3) #(3 1) 'f32))
+         (y (e4-arr (e4-values 15 'f32) #(5 3) #(3 1) 'f32))
+         (t (e4-map '(dim 1) '(dim 0)))
+         (body '(cast f32 (mul (in 0) (in 1))))
+         (sg (make-seg-red #(3 5) 1 (list (e4-op 'x x 'f32 t) (e4-op 'y y 'f32 t))
+                           (list (make-red-result (e4-out 'f32 #(3) (e4-map '(dim 0))) body
+                                                  (make-combine-spec 'add 0.0 'f32) #f))
+                           (list (cons (e4-out 'f32 #(5 3) t) body))))
+         (r (e4-run sg `((x . ,x) (y . ,y)) '((f32 3) (f32 15)))))
+    (test "a fused column sum runs on the strided reduction executor" 'segop/strided-red (car r))
+    (test-assert "column sum and kept products equal the interpreter's" (cadr r)))
+  ;; Sum over axis 1 accumulated in f64, a mean finalize and keepdims.
+  (let* ((x (e4-arr (e4-values 24 'f32) #(4 6) #(6 1) 'f32))
+         (sg (make-seg-red #(4 6) 1 (list (e4-op 'x x 'f32 (identity-index-map 2)))
+                           (list (make-red-result (e4-out 'f32 #(4 1) (e4-map '(dim 0) 0))
+                                                  '(cast f32 (exp (in 0)))
+                                                  (make-combine-spec 'add 0.0 'f64) '(/ (reduced) 6)))))
+         (r (e4-run sg `((x . ,x)) '((f32 4)))))
+    (test "a row mean with keepdims is a strided reduction" 'segop/strided-red (car r))
+    (test-assert "the row mean equals the interpreter's" (cadr r)))
+  ;; Max and min over axes 0 and 2 of a 3-D array, as two results.
+  (let* ((x (e4-arr (e4-values 24 'f64) #(2 3 4) #(12 4 1) 'f64))
+         (m (e4-map '(dim 1) '(dim 0) '(dim 2)))
+         (sg (make-seg-red #(3 2 4) 2 (list (e4-op 'x x 'f64 m))
+                           (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 0.5)
+                                                  (make-combine-spec 'max -inf.0 'f64) #f)
+                                 (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 0.5)
+                                                  (make-combine-spec 'min +inf.0 'f64) #f))))
+         (r (e4-run sg `((x . ,x)) '((f64 3) (f64 3)))))
+    (test "two results over two reduced axes" 'segop/strided-red (car r))
+    (test-assert "max and min with NaN, infinities and -0.0 equal the interpreter's" (cadr r)))
+  ;; A product over axis 1 of a transposed (column-major) input.
+  (let* ((x (e4-arr (e4-values 12 'f64) #(3 4) #(1 3) 'f64))
+         (sg (make-seg-red #(3 4) 1 (list (e4-op 'x x 'f64 (identity-index-map 2)))
+                           (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 1.0)
+                                                  (make-combine-spec 'mul 1.0 'f64) #f))))
+         (r (e4-run sg `((x . ,x)) '((f64 3)))))
+    (test "a strided input" 'segop/strided-red (car r))
+    (test-assert "the product of a transposed input equals the interpreter's" (cadr r)))
+  ;; Everything reduced to a rank-0 result, with a finalize.
+  (let* ((x (e4-arr (e4-values 6 'f64) #(2 3) #(3 1) 'f64))
+         (sg (make-seg-red #(2 3) 2 (list (e4-op 'x x 'f64 (identity-index-map 2)))
+                           (list (make-red-result (e4-out 'f64 #() (e4-map)) '(mul (in 0) (in 0))
+                                                  (make-combine-spec 'add 0.0 'f64) '(sqrt (reduced))))))
+         (r (e4-run sg `((x . ,x)) '((f64 1)))))
+    (test "a rank-0 result" 'segop/strided-red (car r))
+    (test-assert "the rank-0 result equals the interpreter's" (cadr r)))
+  ;; Integer sums of squares, rounded to s32 after every step.
+  (let* ((x (e4-arr (e4-ints 12) #(3 4) #(4 1) 's32))
+         (sg (make-seg-red #(3 4) 1 (list (e4-op 'x x 's32 (identity-index-map 2)))
+                           (list (make-red-result (e4-out 's32 #(3) (e4-map '(dim 0))) '(mul (in 0) (in 0))
+                                                  (make-combine-spec 'add 0 's32) #f))))
+         (r (e4-run sg `((x . ,x)) '((s32 3)))))
+    (test "an s32 reduction" 'segop/strided-red (car r))
+    (test-assert "the s32 sums equal the interpreter's" (cadr r))
+    (test "the s32 sums are the sums of squares"
+      (map (lambda (row) (fold + 0 (map (lambda (j) (let ((v (s32vector-ref (e4-data x) (+ (* 4 row) j)))) (* v v)))
+                                       (iota 4))))
+           (iota 3))
+      (s32vector->list (car (caddr r)))))
+  ;; A blocked sum in single precision: blocks of 3 from the neutral element.
+  (let* ((d (make-f32vector 10 1.0))
+         (_ (f32vector-set! d 0 1e8))
+         (x (e4-arr d #(1 10) #(10 1) 'f32))
+         (sg (make-seg-red #(1 10) 1 (list (e4-op 'x x 'f32 (identity-index-map 2)))
+                           (list (make-red-result (e4-out 'f32 #(1) (e4-map '(dim 0))) '(mul (in 0) 1.0)
+                                                  (make-combine-spec 'add 0.0 'f32 'blocked 3) #f))))
+         (r (e4-run sg `((x . ,x)) '((f32 1)))))
+    (test "a blocked reduction" 'segop/strided-red (car r))
+    (test-assert "the blocked sum equals the interpreter's" (cadr r))
+    (test "the blocks keep the ones a sequential f32 sum would lose" (+ 1e8 8.0)
+      (f32vector-ref (car (caddr r)) 0)))
+  ;; A finalize reading an input over the parallel dimension, and a map
+  ;; output with a body of its own.
+  (let* ((x (e4-arr (e4-values 15 'f64) #(5 3) #(3 1) 'f64))
+         (b (e4-arr (f64vector 0.25 -1.0 +inf.0) #(3) #(1) 'f64))
+         (t (e4-map '(dim 1) '(dim 0)))
+         (sg (make-seg-red #(3 5) 1 (list (e4-op 'x x 'f64 t) (e4-op 'b b 'f64 (e4-map '(dim 0))))
+                           (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(mul (in 0) 2.0)
+                                                  (make-combine-spec 'add 0.0 'f64) '(add (reduced) (in 1))))
+                           (list (cons (e4-out 'f64 #(5 3) t) '(add (in 0) (in 1))))))
+         (r (e4-run sg `((x . ,x) (b . ,b)) '((f64 3) (f64 15)))))
+    (test "a finalize with an input and a separate map output" 'segop/strided-red (car r))
+    (test-assert "they equal the interpreter's" (cadr r)))
+  ;; A seg-red whose input map is opaque still goes to the interpreter.
+  (let* ((x (e4-arr (e4-values 6 'f64) #(2 3) #(3 1) 'f64))
+         (sg (make-seg-red #(2 3) 1 (list (make-segop-operand 'x 'f64 #(2 3) #(3 1) 0 (opaque-index-map values)))
+                           (list (make-red-result (e4-out 'f64 #(2) (e4-map '(dim 0))) '(mul (in 0) 3.0)
+                                                  (make-combine-spec 'add 0.0 'f64) #f)))))
+    (test "an opaque map is not a strided reduction" 'segop/interpreted
+      (car (select-segop-executor sg)))))
 ;;;; ============================================================
 ;;;; Numerical gradient checks
 ;;;;
@@ -2250,7 +2410,7 @@
                           (car (cases segop (cdar gs)
                                  (seg-red (_ _ _ results _ _) results)
                                  (else '()))))))
-                (and (pair? fin) (member `(cast ,dt (acc)) (cdr fin)) #t)))
+                (and (pair? fin) (member `(cast ,dt (reduced)) (cdr fin)) #t)))
             (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
             (test-assert (string-append name ": replay reproduces the trace")
               (s2-same-lists? (cadr r) (caddr r)))
@@ -2272,14 +2432,15 @@
       (test-assert "the cast after a GEMM has the f32 product's values"
         (gm-close? (cadr r) (gm-reference 'f32 av bv 9 8 10) 1e-5))))
 
-  ;; with only the scheme backend, a GEMM is interpreted
+  ;; with only the scheme backend, a GEMM runs on the strided reduction
+  ;; executor
   (let-values (((A B av bv) (gm-operands 'f32 3 4 5 #t #f)))
     (let* ((scheme-only (filter (lambda (b) (eq? (segop-backend-name b) 'scheme)) (segop-backends)))
            (r (parameterize ((segop-backends scheme-only))
                 (s2-run (lambda () (morph-matmul A B))))))
-      (test-assert "with only the scheme backend a GEMM is interpreted"
-        (and (memq 'segop/interpreted (s2-tags (car r))) (null? (gm-segops (car r)))))
-      (test-assert "the interpreted GEMM gives the exact reference"
+      (test-assert "with only the scheme backend a GEMM is a strided reduction"
+        (and (memq 'segop/strided-red (s2-tags (car r))) (null? (gm-segops (car r)))))
+      (test-assert "the host GEMM gives the exact reference"
         (and (s2-same-lists? (cadr r) (gm-reference 'f32 av bv 3 4 5))
              (s2-same-lists? (cadr r) (caddr r)))))))
 
@@ -2344,7 +2505,7 @@
     (let ((fin (mm-gemm-finalize (car (s2-run (lambda () (morph-map mm-shift (morph-matmul A B))))))))
       (test-assert "a map epilogue is an opaque finalize over the stored product"
         (and (pair? fin) (eq? (car fin) 'opaque) (eq? (cadr fin) mm-shift)
-             (equal? (cddr fin) '((cast f32 (acc))))))))
+             (equal? (cddr fin) '((cast f32 (reduced))))))))
 
   ;; a map off the gradient path: x is an input, so map(x) needs no gradient
   (gradcheck "a map of an input added to a product"
@@ -2590,7 +2751,7 @@
     (test "a broadcast read is infusible" '((binding infusible)) (sf-uses graph small))
     (test "a matmul operand is infusible" '((binding infusible))
       (sf-uses graph (sf-binding prog 'add)))
-    (test "a reduction source is infusible" '((binding infusible))
+    (test "a reduction source is fusible" '((binding fusible))
       (sf-uses graph (sf-binding prog 'matmul)))
     (test "a program output has a result use" '((#f result))
       (sf-uses graph (sf-binding prog '(reduce sum))))
@@ -2692,7 +2853,8 @@
                   (let-values (((loss params) (seg-mlp-loss 'f32)))
                     (let ((ctx (make-morphism-context)))
                       (let-values (((joint trace) (compile-and-realize/ctx ctx loss params)))
-                        (let ((n-fused (if fusion? (cdr (assq 'fusions (ssa-fusion-pass-stats))) 0))
+                        ;; the number of values the program computes
+                        (let ((n-fused (length (append-map binding-out-names (ssa-program-bindings joint))))
                               (allocs (cdr (assq 'allocations (context-stats ctx)))))
                           (finalize-context! ctx)
                           (reset-context! ctx)
@@ -2702,8 +2864,8 @@
                                   (map get-allocation-id trace)
                                   (map get-allocation-id replay))))))))))
          (on (run #t)) (off (run #f)))
-    (test "each fused-away producer saves one trace allocation"
-      (- (car off) (cadr on)) (car on))
+    (test "each value fused away saves one trace allocation"
+      (- (car off) (- (cadr off) (cadr on))) (car on))
     (test "replay outputs keep their trace allocation ids" (list-ref on 3) (list-ref on 4))
     ;; the greedy allocator does not guarantee a smaller pool for fewer
     ;; allocations on every graph; the size is reported for benchmarks
@@ -3016,6 +3178,352 @@
     (parameterize ((segop-fusion 'all)) (fp-run prog))
     (test-error "ssa-vjp refuses a forward program with fused bindings"
       (ssa-vjp prog '() (ssa-loss-binding-val prog)))))
+
+;;;; ============================================================
+;;;; Fusion with reductions
+;;;;
+;;;; Maps fuse into the reductions that read them (with the map kept as an
+;;;; extra output when it has other uses), and maps that read a
+;;;; reduction's result fuse into it as its finalize.  Under the policy
+;;;; all, every program gives the values of its unfused form, bit for bit,
+;;;; from ssa-realize, the trace and the replays.
+;;;; ============================================================
+
+(define (rd-fused-reds prog) (filter fused-red-binding? (ssa-program-bindings prog)))
+
+;; The names of the outputs of binding b, its own first.
+(define fused-outputs binding-out-names)
+
+(define (rd-position prog name)
+  (list-index (lambda (b) (memq name (binding-out-names b))) (ssa-program-bindings prog)))
+
+;; Fuses the forward program of m under all (with at most rounds rounds),
+;; and returns the fused program, the pass statistics, and whether its
+;; values, run with the checking backend, are those of the unfused
+;; program, with no executor disagreeing with the interpreter.
+(define (rd-check m #!optional (rounds 16))
+  (let* ((fused (parameterize ((segop-fusion 'all) (segop-fusion-max-rounds rounds))
+                  (ssa-segop-fusion-pass (fk-prog m))))
+         (stats (ssa-fusion-pass-stats)))
+    (let-values (((r checks mismatches) (with-segop-checker (lambda () (sf-run fused)))))
+      (values fused stats (and (rd-same? r (sf-run (fk-prog m))) (= mismatches 0))))))
+
+;; True when a and b, nested lists of numbers, are equal, NaNs included.
+(define (rd-same? a b)
+  (cond ((and (pair? a) (pair? b)) (and (rd-same? (car a) (car b)) (rd-same? (cdr a) (cdr b))))
+        ((and (number? a) (number? b)) (seg-same? a b))
+        (else (equal? a b))))
+
+;; The numbers of a nested list, in order.
+(define (rd-flatten x)
+  (cond ((null? x) '())
+        ((pair? x) (append (rd-flatten (car x)) (rd-flatten (cdr x))))
+        (else (list x))))
+
+(define (rd-missed stats) (cdr (assq 'missed stats)))
+
+(define rd-a '(0.5 -1.25 2.0 0.75 -0.5 1.5 0.1 -3.0 2.5 0.0 -0.0 1e-3))
+(define rd-b '(1.0 -2.0 3.0 0.25 4.0 -0.75 0.3 5.0 -1.5 2.0 7.0 -0.2))
+
+(test-group "fusion with reductions"
+  (for-each
+   (lambda (dtype)
+     (let ((x (fk-arr rd-a '(4 3) dtype)) (y (fk-arr rd-b '(4 3) dtype)))
+       (for-each
+        (lambda (case)
+          (let-values (((fused stats same?) (rd-check ((cadr case)))))
+            (test (sprintf "~A, ~A: one fused reduction" dtype (car case))
+              1 (length (rd-fused-reds fused)))
+            (test-assert (sprintf "~A, ~A: the values of the unfused program" dtype (car case)) same?)))
+        (list (list "sum over axis 0 of x*y" (lambda () (morph-reduce 'sum (morph* x y) '(0) #f)))
+              (list "keepdims mean over axis 1 of exp(x)"
+                    (lambda () (morph-reduce 'mean (morph-exp x) '(1) #t)))
+              (list "max over axis 1 of x - y" (lambda () (morph-reduce 'max (morph- x y) '(1) #f)))
+              (list "min over axis 0 of y / x" (lambda () (morph-reduce 'min (morph/ y x) '(0) #t)))
+              (list "sum of x + a broadcast row"
+                    (lambda () (morph-reduce 'sum (morph+ x (fk-arr '(0.5 -1.0 2.0) '(1 3) dtype)) '(0) #f)))
+              (list "sum of a chain of maps" (lambda () (morph-reduce 'sum (morph* y (morph-exp (morph-negate x))) '(1) #f)))
+              (list "everything summed to a scalar" (lambda () (morph-reduce 'sum (morph* x x) '(0 1) #f)))))))
+   '(f32 f64))
+
+  ;; NaN, infinities and -0.0 through max, min and sum, with the values
+  ;; doubled by a product.
+  (let ((x (fk-arr (list +nan.0 1.0 -0.0 0.0 +inf.0 -inf.0 2.0 +nan.0 -1.0 0.5 -0.0 3.0) '(4 3) 'f64))
+        (two (fk-arr '(2.0) '(1 1) 'f64)))
+    (for-each
+     (lambda (rop)
+       (let-values (((fused stats same?) (rd-check (morph-reduce rop (morph* x two) '(1) #f))))
+         (test-assert (sprintf "~A of values with NaN, infinities and -0.0" rop) same?)))
+     '(max min sum)))
+
+  ;; -0.0 + -0.0 is -0.0 in the fused body as in the unfused loops, so a
+  ;; min over sums of negative zeros keeps the sign.  No row holds 0.0,
+  ;; since min may return either zero.
+  (for-each
+   (lambda (dtype)
+     (let ((x (fk-arr '(-0.0 -0.0 -0.0 -0.0 1.0 2.0) '(2 3) dtype)))
+       (let-values (((fused stats same?) (rd-check (morph-reduce 'min (morph+ x x) '(1) #f))))
+         (test (sprintf "~A, min of x + x with -0.0: one fused reduction" dtype)
+           1 (length (rd-fused-reds fused)))
+         (test-assert (sprintf "~A, min of x + x with -0.0: the values of the unfused program" dtype)
+           same?)
+         (test-assert (sprintf "~A, min of x + x with -0.0 is -0.0 in each row" dtype)
+           (every (lambda (v) (eqv? v -0.0)) (rd-flatten (sf-run fused)))))
+       ;; The same for a fused element-wise add: negate(y) + x with y = -x.
+       (let* ((y (fk-arr '(0.0 0.0 0.0 0.0 -1.0 -2.0) '(2 3) dtype))
+              (m (morph+ (morph-negate y) x)))
+         (let-values (((fused stats same?) (rd-check m)))
+           (test-assert (sprintf "~A, negate(y) + x with -0.0 is fused" dtype)
+             (pair? (fused-bindings fused)))
+           (test-assert (sprintf "~A, negate(y) + x with -0.0: the values of the unfused program" dtype)
+             same?)
+           (test-assert (sprintf "~A, negate(y) + x keeps -0.0 + -0.0 as -0.0" dtype)
+             (every (lambda (run)
+                      (every eqv? '(-0.0 -0.0 -0.0 -0.0 2.0 4.0) (rd-flatten run)))
+                    (sf-run fused)))))))
+   '(f32 f64))
+
+  ;; The general path, over axes 0 and 2 of a rank-3 value.
+  (let-values (((fused stats same?)
+                (rd-check (morph-reduce 'min (morph-exp (fk-arr (map (lambda (i) (* 0.1 i)) (iota 24)) '(2 3 4) 'f64))
+                                        '(0 2) #f))))
+    (test "a reduction over two axes of a rank-3 value is fused" 1 (length (rd-fused-reds fused)))
+    (test-assert "with the values of the unfused program" same?))
+
+  ;; f32 values into a reduction accumulated in f64 (axis 1), and s32 sums.
+  (let-values (((fused stats same?)
+                (rd-check (morph-reduce 'sum (morph* (fk-arr rd-a '(4 3) 'f32) (fk-arr rd-b '(4 3) 'f32)) '(1) #f))))
+    (test-assert "an f32 product summed in f64 keeps its value" same?))
+  (let-values (((fused stats same?)
+                (rd-check (morph-reduce 'sum (morph* (fk-arr '(1 2 3 4 5 6) '(2 3) 's32)
+                                                     (fk-arr '(7 -8 9 1 2 3) '(2 3) 's32))
+                                        '(1) #f))))
+    (test "an s32 product sum is fused" 1 (length (rd-fused-reds fused)))
+    (test-assert "with the values of the unfused program" same?))
+
+  ;; The 1d sum may use the BLAS dot product, whose order is not known.
+  (let ((v (fk-arr '(1.0 2.0 3.0) '(3) 'f64)) (w (fk-arr '(4.0 5.0 6.0) '(3) 'f64)))
+    (let-values (((fused stats same?) (rd-check (morph-reduce 'sum (morph* v w) '(0) #f))))
+      (test "a 1d sum is not fused" '() (rd-fused-reds fused))
+      (test "and is reported as reduction-order" 1 (alist-ref 'reduction-order (rd-missed stats)))
+      (test-assert "its values are unchanged" same?))
+    (let-values (((fused stats same?) (rd-check (morph-reduce 'max (morph* v w) '(0) #f))))
+      (test "a 1d max, accumulated in order, is fused" 1 (length (rd-fused-reds fused)))
+      (test-assert "with the values of the unfused program" same?)))
+
+  ;; A reduction of a reshape of P reads a view: P is not fused into it.
+  (let-values (((fused stats same?)
+                (rd-check (morph-reduce 'sum (morph-reshape (morph* (fk-arr rd-a '(4 3) 'f64) (fk-arr rd-b '(4 3) 'f64))
+                                                            (vector 3 4))
+                                        '(0) #f))))
+    (test "a reduction of a reshape of P is not fused" '() (rd-fused-reds fused))
+    (test-assert "its values are unchanged" same?))
+
+  ;; P read by the reduction and by a later map is kept as a map output,
+  ;; computed at P's position.
+  (let* ((x (fk-arr rd-a '(4 3) 'f64)) (y (fk-arr rd-b '(4 3) 'f64)))
+    (let-values (((fused stats same?)
+                  (rd-check (let ((p (morph* x y))) (morph+ (morph-reduce 'sum p '(0) #t) p)))))
+      (let ((f (car (rd-fused-reds fused))))
+        (test "a kept producer is a second output" 2 (length (fused-outputs f)))
+        (test-assert "the later map reads the kept output"
+          (any (lambda (b) (any (lambda (v) (and (ssa-binding-ref? v) (eq? (ssa-value-id v) (cadr (fused-outputs f)))))
+                                (ssa-binding-inputs b)))
+               (ssa-program-bindings fused)))
+        (test-assert "the values are those of the unfused program" same?))))
+
+  ;; Epilogues.
+  (let ((x (fk-arr rd-a '(4 3) 'f32)) (w (fk-arr rd-b '(4 3) 'f32)))
+    (let-values (((fused stats same?)
+                  (rd-check (morph/ (morph-reduce 'sum (morph* x x) '(1) #t) (fk-arr '(4.0) '(1 1) 'f32)))))
+      (test "a map of a keepdims sum is its finalize" 1 (length (ssa-program-bindings fused)))
+      (test-assert "with the values of the unfused program" same?))
+    ;; rmsnorm: x * (mean(x*x) + eps)^-0.5 * w
+    (let-values (((fused stats same?)
+                  (rd-check (morph* (morph* x (morph-pow (morph+ (morph-reduce 'mean (morph* x x) '(1) #t)
+                                                                 (fk-arr '(1e-5) '(1 1) 'f32))
+                                                         (fk-arr '(-0.5) '(1 1) 'f32)))
+                                    w))))
+      (let ((f (car (rd-fused-reds fused))))
+        (test "rmsnorm's mean, add and pow are one fused reduction" 4 (length (sf-members f)))
+        (test-assert "with the values of the unfused program" same?)))
+    ;; A mean rounded to f32 before the map reads it.
+    (let-values (((fused stats same?)
+                  (rd-check (morph+ (morph-reduce 'mean (morph* x w) '(1) #t) (fk-arr '(0.3) '(1 1) 'f32)))))
+      (test-assert "a finalize reads the mean as stored in f32" same?)))
+
+  (let ((x (fk-arr rd-a '(4 3) 'f64)))
+    ;; x - max(x) reads the reduction through a broadcast.
+    (let-values (((fused stats same?)
+                  (rd-check (morph- (morph-exp x) (morph-reduce 'max (morph-exp x) '(1) #t)))))
+      (test-assert "a broadcast read of a reduction is not an epilogue"
+        (every (lambda (b) (not (any (lambda (m) (eq? m (ssa-binding-name (car (reverse (ssa-program-bindings fused))))))
+                                     (sf-members b))))
+               (rd-fused-reds fused)))
+      (test-assert "its values are unchanged" same?))
+    ;; a reduction result read by two maps
+    (let-values (((fused stats same?)
+                  (rd-check (let ((s (morph-reduce 'sum (morph-exp x) '(1) #t))) (morph+ (morph-log s) (morph-exp s))) 1)))
+      (test "a reduction with two readers is reported" 1 (alist-ref 'multi-use-reduction (rd-missed stats)))
+      (test-assert "its values are unchanged" same?))
+    ;; r = sum(P) keeps P, which u = exp(P) reads after it, so r is at P's
+    ;; position, before t = sum(u): r * t cannot be r's finalize.
+    (let-values (((fused stats same?)
+                  (rd-check (let* ((p (morph* x x)) (r (morph-reduce 'sum p '(1) #t))
+                                   (t (morph-reduce 'sum (morph-exp p) '(1) #t)))
+                              (morph* r t))
+                            1)))
+      (test "an epilogue whose inputs come too late is reported" 1 (alist-ref 'placement (rd-missed stats)))
+      (test-assert "its values are unchanged" same?))
+    (let-values (((fused stats same?)
+                  (rd-check (let* ((p (morph* x x)) (r (morph-reduce 'sum p '(1) #t))
+                                   (t (morph-reduce 'sum (morph-exp p) '(1) #t)))
+                              (morph* r t)))))
+      (test-assert "the product fuses into the later reduction instead" same?)))
+
+  ;; A forward program fused at its first trace.
+  (let* ((x (fk-arr rd-a '(4 3) 'f32))
+         (m (lambda () (morph-sqrt (morph-reduce 'mean (morph* x x) '(1) #t))))
+         (expect (map concrete->list (ssa-realize (fk-prog (m)))))
+         (prog (fk-prog (m)))
+         (r (parameterize ((segop-fusion 'all)) (fp-run prog))))
+    (test "a forward program fuses its reduction at the first trace" 1 (length (rd-fused-reds prog)))
+    (test "the trace and the replays give the unfused values" (list expect expect expect) (values r)))
+
+  ;; Under the default policy, with no backend running fused reductions
+  ;; natively, nothing is fused into a reduction.
+  (let ((fused (ssa-segop-fusion-pass (fk-prog (morph-reduce 'sum (morph* (fk-arr rd-a '(4 3) 'f32)
+                                                                         (fk-arr rd-b '(4 3) 'f32))
+                                                              '(0) #f)))))
+    (test "the default fuses no reduction without a native kernel" '() (rd-fused-reds fused))
+    (test-assert "and reports it as not native" (alist-ref 'not-native (rd-missed (ssa-fusion-pass-stats)))))
+  (let ((fused (parameterize ((segop-fusion #f))
+                 (ssa-segop-fusion-pass (fk-prog (morph-reduce 'sum (morph* (fk-arr rd-a '(4 3) 'f32)
+                                                                            (fk-arr rd-b '(4 3) 'f32))
+                                                               '(0) #f))))))
+    (test "the policy #f does not change the program" 2 (length (ssa-program-bindings fused)))))
+
+;; The joint program of a dense layer, loss sum(relu(x W + b) * c), whose
+;; bias gradient sums g * relu'(z) over the batch, and the product's other
+;; readers, the GEMMs, come before that sum.
+(define (rd-dense-joint policy dtype)
+  (let* ((x (seg-var (map (lambda (i) (- (* 0.37 i) 2.0)) (iota 12)) '(4 3) dtype #f))
+         (W (seg-var (map (lambda (i) (* 0.21 (sin (+ i 1.0)))) (iota 15)) '(3 5) dtype #t))
+         (b (seg-var (map (lambda (i) (- (* 0.1 i) 0.2)) (iota 5)) '(5) dtype #t))
+         (c (seg-var (map (lambda (i) (cos (* 0.5 i))) (iota 20)) '(4 5) dtype #f))
+         (loss (am:var-sum (am:var* (am:var-relu (am:var+ (am:var-matmul x W) b)) c)))
+         (fwd (morphism-to-ssa loss))
+         (pv (map (lambda (p) (ssa-constant-id fwd (am:var-value p))) (list W b))))
+    (parameterize ((segop-fusion policy)) (ssa-vjp fwd pv (ssa-loss-binding-val fwd)))))
+
+;; The results of the trace and of three replays of joint, and the pool's
+;; bytes.
+(define (rd-replays joint)
+  (let* ((ctx (make-morphism-context))
+         (trace (map concrete->list (ssa-realize/ctx ctx joint))))
+    (finalize-context! ctx)
+    (let loop ((k 0) (rs (list trace)))
+      (if (= k 3)
+          (values (reverse rs) (cdr (assq 'bytes (context-stats ctx))))
+          (begin
+            (reset-context! ctx)
+            (loop (+ k 1) (cons (map concrete->list (ssa-realize/ctx ctx joint)) rs)))))))
+
+(test-group "fusion of bias gradients"
+  (for-each
+   (lambda (dtype)
+     (let* ((off (rd-dense-joint #f dtype))
+            (all (rd-dense-joint 'all dtype))
+            (kept (filter (lambda (f) (> (length (fused-outputs f)) 1)) (rd-fused-reds all))))
+       (test (sprintf "~A: the bias gradient keeps g * relu' as a map output" dtype) 1 (length kept))
+       (let* ((f (car kept)) (mo (cadr (fused-outputs f))))
+         (test-assert (sprintf "~A: a GEMM reads the kept output after the fused reduction" dtype)
+           (let ((fpos (rd-position all (ssa-binding-name f))))
+             (any (lambda (b i) (and (eq? (ssa-binding-op b) 'matmul) (> i fpos)
+                                     (any (lambda (v) (and (ssa-binding-ref? v) (eq? (ssa-value-id v) mo)))
+                                          (ssa-binding-inputs b))))
+                  (ssa-program-bindings all) (iota (length (ssa-program-bindings all))))))
+         (test-assert (sprintf "~A: the bias gradient is computed by the fused reduction" dtype)
+           (any (lambda (ov) (eq? (ssa-value-id ov) (ssa-binding-name f))) (ssa-program-outputs all))))
+       (let-values (((r-all bytes-all) (rd-replays all))
+                    ((r-off bytes-off) (rd-replays off)))
+         (test (sprintf "~A: the trace and the replays give the unfused gradients" dtype) r-off r-all)
+         (test-assert (sprintf "~A: the replays give the trace's values" dtype)
+           (every (lambda (r) (equal? r (car r-all))) (cdr r-all)))
+         (test-assert (sprintf "~A: the pool is not larger" dtype) (<= bytes-all bytes-off)))
+       (let-values (((r checks mismatches)
+                     (with-segop-checker
+                      (lambda () (call-with-values (lambda () (rd-replays (rd-dense-joint 'all dtype))) list)))))
+         (test (sprintf "~A: the executors agree with the interpreter" dtype) 0 mismatches))))
+   '(f32 f64)))
+
+;; A fused column-sum kernel computing canonical body over n inputs on
+;; dtype arrays, adding the rows in order with the sum rounded to dtype.
+(define rd-colsum-calls 0)
+
+(define (rd-colsum-kernel body n dtype)
+  (let ((proc (scalar-expr->procedure body n)))
+    (lambda (rows cols ins mo out)
+      (set! rd-colsum-calls (+ rd-colsum-calls 1))
+      (do ((j 0 (+ j 1))) ((= j cols)) (typed-vector-set! out dtype j 0.0))
+      (do ((i 0 (+ i 1))) ((= i rows))
+        (do ((j 0 (+ j 1))) ((= j cols))
+          (let ((k (+ (* i cols) j)))
+            (typed-vector-set! mo dtype k
+                               (exact->inexact (apply proc (map (lambda (v) (typed-vector-ref v dtype k)) ins))))
+            (typed-vector-set! out dtype j (+ (typed-vector-ref out dtype j) (typed-vector-ref mo dtype k)))))))))
+
+(define rd-relu-map-body '((f32 . (mul (in 0) (cast f32 (relu-deriv (in 1)))))
+                           (f64 . (mul (in 0) (relu-deriv (in 1))))))
+(define rd-relu-colsum-body '((f32 . (cast f32 (mul (in 0) (cast f32 (relu-deriv (in 1))))))
+                              (f64 . (mul (in 0) (relu-deriv (in 1))))))
+
+;; An activation backend with the fused g * relu'(z) kernel and its
+;; column-sum kernel, for the given dtypes.
+(define (rd-mock-catalogue dtypes)
+  (let ((be (make-activation-backend 'mock-colsum)))
+    (for-each (lambda (dt)
+                (let ((mb (cdr (assq dt rd-relu-map-body))) (cb (cdr (assq dt rd-relu-colsum-body))))
+                  (activation-backend-add-fused-kernel! be mb dt (fk-kernel mb 2 dt))
+                  (activation-backend-add-colsum-kernel! be cb dt (rd-colsum-kernel cb 2 dt))))
+              dtypes)
+    be))
+
+(test-group "fused column-sum kernels"
+  (for-each
+   (lambda (dtype)
+     (let ((off (rd-dense-joint #f dtype)))
+       (register-activation-backend! (rd-mock-catalogue '(f32 f64)))
+       (set! rd-colsum-calls 0)
+       (let ((on (rd-dense-joint #t dtype)))
+         (let-values (((r-on bytes-on) (rd-replays on))
+                      ((r-off bytes-off) (rd-replays off)))
+           (let ((tags (map car (plan-segops on))))
+             (test-assert (sprintf "~A: the default fuses the bias gradient into a column-sum kernel" dtype)
+               (memq 'segop/colsum-kernel tags))
+             (test-assert (sprintf "~A: the kernel was called" dtype) (> rd-colsum-calls 0))
+             (test (sprintf "~A: the plan counts it as native, with nothing on the host" dtype)
+               0 (cdr (assq 'host (cdr (assq 'fused (replay-plan-stats on))))))
+             (test (sprintf "~A: the gradients are those of the unfused program" dtype) r-off r-on))))
+       (register-activation-backend! #f)))
+   '(f32 f64))
+  (register-activation-backend! (rd-mock-catalogue '(f32)))
+  (let ((on (rd-dense-joint #t 'f64)))
+    (test "an f32 column-sum entry is not used for f64" '() (rd-fused-reds on)))
+  (register-activation-backend! #f)
+  ;; The kernel missing when the step runs: the host executor computes it.
+  (let* ((be (rd-mock-catalogue '(f32)))
+         (on (begin (register-activation-backend! be) (rd-dense-joint #t 'f32)))
+         (off (rd-dense-joint #f 'f32)))
+    (let-values (((r-on b1) (rd-replays on)))
+      (register-activation-backend! (make-activation-backend 'empty))
+      (let-values (((r checks mismatches)
+                    (with-segop-checker (lambda () (call-with-values (lambda () (rd-replays on)) list))))
+                   ((r-off b3) (rd-replays off)))
+        (test "without its kernel at run time, the fused reduction still gives the unfused values"
+          r-off (car r))
+        (test "and agrees with the interpreter" 0 mismatches)))
+    (register-activation-backend! #f)))
 
 
 (test-end)

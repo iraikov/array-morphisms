@@ -337,6 +337,21 @@ fused away. A fused binding (op `fused`) computes both bindings in one
 segop and never stores the intermediate value. Chains are fused to the end
 in one pass, and an input that both bindings read is read once.
 
+The pass also fuses element-wise bindings with reductions, in two ways:
+
+- An element-wise binding read by a reduction is computed inside the
+  reduction, so its values are summed without being stored first. If other
+  bindings also read it, the fused reduction stores it for them as a second
+  output. This covers bias gradients, whose values the weight gradient also
+  reads.
+- An element-wise binding that reads only a reduction's result becomes the
+  reduction's final step (its *finalize*). For example, rmsnorm's
+  `(mean(x*x) + eps)^-0.5` becomes one segop.
+
+A fused reduction adds its values in the same order as the unfused one, so
+results do not change. Sums of rank-1 arrays are not fused, because their
+order is left to the BLAS backend.
+
 Whether a legal fusion is made depends on the policy, the value of the
 parameter `segop-fusion` (`array-morphisms-ssa`):
 
@@ -368,14 +383,16 @@ An activation backend holds fused kernels through
 `activation-backend-add-fused-kernel!`. The crunch backends of
 `array-morphisms-crunch` hold kernels for the bodies the pass forms most
 often in backward passes, such as `g * relu-deriv(x)`, and for Llama's
-`b * silu(a)`. `replay-plan-stats` reports under `fused` how many fused
-bindings run as a native kernel and how many on the host.
-`ssa-fusion-pass-stats` lists the bodies the pass formed (`candidates`),
-which under `'all` shows which fused kernels would be worth adding, and
-counts the pairs left unfused by reason (`missed`): no native backend for
-the fused segop (`not-native`), the same with a broadcast input
-(`broadcast-input`), the size bounds (`size-cap`), or a producer read
-through a reshape or transpose (`view`), which the pass does not fuse.
+`b * silu(a)`. An activation backend can also hold *column-sum kernels*
+(`activation-backend-add-colsum-kernel!`), which compute a body and sum it
+over the rows in one pass. The single-threaded crunch backend holds one,
+for the bias gradient of a relu layer. `replay-plan-stats` reports under
+`fused` how many fused bindings run as a native kernel and how many on the
+host.
+`ssa-fusion-pass-stats` lists the fused bodies the pass formed
+(`candidates`, and `red-candidates` for reductions) and counts the pairs it
+left unfused, by reason (`missed`). Run under `'all`, it shows which fused
+kernels would be worth adding.
 
 Fusion does not change results. A fused binding rounds each intermediate
 value to its dtype, as storing it in an array would (`(cast f32 ...)` in its
@@ -455,7 +472,7 @@ zero-copy views is lowered to a segop:
   accumulator, as the Scheme loop does. An adjacent element-wise consumer
   (an activation, or a bias add) of the same shape and dtype is fused as
   the reduction's finalize, applied to the stored product
-  (`(sigmoid (cast f32 (acc)))`);
+  (`(sigmoid (cast f32 (reduced)))`);
 - materialized views (such as a reshape of a transposed array) become a
   gather, a `seg-map` with the body `(in 0)`;
 - the remaining index functions run on the host through a `seg-lib`.

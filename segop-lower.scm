@@ -136,38 +136,59 @@
 ;;; Fused bindings
 ;;; ------------------------------------------------------------
 ;;;
-;;; A fused binding (op fused) computes several bindings in one seg-map.
-;;; Its template holds the iteration space, one logical index map per
-;;; external input (from the space to that input's index, without a
-;;; layout) and its outputs, the first being the binding's own result.
-;;; Each output is written at every point of the space, in row-major
-;;; order.  Layouts are attached when the template is lowered against
-;;; arrays: the trace-time arrays of the inputs when a plan is compiled,
-;;; the input arrays themselves when the trace realizes the binding.
+;;; A fused binding (op fused) computes several bindings in one seg-map or
+;;; one seg-red.  Its template holds the iteration space, one index map per
+;;; input (from the space to the input's index, without a layout), the
+;;; outputs, the binding's own result first, and nred, the number of
+;;; trailing dimensions of the space that are reduced (0 for a seg-map).
+;;; A seg-red lists its reduced results before its map outputs.
+;;;
+;;; Layouts are attached when the template is lowered against arrays: the
+;;; trace-time arrays when a plan is compiled, the input arrays when the
+;;; trace realizes the binding.  Every output is a row-major buffer.
 
-(define-record fusion-template space in-maps outs)
-(define-record fused-out name shape dtype body combiner)
+(define-record fusion-template space in-maps outs nred)
+
+;; map takes the space to the output's index, or is #f for an output
+;; written in row-major order.  red is (combine-spec . finalize) for a
+;; reduced result, or #f.
+(define-record fused-out name shape dtype body combiner map red)
+
+(define (fused-out-index-map o)
+  (or (fused-out-map o) (identity-index-map (vector-length (fused-out-shape o)))))
 
 (define (lower-fused-binding tpl in-arrs in-slots out-slots)
-  "The seg-map of fusion template tpl reading the concrete arrays in-arrs
-   (for their layouts), found at in-slots, and writing out-slots, one slot
-   per output.  A single output keeps its compiled body as the fallback."
-  (let ((space (fusion-template-space tpl))
-        (outs  (fusion-template-outs tpl)))
-    (make-seg-map
-     space
-     (map (lambda (arr slot m)
-            (cases array-morphism arr
-              (concrete-array (_ s st off dt _ _) (make-segop-operand slot dt s st off m))
-              (else (error "lower-fused-binding: input not concrete" arr))))
-          in-arrs in-slots (fusion-template-in-maps tpl))
-     (map (lambda (o slot)
-            (let ((shape (fused-out-shape o)))
-              (make-segop-operand slot (fused-out-dtype o) shape (compute-strides shape) 0
-                                  (identity-index-map (vector-length shape)))))
-          outs out-slots)
-     (map fused-out-body outs)
-     (and (null? (cdr outs)) (fused-out-combiner (car outs))))))
+  "The seg-map or seg-red of fusion template tpl reading the concrete
+   arrays in-arrs (for their layouts), found at in-slots, and writing
+   out-slots, one slot per output.  A seg-map with a single output keeps
+   its compiled body as the fallback."
+  (let* ((space (fusion-template-space tpl))
+         (outs  (fusion-template-outs tpl))
+         (nred  (fusion-template-nred tpl))
+         (ins   (map (lambda (arr slot m)
+                       (cases array-morphism arr
+                         (concrete-array (_ s st off dt _ _) (make-segop-operand slot dt s st off m))
+                         (else (error "lower-fused-binding: input not concrete" arr))))
+                     in-arrs in-slots (fusion-template-in-maps tpl)))
+         (out-op (lambda (o slot)
+                   (let ((shape (fused-out-shape o)))
+                     (make-segop-operand slot (fused-out-dtype o) shape (compute-strides shape) 0
+                                         (fused-out-index-map o))))))
+    (if (= nred 0)
+        (make-seg-map space ins (map out-op outs out-slots) (map fused-out-body outs)
+                      (and (null? (cdr outs)) (fused-out-combiner (car outs))))
+        (let loop ((os outs) (slots out-slots) (results '()))
+          (if (and (pair? os) (fused-out-red (car os)))
+              (loop (cdr os) (cdr slots)
+                    (cons (make-red-result (out-op (car os) (car slots)) (fused-out-body (car os))
+                                           (car (fused-out-red (car os))) (cdr (fused-out-red (car os))))
+                          results))
+              (begin
+                (when (any fused-out-red os)
+                  (error "lower-fused-binding: reduced results must come before map outputs"))
+                (make-seg-red space nred ins (reverse results)
+                              (map (lambda (o slot) (cons (out-op o slot) (fused-out-body o)))
+                                   os slots))))))))
 
 ;;; ------------------------------------------------------------
 ;;; Operand patterns
@@ -435,7 +456,7 @@
                              (make-segop-operand pool-idx dtype shape strides 0 out-map)
                              '(in 0)
                              (reduction-combine-spec rop path sdt dtype)
-                             (and (eq? rop 'mean) `(/ (acc) ,count)))))))
+                             (and (eq? rop 'mean) `(/ (reduced) ,count)))))))
     (else (error "lower-reduction-binding: source not concrete" src-tr))))
 
 (define (standard-reduction sg)
@@ -479,7 +500,7 @@
                  (count (fold (lambda (k acc) (* acc (vector-ref (segop-operand-shape src) k))) 1 red))
                  (cop  (combine-spec-op spec))
                  (rop  (cond ((and (eq? cop 'add) (not fin)) 'sum)
-                             ((and (eq? cop 'add) (equal? fin `(/ (acc) ,count))) 'mean)
+                             ((and (eq? cop 'add) (equal? fin `(/ (reduced) ,count))) 'mean)
                              ((and (eq? cop 'mul) (not fin)) 'prod)
                              (fin #f)
                              ((memq cop '(max min)) cop)
@@ -717,6 +738,115 @@
                    (else #f)))))
     (else #f)))
 
+;;; ------------------------------------------------------------
+;;; Strided reductions
+;;; ------------------------------------------------------------
+;;;
+;;; A seg-red that is not a standard reduction, such as a fused one, runs
+;;; on the host with compiled bodies when every operand has a linear form.
+;;; It visits the points in the order segop-interpret does and rounds as it
+;;; does, so the two agree bit for bit.  A map output whose body is the
+;;; same expression as a result's body reuses the result's value.
+
+(define (strided-red-executor space nred ins results map-outs)
+  (let* ((rank    (vector-length space))
+         (npar    (- rank nred))
+         (n       (length ins))
+         (refs    (map segop-operand-slot ins))
+         (dtypes  (list->vector (map segop-operand-dtype ins)))
+         (in-lins (map (lambda (o) (segop-operand-linear o rank)) ins))
+         (red-space (subvector space npar rank))
+         (par-space (subvector space 0 npar))
+         ;; The linear forms of the inputs and map outputs over the reduced
+         ;; dimensions, and over the parallel ones (for the offsets).
+         (red-coefs (map (lambda (l) (subvector (cdr l) npar rank))
+                         (append in-lins (map (lambda (mo) (segop-operand-linear (car mo) rank))
+                                              map-outs))))
+         (base-lins (append in-lins (map (lambda (mo) (segop-operand-linear (car mo) rank)) map-outs)
+                            (map (lambda (r) (segop-operand-linear (red-result-out r) rank)) results)))
+         (par-lins  (map (lambda (l) (cons (car l) (subvector (cdr l) 0 npar))) base-lins))
+         (n-mo      (length map-outs))
+         (procs     (list->vector
+                     (map (lambda (r) (scalar-expr->procedure (red-result-body r) n)) results)))
+         (specs     (list->vector (map red-result-combine results)))
+         (fins      (list->vector
+                     (map (lambda (r)
+                            (and (red-result-finalize r)
+                                 (scalar-expr->procedure (red-result-finalize r) n reduced?: #t)))
+                          results)))
+         (out-dtypes (list->vector (map (lambda (r) (segop-operand-dtype (red-result-out r))) results)))
+         ;; For each map output, (j . #f) when it shares result j's body,
+         ;; or (#f . its compiled body).
+         (mo-src    (list->vector
+                     (map (lambda (mo)
+                            (let ((j (list-index (lambda (r) (eq? (red-result-body r) (cdr mo))) results)))
+                              (if j (cons j #f) (cons #f (scalar-expr->procedure (cdr mo) n)))))
+                          map-outs)))
+         (mo-dtypes (list->vector (map (lambda (mo) (segop-operand-dtype (car mo))) map-outs)))
+         (n-res     (length results)))
+    (lambda (deref buf #!optional (extra-bufs '()))
+      (let* ((datas (list->vector (map (lambda (r) (operand-data 'strided-red (deref r))) refs)))
+             (bufs  (list->vector (cons buf extra-bufs)))
+             (accs  (make-vector n-res #f))
+             (blks  (make-vector n-res #f))
+             (cnts  (make-vector n-res 0))
+             (vals  (make-vector n-res #f)))
+        (define (args offs) (map (lambda (k) (typed-vector-ref (vector-ref datas k) (vector-ref dtypes k)
+                                                               (vector-ref offs k)))
+                                 (iota n)))
+        (for-each-strided-point
+         par-space par-lins
+         (lambda (poffs)
+           (do ((j 0 (+ j 1))) ((= j n-res))
+             (let ((spec (vector-ref specs j)))
+               (vector-set! accs j (round-to-dtype (combine-spec-neutral spec)
+                                                   (combine-spec-acc-dtype spec)))
+               (vector-set! blks j (vector-ref accs j))
+               (vector-set! cnts j 0)))
+           (for-each-strided-point
+            red-space
+            (map (lambda (k c) (cons (vector-ref poffs k) c)) (iota (+ n n-mo)) red-coefs)
+            (lambda (offs)
+              (let ((xs (args offs)))
+                (do ((j 0 (+ j 1))) ((= j n-res))
+                  (let* ((spec (vector-ref specs j))
+                         (v    (apply (vector-ref procs j) xs)))
+                    (vector-set! vals j v)
+                    (if (eq? (combine-spec-order spec) 'blocked)
+                        (begin
+                          (vector-set! blks j (combine-step spec (vector-ref blks j) v))
+                          (vector-set! cnts j (+ 1 (vector-ref cnts j)))
+                          (when (= (vector-ref cnts j) (combine-spec-block-size spec))
+                            (vector-set! accs j (combine-step spec (vector-ref accs j) (vector-ref blks j)))
+                            (vector-set! blks j (round-to-dtype (combine-spec-neutral spec)
+                                                                (combine-spec-acc-dtype spec)))
+                            (vector-set! cnts j 0)))
+                        (vector-set! accs j (combine-step spec (vector-ref accs j) v)))))
+                (do ((m 0 (+ m 1))) ((= m n-mo))
+                  (let* ((src (vector-ref mo-src m))
+                         (v   (if (car src) (vector-ref vals (car src)) (apply (cdr src) xs))))
+                    (typed-vector-set! (vector-ref bufs (+ n-res m)) (vector-ref mo-dtypes m)
+                                       (vector-ref offs (+ n m)) v))))))
+           (do ((j 0 (+ j 1))) ((= j n-res))
+             (let ((spec (vector-ref specs j)))
+               (when (and (eq? (combine-spec-order spec) 'blocked) (> (vector-ref cnts j) 0))
+                 (vector-set! accs j (combine-step spec (vector-ref accs j) (vector-ref blks j))))
+               (let* ((acc (vector-ref accs j))
+                      (fin (vector-ref fins j))
+                      (v   (if fin (apply fin (append (args poffs) (list acc))) acc)))
+                 (typed-vector-set! (vector-ref bufs j) (vector-ref out-dtypes j)
+                                    (vector-ref poffs (+ n n-mo j)) v))))))))))
+
+(define (strided-red-select sg)
+  (cases segop sg
+    (seg-red (space nred ins results map-outs fallback)
+      (let ((rank (vector-length space)))
+        (and (all-linear? (append ins (map red-result-out results) (map car map-outs)) rank)
+             (every (lambda (o) (memq (segop-operand-dtype o) '(f32 f64 s32 s64 u32 u64)))
+                    (append ins (map red-result-out results) (map car map-outs)))
+             (cons 'segop/strided-red (strided-red-executor space nred ins results map-outs)))))
+    (else #f)))
+
 ;; The last resort: evaluate a seg-map or a seg-red with the reference
 ;; interpreter.  The executor of a segop with several outputs takes the
 ;; buffers of the outputs after the first as a list.
@@ -745,7 +875,7 @@
 ;;;
 ;;; A GEMM can absorb the element-wise binding that consumes it (the
 ;;; epilogue): the finalize is the epilogue's body with its input 0
-;;; replaced by (cast dtype (acc)), the product as stored in the output,
+;;; replaced by (cast dtype (reduced)), the product as stored in the output,
 ;;; and its other inputs (a bias) appended to the seg-red's inputs.  The
 ;;; seg-red's fallback is the epilogue's combiner, which the executor
 ;;; applies to the stored product in place.
@@ -819,7 +949,7 @@
                                           gemm-body spec
                                           (scalar-expr-substitute-inputs
                                            (car e-bodies)
-                                           (lambda (k) (if (= k 0) `(cast ,dtype (acc)) `(in ,(+ k 1)))))))
+                                           (lambda (k) (if (= k 0) `(cast ,dtype (reduced)) `(in ,(+ k 1)))))))
                                    '() e-fallback))
                    (else #f))
                  (make-seg-red space 1 (list A B)
@@ -941,7 +1071,14 @@
   "The native-capability query of the registry backend: true when the
    segop template tpl has one output and one to three flat inputs read at
    the iteration point, all of the output's dtype, f32 or f64, and the
-   active activation backend holds a fused kernel for its canonical body."
+   active activation backend holds a fused kernel for its canonical body;
+   or when tpl is a column sum that a fused column-sum kernel of the
+   active activation backend computes (see colsum-template?)."
+  (if (> (segop-template-nred tpl) 0)
+      (colsum-template? tpl)
+      (registry-map-native? tpl)))
+
+(define (registry-map-native? tpl)
   (let ((ins (segop-template-ins tpl)) (outs (segop-template-outs tpl))
         (space (segop-template-space tpl)))
     (and (= (length outs) 1)
@@ -992,12 +1129,112 @@
                                                  (shape-size space) dtype)))))))))
 
 ;;; ------------------------------------------------------------
+;;; Fused column sums
+;;; ------------------------------------------------------------
+;;;
+;;; A seg-red that sums a body over the rows of rows x cols arrays and
+;;; also stores the body's values runs as a column-sum kernel of the
+;;; active activation backend (tag segop/colsum-kernel), when the backend
+;;; holds one for the canonical body.  Its space is (cols rows), with the
+;;; rows reduced; the inputs and the stored values are row-major arrays of
+;;; one dtype, f32 or f64.  The kernel adds the rows in order, as the
+;;; unfused axis-0 sum does.  If the kernel is missing when the step runs,
+;;; the strided reduction executor computes the segop instead.
+
+(define colsum-in-exprs '#((dim 1) (dim 0)))
+
+(define (colsum-out-exprs? exprs)
+  (member exprs '(#((dim 0)) #(0 (dim 0)))))
+
+(define (colsum-spec? spec dtype)
+  (and (eq? (combine-spec-op spec) 'add)
+       (eq? (combine-spec-order spec) 'sequential)
+       (eq? (combine-spec-acc-dtype spec) dtype)
+       (eqv? (combine-spec-neutral spec) 0.0)))
+
+(define (colsum-template? tpl)
+  (let ((space (segop-template-space tpl))
+        (ins   (segop-template-ins tpl))
+        (outs  (segop-template-outs tpl)))
+    (and (= (segop-template-nred tpl) 1)
+         (= (vector-length space) 2)
+         (= (length outs) 2)
+         (<= 1 (length ins) 3)
+         (let* ((res (car outs)) (mo (cadr outs)) (dt (template-output-dtype res)))
+           (and (fused-kernel-dtype? dt)
+                (template-output-combine res)
+                (colsum-spec? (template-output-combine res) dt)
+                (not (template-output-finalize res))
+                (template-output-map res)
+                (colsum-out-exprs? (index-map-exprs (template-output-map res)))
+                (not (template-output-combine mo))
+                (eq? (template-output-dtype mo) dt)
+                (eq? (template-output-body mo) (template-output-body res))
+                (template-output-map mo)
+                (equal? (index-map-exprs (template-output-map mo)) colsum-in-exprs)
+                (every (lambda (i) (and (template-input-flat? i)
+                                        (eq? (template-input-dtype i) dt)
+                                        (equal? (index-map-exprs (template-input-map i)) colsum-in-exprs)))
+                       ins)
+                (lookup-colsum-kernel (active-activation-backend)
+                                      (car (canonical-body+perm (template-output-body res) (length ins)))
+                                      dt)
+                #t)))))
+
+(define (registry-colsum-select sg)
+  (cases segop sg
+    (seg-red (space nred ins results map-outs fallback)
+      (and (= nred 1)
+           (= (vector-length space) 2)
+           (= (length results) 1)
+           (= (length map-outs) 1)
+           (<= 1 (length ins) 3)
+           (let* ((res   (car results))
+                  (out   (red-result-out res))
+                  (mo    (caar map-outs))
+                  (body  (red-result-body res))
+                  (dt    (segop-operand-dtype out))
+                  (cols  (vector-ref space 0))
+                  (rows  (vector-ref space 1))
+                  (full  (vector rows cols)))
+             (and (fused-kernel-dtype? dt)
+                  (eq? (cdar map-outs) body)
+                  (colsum-spec? (red-result-combine res) dt)
+                  (not (red-result-finalize res))
+                  (operand-row-major? out)
+                  (= (shape-size (segop-operand-shape out)) cols)
+                  (colsum-out-exprs? (index-map-exprs (segop-operand-map out)))
+                  (eq? (segop-operand-dtype mo) dt)
+                  (operand-flat? mo full)
+                  (equal? (index-map-exprs (segop-operand-map mo)) colsum-in-exprs)
+                  (every (lambda (o) (and (operand-flat? o full) (eq? (segop-operand-dtype o) dt)
+                                          (equal? (index-map-exprs (segop-operand-map o)) colsum-in-exprs)))
+                         ins)
+                  (let* ((cp    (canonical-body+perm body (length ins)))
+                         (refs  (map segop-operand-slot ins))
+                         (crefs (map (lambda (k) (list-ref refs k)) (cdr cp)))
+                         (host  (strided-red-executor space nred ins results map-outs)))
+                    (and (lookup-colsum-kernel (active-activation-backend) (car cp) dt)
+                         (cons 'segop/colsum-kernel
+                               (lambda (deref buf #!optional (extra-bufs '()))
+                                 (let ((kernel (lookup-colsum-kernel (active-activation-backend)
+                                                                     (car cp) dt)))
+                                   (if kernel
+                                       (kernel rows cols
+                                               (map (lambda (r) (operand-data 'colsum-kernel (deref r)))
+                                                    crefs)
+                                               (car extra-bufs) buf)
+                                       (host deref buf extra-bufs)))))))))))
+    (else #f)))
+
+;;; ------------------------------------------------------------
 ;;; Backend registration and instruction compilation
 ;;; ------------------------------------------------------------
 
 (define (registry-select sg)
   (or (registry-gemm-select sg)
       (registry-fused-select sg)
+      (registry-colsum-select sg)
       (registry-elementwise-select sg)
       (select-standard-reduction sg '(axis0 axis1))
       (registry-gather-select sg)))
@@ -1006,6 +1243,7 @@
   (or (scheme-elementwise-select sg)
       (select-standard-reduction sg '(1d axis0 axis1 general))
       (strided-select sg)
+      (strided-red-select sg)
       (host-index-fn-select sg)
       (interpreted-select sg)))
 

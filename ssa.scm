@@ -76,6 +76,8 @@
    segop-fusion-max-rounds
    ssa-fusion-pass-stats
    make-fused-ssa-binding
+   fused-red-binding?
+   binding-out-names
 
    ;; Segop lowering
    binding-scalar-body
@@ -586,7 +588,8 @@
 ;;;
 ;;; The driver visits the bindings from last to first and fuses into each
 ;;; consumer until nothing more fuses, so a chain collapses in one visit.
-;;; Rounds are repeated while they fuse something, at most
+;;; Each round fuses maps into maps first, then fuses with reductions (see
+;;; below).  Rounds are repeated while they fuse something, at most
 ;;; (segop-fusion-max-rounds) times.
 ;;; ============================================================
 
@@ -606,16 +609,22 @@
   "An alist describing the last run of ssa-segop-fusion-pass: rounds (the
    rounds run), fusions (the producers fused away), bound-reached? (true
    when the last round still fused and the round bound stopped the pass)
-   candidates, the bodies of the fused bindings made, each a list
+   candidates, the bodies of the fused seg-maps made, each a list
    (canonical-body dtype count elements): how many bindings have that
-   body and dtype, and their total number of elements; and missed, an
-   alist from reason to the number of pairs the last round left unfused
-   for that reason: not-native (the policy found no backend to run the
-   fused segop natively), broadcast-input (the same, for a fused segop
-   that reads a broadcast input), size-cap (the fused body or its inputs
-   exceed the bounds)
-   or view (the producer reaches the consumer through a reshape or a
-   transpose)."
+   body and dtype, and their total number of elements; red-candidates,
+   the fused seg-reds made, each a list (canonical-body combine-op path
+   map-output? dtype count elements), elements counting the reduced
+   values; and missed, an alist from reason to the number of pairs the
+   last round left unfused for that reason:
+     not-native           no backend runs the fused segop natively
+     broadcast-input      the same, for a fused segop with a broadcast input
+     size-cap             the fused body or its inputs exceed the bounds
+     view                 the producer is read through a reshape or a
+                          transpose, or a reduction's source is a view
+     reduction-order      the reduction's order is left to its backend
+     multi-use-reduction  a reduction result has other uses, or is read twice
+     placement            a finalize's inputs come after a reduction that
+                          keeps a map output"
   *fusion-pass-stats*)
 
 ;; Views: their values share the buffer of their source, in a layout that
@@ -627,7 +636,7 @@
   (let ((table (make-hash-table equal?)))
     (for-each
      (lambda (b)
-       (when (fused-binding? b)
+       (when (and (fused-binding? b) (not (fused-red-binding? b)))
          (for-each
           (lambda (o)
             (let* ((key (cons (call-with-values
@@ -643,6 +652,31 @@
     (map (lambda (kv) (list (caar kv) (cdar kv) (cadr kv) (cddr kv)))
          (hash-table->alist table))))
 
+;; The red-candidates entry of ssa-fusion-pass-stats for bindings bs.
+(define (fusion-red-candidates bs)
+  (let ((table (make-hash-table equal?)))
+    (for-each
+     (lambda (b)
+       (when (fused-red-binding? b)
+         (let* ((outs (fused-binding-outs b))
+                (o    (car outs))
+                (key  (list (call-with-values
+                                (lambda () (canonical-scalar-body (fused-out-body o)
+                                                                  (length (ssa-binding-inputs b))))
+                              (lambda (c perm) c))
+                            (combine-spec-op (car (fused-out-red o)))
+                            (cdr (assq 'path (ssa-binding-meta b)))
+                            (and (any (lambda (x) (not (fused-out-red x))) outs) #t)
+                            (fused-out-dtype o)))
+                (old  (hash-table-ref/default table key '(0 . 0))))
+           (hash-table-set! table key
+                            (cons (+ 1 (car old))
+                                  (+ (shape-size (cdr (assq 'src-shape (ssa-binding-meta b))))
+                                     (cdr old)))))))
+     bs)
+    (map (lambda (kv) (append (car kv) (list (cadr kv) (cddr kv))))
+         (hash-table->alist table))))
+
 ;; Ops that never take part in a fusion: contractions, views and the
 ;; convolution family read their operands in their own patterns.
 (define fusion-barrier-ops
@@ -655,39 +689,63 @@
 
 (define (fused-binding? b) (eq? (ssa-binding-op b) 'fused))
 
+;; The number of reduced dimensions of fused binding b: 0 for a seg-map.
+(define (fused-binding-nred b)
+  (let ((p (assq 'nred (ssa-binding-meta b)))) (if p (cdr p) 0)))
+
+(define (fused-red-binding? b) (and (fused-binding? b) (> (fused-binding-nred b) 0)))
+
+(define (reduce-binding? b)
+  (let ((op (ssa-binding-op b))) (and (pair? op) (eq? (car op) 'reduce))))
+
 (define (fused-binding-template b)
   (cdr (assq 'template (ssa-binding-meta b))))
 
 (define (fused-binding-outs b)
   (fusion-template-outs (fused-binding-template b)))
 
+(define (binding-out-names b)
+  (if (fused-binding? b) (map fused-out-name (fused-binding-outs b)) (list (ssa-binding-name b))))
+
 (define (binding-members b)
   (if (fused-binding? b) (cdr (assq 'members (ssa-binding-meta b))) (list (ssa-binding-name b))))
 
-(define (make-fused-ssa-binding inputs space in-maps outs members)
+(define (make-fused-ssa-binding inputs space in-maps outs members #!optional (nred 0) (meta '()))
   "A fused binding reading inputs (ssa-vtab) through in-maps, logical
-   index maps from the iteration space space.  outs lists its outputs as
-   (name shape dtype body), the binding's own result first; each body
-   reads the inputs as (in 0) ... in the order of inputs.  members names
-   the bindings it computes, in program order."
+   index maps from the iteration space space, of which the last nred
+   dimensions are reduced.  outs lists its outputs as (name shape dtype
+   body) or (name shape dtype body map red), the binding's own result
+   first (see fused-out); each body reads the inputs as (in 0) ... in the
+   order of inputs.  members names the bindings it computes, in program
+   order; meta is added to the binding's meta."
   (let* ((n   (length inputs))
          (fos (map (lambda (o)
                      (make-fused-out (car o) (cadr o) (caddr o) (cadddr o)
-                                     (scalar-expr->procedure (cadddr o) n)))
+                                     (scalar-expr->procedure (cadddr o) n)
+                                     (and (> (length o) 4) (list-ref o 4))
+                                     (and (> (length o) 5) (list-ref o 5))))
                    outs))
          (p   (car fos)))
     (make-ssa-binding (fused-out-name p) 'fused inputs (fused-out-shape p) (fused-out-dtype p)
-                      `((template . ,(make-fusion-template space in-maps fos))
+                      `((template . ,(make-fusion-template space in-maps fos nred))
                         (members . ,members)
                         (body . ,(fused-out-body p))
-                        (combiner . ,(fused-out-combiner p))))))
+                        (combiner . ,(fused-out-combiner p))
+                        (nred . ,nred)
+                        ,@meta))))
+
+;; The output o of a fusion template in the list form of
+;; make-fused-ssa-binding.
+(define (fused-out->list o)
+  (list (fused-out-name o) (fused-out-shape o) (fused-out-dtype o) (fused-out-body o)
+        (fused-out-map o) (fused-out-red o)))
 
 (define (fusion-map-binding? b)
   "True when b computes one value per point of its shape from its inputs:
    an element-wise binding with a combiner, or a fused binding with a
    single output."
   (let ((op (ssa-binding-op b)))
-    (cond ((eq? op 'fused) (null? (cdr (fused-binding-outs b))))
+    (cond ((eq? op 'fused) (and (= 0 (fused-binding-nred b)) (null? (cdr (fused-binding-outs b)))))
           ((pair? op) #f)
           ((memq op fusion-barrier-ops) #f)
           (else (ssa-binding-has-combiner? b)))))
@@ -710,7 +768,12 @@
     t))
 
 (define (fusion-edge-kind c shape)
-  (if (and (fusion-map-binding? c) (equal? shape (ssa-binding-shape c))) 'fusible 'infusible))
+  (cond ((fusion-map-binding? c) (if (equal? shape (ssa-binding-shape c)) 'fusible 'infusible))
+        ;; a reduction reads its source at every point of its space
+        ((reduce-binding? c) 'fusible)
+        ((fused-red-binding? c)
+         (if (equal? shape (cdr (assq 'src-shape (ssa-binding-meta c)))) 'fusible 'infusible))
+        (else 'infusible)))
 
 ;; Adds to uses the edges of binding c's reads.
 (define (add-fusion-edges! uses c vtab)
@@ -798,8 +861,12 @@
      (map (lambda (v m)
             (make-template-input (cdr (hash-table-ref vtab (ssa-value-id v))) m (flat? v)))
           (ssa-binding-inputs f) (fusion-template-in-maps tpl))
-     (map (lambda (o) (make-template-output (fused-out-dtype o) (fused-out-body o)))
-          (fusion-template-outs tpl)))))
+     (map (lambda (o)
+            (let ((red (fused-out-red o)))
+              (make-template-output (fused-out-dtype o) (fused-out-body o)
+                                    (and red (car red)) (and red (cdr red)) (fused-out-map o))))
+          (fusion-template-outs tpl))
+     (fusion-template-nred tpl))))
 
 (define (fusion-profitable? f vtab flat?)
   "True when making fused binding f should be done under the current
@@ -828,10 +895,7 @@
          (ins    (distinct-values (append (take c-ins k) p-ins (drop c-ins (+ k 1)))))
          (pos    (lambda (v) (list-index (lambda (u) (eq? (ssa-value-id u) (ssa-value-id v))) ins)))
          (renum  (lambda (vs) (lambda (j) `(in ,(pos (list-ref vs j))))))
-         (p-dtype (ssa-binding-dtype p))
-         (p-body (let ((b (binding-scalar-body p (ssa-binding-combiner p))))
-                   (if (eq? p-dtype 'f64) b `(cast ,p-dtype ,b))))
-         (p-body* (scalar-expr-substitute-inputs p-body (renum p-ins)))
+         (p-body* (scalar-expr-substitute-inputs (rounded-map-body p) (renum p-ins)))
          (body   (scalar-expr-substitute-inputs
                   (binding-scalar-body c (ssa-binding-combiner c))
                   (lambda (j) (if (= j k) p-body* ((renum c-ins) j)))))
@@ -844,9 +908,216 @@
      (list (list (ssa-binding-name c) shape (ssa-binding-dtype c) body))
      (append (binding-members p) (binding-members c)))))
 
+;;; ------------------------------------------------------------
+;;; Fusion with reductions
+;;; ------------------------------------------------------------
+;;;
+;;; A map P read by a reduction C is fused into it: the fused seg-red
+;;; computes P's body, rounded to P's dtype, at each point and combines it
+;;; as the unfused reduction would.  When P has other uses, the fused
+;;; binding also stores P's value as a map output and takes P's position,
+;;; because those uses may come before C.
+;;;
+;;; A map C that is the only use of a reduction R's result, and reads it at
+;;; C's own shape, becomes R's finalize: C's body, with R's stored value in
+;;; place of the read.  The fused binding takes R's position when C's other
+;;; inputs exist there, and otherwise C's position if R has no map outputs.
+;;;
+;;; A reduction whose order is left to its backend (the 1d sum, which may
+;;; use the BLAS dot product) is never fused.
+
+;; The parts of reduction binding r (a reduce binding or a fused seg-red)
+;; as a list (inputs space in-maps outs nred src-shape path), outs in the
+;; list form of make-fused-ssa-binding; or #f and the reason r cannot be
+;; fused.  A reduce binding's source must be expected flat (flat?), since
+;; its combine spec depends on its layout.
+(define (reduction-parts r vtab flat?)
+  (if (fused-binding? r)
+      (let ((tpl (fused-binding-template r)) (meta (ssa-binding-meta r)))
+        (values (list (ssa-binding-inputs r) (fusion-template-space tpl) (fusion-template-in-maps tpl)
+                      (map fused-out->list (fusion-template-outs tpl)) (fusion-template-nred tpl)
+                      (cdr (assq 'src-shape meta)) (cdr (assq 'path meta)))
+                #f))
+      (let* ((meta  (ssa-binding-meta r))
+             (rop   (cadr (ssa-binding-op r)))
+             (src   (car (ssa-binding-inputs r)))
+             (sd    (hash-table-ref vtab (ssa-value-id src)))
+             (s     (car sd))
+             (sdt   (cdr sd))
+             (rank  (vector-length s))
+             (axes  (cdr (assq 'axes meta)))
+             (keep? (let ((p (assq 'keepdims? meta))) (and p (cdr p))))
+             (red   (filter (lambda (k) (memv k axes)) (iota rank)))
+             (par   (filter (lambda (k) (not (memv k axes))) (iota rank)))
+             (order (append par red))
+             (dim-of (lambda (k) `(dim ,(list-index (lambda (j) (= j k)) order))))
+             (in-map (make-index-map (list->vector (map dim-of (iota rank))) #f 0.0 #f))
+             (out-map (if keep?
+                          (make-index-map (list->vector (map (lambda (k) (if (memv k red) 0 (dim-of k)))
+                                                             (iota rank)))
+                                          #f 0.0 #f)
+                          (identity-index-map (length par))))
+             (path  (reduction-path rop s (compute-strides s) 0 sdt red))
+             (spec  (reduction-combine-spec rop path sdt (ssa-binding-dtype r)))
+             (count (fold (lambda (k acc) (* acc (vector-ref s k))) 1 red)))
+        (cond ((eq? (combine-spec-order spec) 'unspecified) (values #f 'reduction-order))
+              ((not (flat? src)) (values #f 'view))
+              (else
+               (values (list (list src)
+                             (list->vector (map (lambda (k) (vector-ref s k)) order))
+                             (list in-map)
+                             (list (list (ssa-binding-name r) (ssa-binding-shape r) (ssa-binding-dtype r)
+                                         '(in 0) out-map
+                                         (cons spec (and (eq? rop 'mean) `(/ (reduced) ,count)))))
+                             (length red) s path)
+                       #f))))))
+
+;; True when index maps a and b read the same element at every point.
+(define (same-index-map? a b)
+  (and (not (index-map-proc a)) (not (index-map-proc b))
+       (not (index-map-guard a)) (not (index-map-guard b))
+       (equal? (index-map-exprs a) (index-map-exprs b))))
+
+;; The (value . map) pairs of pairs without repeats, in order of first
+;; occurrence.  A value read through two different maps is kept twice.
+(define (distinct-reads pairs)
+  (let loop ((ps pairs) (acc '()))
+    (cond ((null? ps) (reverse acc))
+          ((any (lambda (q) (and (eq? (ssa-value-id (car q)) (ssa-value-id (caar ps)))
+                                 (same-index-map? (cdr q) (cdar ps))))
+                acc)
+           (loop (cdr ps) acc))
+          (else (loop (cdr ps) (cons (car ps) acc))))))
+
+(define (read-position reads v m)
+  (list-index (lambda (q) (and (eq? (ssa-value-id (car q)) (ssa-value-id v)) (same-index-map? (cdr q) m)))
+              reads))
+
+;; e with each (in j) replaced by (subst j).  memo keeps bodies that were
+;; the same object the same object after the change.
+(define (renumber-body e subst memo)
+  (let ((hit (assq e (car memo))))
+    (if hit
+        (cdr hit)
+        (let ((new (scalar-expr-substitute-inputs e subst)))
+          (set-car! memo (cons (cons e new) (car memo)))
+          new))))
+
+;; The body of map binding p, rounded to p's dtype as storing it would.
+(define (rounded-map-body p)
+  (let ((b (binding-scalar-body p (ssa-binding-combiner p))) (dt (ssa-binding-dtype p)))
+    (if (eq? dt 'f64) b `(cast ,dt ,b))))
+
+;; The number of reads of input k by the bodies of outs, a body shared by
+;; several outputs counted once, and by their finalize bodies.
+(define (parts-input-reads outs k)
+  (let loop ((os outs) (seen '()) (n 0))
+    (if (null? os)
+        n
+        (let* ((o (car os)) (body (list-ref o 3)) (red (list-ref o 5))
+               (fin-n (if (and red (cdr red)) (scalar-body-input-reads (cdr red) k) 0)))
+          (if (memq body seen)
+              (loop (cdr os) seen (+ n fin-n))
+              (loop (cdr os) (cons body seen) (+ n fin-n (scalar-body-input-reads body k))))))))
+
+(define (make-fused-reduction ins+maps space outs nred src-shape path members)
+  (make-fused-ssa-binding (map car ins+maps) space (map cdr ins+maps) outs members nred
+                          `((src-shape . ,src-shape) (path . ,path))))
+
+(define (fuse-map-into-reduction p parts k kept? members vtab)
+  "The fused seg-red computing map binding p and the reduction whose parts
+   are parts (see reduction-parts), of which p is input k.  When kept? is
+   true, p's value is also written, as a map output named after p."
+  (let* ((r-ins   (list-ref parts 0))
+         (in-maps (list-ref parts 2))
+         (outs    (list-ref parts 3))
+         (m-p     (list-ref in-maps k))
+         (p-ins   (ssa-binding-inputs p))
+         (p-rank  (vector-length (ssa-binding-shape p)))
+         (p-maps  (map (lambda (v)
+                         (compose-index-maps
+                          (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) p-rank)
+                          m-p))
+                       p-ins))
+         (reads   (distinct-reads (append (map cons (take r-ins k) (take in-maps k))
+                                          (map cons p-ins p-maps)
+                                          (map cons (drop r-ins (+ k 1)) (drop in-maps (+ k 1))))))
+         (p-body  (scalar-expr-substitute-inputs
+                   (rounded-map-body p)
+                   (lambda (i) `(in ,(read-position reads (list-ref p-ins i) (list-ref p-maps i))))))
+         (subst   (lambda (j)
+                    (if (= j k)
+                        p-body
+                        `(in ,(read-position reads (list-ref r-ins j) (list-ref in-maps j))))))
+         (memo    (list '()))
+         (outs*   (map (lambda (o)
+                         (let ((red (list-ref o 5)))
+                           (list (car o) (cadr o) (caddr o) (renumber-body (list-ref o 3) subst memo)
+                                 (list-ref o 4)
+                                 (and red (cons (car red)
+                                                (and (cdr red)
+                                                     (scalar-expr-substitute-inputs (cdr red) subst)))))))
+                       outs)))
+    (make-fused-reduction
+     reads (list-ref parts 1)
+     (if kept?
+         (append outs* (list (list (ssa-binding-name p) (ssa-binding-shape p) (ssa-binding-dtype p)
+                                   p-body m-p #f)))
+         outs*)
+     (list-ref parts 4) (list-ref parts 5) (list-ref parts 6) members)))
+
+(define (fuse-epilogue parts c k members vtab)
+  "The fused seg-red computing the reduction whose parts are parts and map
+   binding c, which reads the reduction's result as input k: c's body
+   becomes the result's finalize."
+  (let* ((r-ins   (list-ref parts 0))
+         (in-maps (list-ref parts 2))
+         (outs    (list-ref parts 3))
+         (res     (car outs))
+         (om      (list-ref res 4))
+         (red     (list-ref res 5))
+         (r-dtype (list-ref res 2))
+         (c-ins   (ssa-binding-inputs c))
+         (c-rank  (vector-length (ssa-binding-shape c)))
+         (c-maps  (map (lambda (v)
+                         (compose-index-maps
+                          (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) c-rank)
+                          om))
+                       c-ins))
+         (others  (filter (lambda (j) (not (= j k))) (iota (length c-ins))))
+         (reads   (distinct-reads (append (map cons r-ins in-maps)
+                                          (map (lambda (j) (cons (list-ref c-ins j) (list-ref c-maps j)))
+                                               others))))
+         (fin     (or (cdr red) '(reduced)))
+         (stored  (if (eq? r-dtype 'f64) fin `(cast ,r-dtype ,fin)))
+         (fin*    (scalar-expr-substitute-inputs
+                   (binding-scalar-body c (ssa-binding-combiner c))
+                   (lambda (j)
+                     (if (= j k)
+                         stored
+                         `(in ,(read-position reads (list-ref c-ins j) (list-ref c-maps j))))))))
+    (make-fused-reduction
+     reads (list-ref parts 1)
+     (cons (list (ssa-binding-name c) (ssa-binding-shape c) (ssa-binding-dtype c)
+                 (list-ref res 3) om (cons (car red) fin*))
+           (cdr outs))
+     (list-ref parts 4) (list-ref parts 5) (list-ref parts 6) members)))
+
+(define (fused-reduction-legal? f)
+  "True when fused seg-red f is within the bounds on the number of inputs
+   and the size of its bodies, finalize bodies included."
+  (and (<= (length (ssa-binding-inputs f)) fusion-max-inputs)
+       (every (lambda (o)
+                (and (<= (scalar-body-size (fused-out-body o)) fusion-max-body-size)
+                     (let ((red (fused-out-red o)))
+                       (or (not red) (not (cdr red))
+                           (<= (scalar-body-size (cdr red)) fusion-max-body-size)))))
+              (fused-binding-outs f))))
+
 (define (ssa-segop-fusion-pass prog)
-  "Fuse the map bindings of prog into their consumers (see above).
-   Returns a new program; prog is not changed."
+  "Fuse the map bindings of prog into their consumers, maps into the
+   reductions that read them, and reductions into the maps that read their
+   results (see above).  Returns a new program; prog is not changed."
   (let* ((bv     (list->vector (ssa-program-bindings prog)))
          (n      (vector-length bv))
          (pos    (make-hash-table eq?))
@@ -872,30 +1143,46 @@
                         ((memq op fusion-view-ops)
                          (hash-table-set! layouts (ssa-binding-name b) #f)))))
               (ssa-program-bindings prog))
+    ;; pos maps the name of every value a binding computes to the
+    ;; binding's position; pos-of-binding maps each binding's name.
+    (define pos-of-binding (make-hash-table eq?))
     (do ((i 0 (+ i 1))) ((= i n))
-      (hash-table-set! pos (ssa-binding-name (vector-ref bv i)) i))
+      (let ((b (vector-ref bv i)))
+        (hash-table-set! pos-of-binding (ssa-binding-name b) i)
+        (for-each (lambda (name) (hash-table-set! pos name i)) (binding-out-names b))))
 
     (define (binding-of v)
       (and (ssa-binding-ref? v)
            (let ((i (hash-table-ref/default pos (ssa-value-id v) #f)))
              (and i (vector-ref bv i)))))
 
-    ;; Replaces p and c by f at c's position, updating the uses of their
-    ;; inputs.
-    (define (commit! p c f)
-      (let ((p-name (ssa-binding-name p)) (c-name (ssa-binding-name c)))
+    ;; Replaces the bindings olds by f at position at, and updates the uses
+    ;; of their inputs.
+    (define (commit-at! olds f at)
+      (let ((names (map ssa-binding-name olds))
+            (keep  (map fused-out-name (fused-binding-outs f))))
         (for-each (lambda (v)
                     (when (ssa-binding-ref? v)
                       (let ((id (ssa-value-id v)))
                         (hash-table-set! uses id
-                                         (filter (lambda (u) (not (memq (car u) (list p-name c-name))))
+                                         (filter (lambda (u) (not (memq (car u) names)))
                                                  (hash-table-ref/default uses id '()))))))
-                  (append (ssa-binding-inputs p) (ssa-binding-inputs c)))
-        (hash-table-set! uses p-name '())
-        (vector-set! bv (hash-table-ref pos p-name) #f)
-        (hash-table-set! pos p-name #f)
-        (vector-set! bv (hash-table-ref pos c-name) f)
+                  (append-map ssa-binding-inputs olds))
+        (for-each (lambda (b)
+                    (for-each (lambda (name)
+                                (unless (memq name keep) (hash-table-set! uses name '()))
+                                (hash-table-set! pos name #f))
+                              (binding-out-names b))
+                    (vector-set! bv (hash-table-ref pos-of-binding (ssa-binding-name b)) #f))
+                  olds)
+        (vector-set! bv at f)
+        (for-each (lambda (name) (hash-table-set! pos name at)) keep)
+        (hash-table-set! pos-of-binding (ssa-binding-name f) at)
         (add-fusion-edges! uses f vtab)))
+
+    ;; Replaces p and c by f at c's position.
+    (define (commit! p c f)
+      (commit-at! (list p c) f (hash-table-ref pos-of-binding (ssa-binding-name c))))
 
     ;; The reasons for which the current round left pairs unfused, as an
     ;; alist from reason to count.
@@ -950,16 +1237,131 @@
                               (begin (note-missed! p c k) #f))))
                    (loop (cdr vs) (+ k 1)))))))
 
-    (define (run-round)
-      (set! missed '())
+    ;; Puts fused binding f in place of olds at position at, if it is legal
+    ;; and profitable; otherwise records why not.
+    (define (try-commit! olds f at)
+      (cond ((not (fused-reduction-legal? f)) (miss! 'size-cap) #f)
+            ((not (fusion-profitable? f vtab flat?)) (miss! 'not-native) #f)
+            (else (commit-at! olds f at) #t)))
+
+    ;; Fuses a map producer into the reduction at position i; true if it
+    ;; did.  A producer with other uses is kept as a map output, which only
+    ;; a reduce binding can do.
+    (define (fuse-into-reduction! i)
+      (let ((c (vector-ref bv i)))
+        (let loop ((vs (ssa-binding-inputs c)) (k 0))
+          (and (pair? vs)
+               (or (let ((p (binding-of (car vs))))
+                     (and p
+                          (eq? (ssa-binding-name p) (ssa-value-id (car vs)))
+                          (fusion-map-binding? p)
+                          (let* ((p-name (ssa-binding-name p))
+                                 (u      (hash-table-ref/default uses p-name '()))
+                                 (single (single-fusible-use? p-name (ssa-binding-name c)))
+                                 (kept   (and (not single) (reduce-binding? c)
+                                              (any (lambda (x) (and (eq? (car x) (ssa-binding-name c))
+                                                                    (eq? (caddr x) 'fusible)))
+                                                   u))))
+                            (and (or single kept)
+                                 (call-with-values (lambda () (reduction-parts c vtab flat?))
+                                   (lambda (parts reason)
+                                     (cond
+                                      ((not parts) (miss! reason) #f)
+                                      ((not (and (= 1 (parts-input-reads (list-ref parts 3) k))
+                                                 (every (lambda (o)
+                                                          (let ((red (list-ref o 5)))
+                                                            (or (not red) (not (cdr red))
+                                                                (= 0 (scalar-body-input-reads (cdr red) k)))))
+                                                        (list-ref parts 3))))
+                                       #f)
+                                      (else
+                                       (let ((f (fuse-map-into-reduction
+                                                 p parts k kept
+                                                 (append (binding-members p) (binding-members c))
+                                                 vtab)))
+                                         (try-commit! (list p c) f
+                                                      (hash-table-ref pos-of-binding
+                                                                      (if kept p-name (ssa-binding-name c)))))))))))))
+                   (loop (cdr vs) (+ k 1)))))))
+
+    ;; Fuses map binding c at position i into the reduction whose result
+    ;; it reads (an epilogue); true if it did.
+    (define (fuse-epilogue! i)
+      (let ((c (vector-ref bv i)))
+        (let loop ((vs (ssa-binding-inputs c)) (k 0))
+          (and (pair? vs)
+               (or (let ((r (binding-of (car vs))))
+                     (and r
+                          (or (reduce-binding? r) (fused-red-binding? r))
+                          (eq? (ssa-binding-name r) (ssa-value-id (car vs)))
+                          (let* ((r-name (ssa-binding-name r))
+                                 (u      (hash-table-ref/default uses r-name '())))
+                            (and (any (lambda (x) (and (eq? (car x) (ssa-binding-name c))
+                                                       (eq? (caddr x) 'fusible)))
+                                      u)
+                                 (cond
+                                  ((not (single-fusible-use? r-name (ssa-binding-name c)))
+                                   (miss! 'multi-use-reduction) #f)
+                                  ;; a second read would compute the finalize twice
+                                  ((not (= 1 (scalar-body-input-reads
+                                              (binding-scalar-body c (ssa-binding-combiner c)) k)))
+                                   (miss! 'multi-use-reduction) #f)
+                                  ;; c also reads another output of r
+                                  ((any (lambda (v)
+                                          (and (ssa-binding-ref? v)
+                                               (not (eq? (ssa-value-id v) r-name))
+                                               (memq (ssa-value-id v) (binding-out-names r))))
+                                        (ssa-binding-inputs c))
+                                   #f)
+                                  (else
+                                   (call-with-values (lambda () (reduction-parts r vtab flat?))
+                                     (lambda (parts reason)
+                                       (if (not parts)
+                                           (begin (miss! reason) #f)
+                                           (let* ((r-at (hash-table-ref pos-of-binding r-name))
+                                                  (early? (every (lambda (v)
+                                                                   (or (not (ssa-binding-ref? v))
+                                                                       (eq? (ssa-value-id v) r-name)
+                                                                       (let ((j (hash-table-ref/default
+                                                                                 pos (ssa-value-id v) #f)))
+                                                                         (or (not j) (< j r-at)))))
+                                                                 (ssa-binding-inputs c)))
+                                                  (at (cond (early? r-at)
+                                                            ((null? (cdr (list-ref parts 3))) i)
+                                                            (else #f))))
+                                             (if (not at)
+                                                 (begin (miss! 'placement) #f)
+                                                 (try-commit!
+                                                  (list r c)
+                                                  (fuse-epilogue parts c k
+                                                                 (append (binding-members r) (binding-members c))
+                                                                 vtab)
+                                                  at))))))))))))
+                   (loop (cdr vs) (+ k 1)))))))
+
+    ;; Tries rule on each binding that satisfies pred, from last to first,
+    ;; until it fuses nothing more there; returns the number of fusions.
+    (define (run-phase pred rule)
       (let loop ((i (- n 1)) (count 0))
         (if (< i 0)
             count
             (let ((b (vector-ref bv i)))
-              (if (and b (fusion-map-binding? b))
+              (if (and b (pred b))
                   (let fuse ((count count))
-                    (if (fuse-one! i) (fuse (+ count 1)) (loop (- i 1) count)))
+                    (if (and (vector-ref bv i) (pred (vector-ref bv i)) (rule i))
+                        (fuse (+ count 1))
+                        (loop (- i 1) count)))
                   (loop (- i 1) count))))))
+
+    ;; Maps are fused first, so that a chain of maps is one map before it
+    ;; meets its reduction.
+    (define (run-round)
+      (set! missed '())
+      (let* ((maps (run-phase fusion-map-binding? fuse-one!))
+             (reds (run-phase (lambda (b) (or (reduce-binding? b) (fused-red-binding? b)))
+                              fuse-into-reduction!))
+             (epis (run-phase fusion-map-binding? fuse-epilogue!)))
+        (+ maps reds epis)))
 
     (let rounds ((r 1) (total 0))
       (let* ((fused (run-round)) (total (+ total fused)))
@@ -967,6 +1369,7 @@
             (set! *fusion-pass-stats*
                   `((rounds . ,r) (fusions . ,total) (bound-reached? . ,(> fused 0))
                     (candidates . ,(fusion-candidates (filter (lambda (b) b) (vector->list bv))))
+                    (red-candidates . ,(fusion-red-candidates (filter (lambda (b) b) (vector->list bv))))
                     (missed . ,(reverse missed))))
             (rounds (+ r 1) total))))
 
@@ -2585,7 +2988,8 @@
                          (binding-ref (bid) (eq? bid (ssa-binding-name g)))
                          (else #f)))
                      (ssa-binding-elementwise? e)
-                     (not (and (fused-binding? e) (pair? (cdr (fused-binding-outs e))))))
+                     (not (and (fused-binding? e)
+                               (or (fused-red-binding? e) (pair? (cdr (fused-binding-outs e)))))))
             ;; Try to compile e as a flat instruction
             (let* ((e-in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
                                     (ssa-binding-inputs e)))
@@ -3113,7 +3517,7 @@
       (cond ((null? bs) `((native . ,native) (host . ,host)))
             ((fused-binding? (car bs))
              (if (cases replay-instruction (vector-ref plan i)
-                   (ri-segop (_ _ _ _ _ _ tag _) (eq? tag 'segop/fused-kernel))
+                   (ri-segop (_ _ _ _ _ _ tag _) (memq tag '(segop/fused-kernel segop/colsum-kernel)))
                    (else #f))
                  (loop (cdr bs) (+ i 1) (+ native 1) host)
                  (loop (cdr bs) (+ i 1) native (+ host 1))))

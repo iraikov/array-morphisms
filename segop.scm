@@ -33,7 +33,7 @@
 ;;;       | (in k)                      element of input k at the current point
 ;;;       | (param k)                   runtime scalar parameter k
 ;;;       | (idx d)                     iteration coordinate d, an integer
-;;;       | (acc)                       the reduced value, in a finalize body
+;;;       | (reduced)                   the reduced value, in a finalize body
 ;;;       | (op e ...)                  a primitive (see scalar-primitives) or
 ;;;                                     an op of the scalar-op table
 ;;;       | (if e e e) | (let* ((v e) ...) e)
@@ -82,6 +82,7 @@
    scalar-expr-valid?
    eval-scalar-expr
    scalar-expr-substitute-inputs
+   scalar-expr-substitute-reduced
    scalar-expr-inputs
    scalar-expr-opaque?
    scalar-expr->procedure
@@ -95,6 +96,7 @@
    make-red-result
    red-result?
    red-result-out red-result-body red-result-combine red-result-finalize
+   combine-step round-to-dtype
 
    ;; Segops
    segop segop?
@@ -110,13 +112,14 @@
    ;; Query templates
    make-segop-template
    segop-template?
-   segop-template-space segop-template-ins segop-template-outs
+   segop-template-space segop-template-ins segop-template-outs segop-template-nred
    make-template-input
    template-input?
    template-input-dtype template-input-map template-input-flat?
    make-template-output
    template-output?
    template-output-dtype template-output-body
+   template-output-combine template-output-finalize template-output-map
 
    ;; Backends
    make-segop-backend
@@ -524,10 +527,10 @@
 ;;;; Scalar expressions
 ;;;; ============================================================
 
-(define (scalar-expr-valid? e n-inputs space-rank #!key (acc? #f))
+(define (scalar-expr-valid? e n-inputs space-rank #!key (reduced? #f))
   "True when e is a well-formed scalar expression whose (in k) refer to
-   k < n-inputs and whose (idx d) refer to d < space-rank.  (acc) is allowed
-   only when acc? is true."
+   k < n-inputs and whose (idx d) refer to d < space-rank.  (reduced) is
+   allowed only when reduced? is true."
   (let walk ((e e) (vars '()))
     (cond ((number? e) #t)
           ((symbol? e) (and (memq e vars) #t))
@@ -539,7 +542,7 @@
              ((param) (and (= (length e) 2) (exact-integer? (cadr e)) (>= (cadr e) 0)))
              ((idx) (and (= (length e) 2) (exact-integer? (cadr e))
                          (<= 0 (cadr e)) (< (cadr e) space-rank)))
-             ((acc) (and acc? (null? (cdr e))))
+             ((reduced) (and reduced? (null? (cdr e))))
              ((if) (and (= (length e) 4) (every (lambda (x) (walk x vars)) (cdr e))))
              ((cast) (and (= (length e) 3) (memq (cadr e) cast-dtypes) (walk (caddr e) vars)))
              ((let*)
@@ -564,16 +567,16 @@
 
 (define (primitive-procedure sym)
   (case sym
-    ((+) +) ((-) -) ((*) *) ((/) /)
+    ((+) scalar-add) ((-) -) ((*) *) ((/) /)
     ((exp) exp) ((log) log) ((sqrt) sqrt) ((sin) sin) ((cos) cos) ((tan) tan)
     ((floor) floor) ((ceiling) ceiling) ((expt) expt) ((fpabs) fp-abs)
     ((<) <) ((>) >) ((<=) <=) ((>=) >=) ((=) =)
     (else #f)))
 
-(define (eval-scalar-expr e read-in #!key (params '#()) (coords '#()) (acc #f))
+(define (eval-scalar-expr e read-in #!key (params '#()) (coords '#()) (reduced #f))
   "Value of the scalar expression e.  read-in is a procedure giving the
    value of input k at the current point; params is the vector of runtime
-   parameters, coords the iteration point and acc the reduced value.  Ops
+   parameters, coords the iteration point and reduced the reduced value.  Ops
    of the scalar-op table are evaluated from their table expressions."
   (let ev ((e e) (env '()))
     (cond ((number? e) e)
@@ -585,7 +588,7 @@
              ((in) (read-in (cadr e)))
              ((param) (vector-ref params (cadr e)))
              ((idx) (vector-ref coords (cadr e)))
-             ((acc) (or acc (error 'eval-scalar-expr "(acc) outside a finalize body")))
+             ((reduced) (or reduced (error 'eval-scalar-expr "(reduced) outside a finalize body")))
              ((if) (if (ev (cadr e) env) (ev (caddr e) env) (ev (cadddr e) env)))
              ((cast) (round-to-dtype (ev (caddr e) env) (cadr e)))
              ((let*)
@@ -607,7 +610,7 @@
   "e with every (in k) replaced by (subst k), an expression."
   (cond ((not (pair? e)) e)
         ((eq? (car e) 'in) (subst (cadr e)))
-        ((memq (car e) '(param idx acc)) e)
+        ((memq (car e) '(param idx reduced)) e)
         ((eq? (car e) 'cast) `(cast ,(cadr e) ,(scalar-expr-substitute-inputs (caddr e) subst)))
         ((eq? (car e) 'let*)
          `(let* ,(map (lambda (b) (list (car b) (scalar-expr-substitute-inputs (cadr b) subst)))
@@ -617,12 +620,26 @@
          `(opaque ,(cadr e) ,@(map (lambda (x) (scalar-expr-substitute-inputs x subst)) (cddr e))))
         (else (cons (car e) (map (lambda (x) (scalar-expr-substitute-inputs x subst)) (cdr e))))))
 
+(define (scalar-expr-substitute-reduced e r)
+  "e with every (reduced) replaced by the expression r."
+  (cond ((not (pair? e)) e)
+        ((eq? (car e) 'reduced) r)
+        ((memq (car e) '(in param idx)) e)
+        ((eq? (car e) 'cast) `(cast ,(cadr e) ,(scalar-expr-substitute-reduced (caddr e) r)))
+        ((eq? (car e) 'let*)
+         `(let* ,(map (lambda (b) (list (car b) (scalar-expr-substitute-reduced (cadr b) r)))
+                      (cadr e))
+            ,(scalar-expr-substitute-reduced (caddr e) r)))
+        ((eq? (car e) 'opaque)
+         `(opaque ,(cadr e) ,@(map (lambda (x) (scalar-expr-substitute-reduced x r)) (cddr e))))
+        (else (cons (car e) (map (lambda (x) (scalar-expr-substitute-reduced x r)) (cdr e))))))
+
 (define (scalar-expr-inputs e)
   "Sorted list of the input indices k for which e contains (in k)."
   (define (walk e acc)
     (cond ((not (pair? e)) acc)
           ((eq? (car e) 'in) (if (memv (cadr e) acc) acc (cons (cadr e) acc)))
-          ((memq (car e) '(param idx acc)) acc)
+          ((memq (car e) '(param idx reduced)) acc)
           ((eq? (car e) 'cast) (walk (caddr e) acc))
           ((eq? (car e) 'let*)
            (walk (caddr e) (fold (lambda (b acc) (walk (cadr b) acc)) acc (cadr e))))
@@ -639,7 +656,7 @@
                 (or (any (lambda (b) (scalar-expr-opaque? (cadr b))) (cadr e))
                     (scalar-expr-opaque? (caddr e))))
            (and (eq? (car e) 'cast) (scalar-expr-opaque? (caddr e)))
-           (and (not (memq (car e) '(in param idx acc let* cast)))
+           (and (not (memq (car e) '(in param idx reduced let* cast)))
                 (any scalar-expr-opaque? (cdr e))))))
 
 
@@ -662,12 +679,20 @@
 ;;; one of its own calls is still running (an opaque procedure calling the
 ;;; same compiled body).
 
-(define (scalar-expr->procedure body n-inputs)
+(define (scalar-expr->procedure body n-inputs #!key (reduced? #f))
   "A procedure of n-inputs arguments that computes body.  The body may use
    (in k), numbers, table ops, primitives, if, let*, cast and opaque; (param
-   k), (idx d) and (acc) are not supported."
-  (unless (scalar-expr-valid? body n-inputs 0)
+   k) and (idx d) are not supported.  When reduced? is true, body is a
+   finalize body that may also use (reduced), and the procedure takes the
+   reduced value as one more argument, after the inputs."
+  (unless (scalar-expr-valid? body n-inputs 0 reduced?: reduced?)
     (error 'scalar-expr->procedure "invalid body" body n-inputs))
+  (if reduced?
+      (scalar-expr->procedure (scalar-expr-substitute-reduced body `(in ,n-inputs))
+                              (+ n-inputs 1))
+      (compile-scalar-expr body n-inputs)))
+
+(define (compile-scalar-expr body n-inputs)
   (let ((wide? (> n-inputs 3)))
     (define (compile e env)
       (cond
@@ -684,7 +709,7 @@
                    ((= k 0) (lambda (a b c v) a))
                    ((= k 1) (lambda (a b c v) b))
                    (else    (lambda (a b c v) c)))))
-          ((param idx acc)
+          ((param idx reduced)
            (error 'scalar-expr->procedure "form not supported by the body compiler" e))
           ((if)
            (let ((t (compile (cadr e) env))
@@ -768,7 +793,7 @@
 ;; to the same dtype merged, from the leaves up.
 (define (normalize-scalar-expr e)
   (cond ((not (pair? e)) e)
-        ((memq (car e) '(in param idx acc)) e)
+        ((memq (car e) '(in param idx reduced)) e)
         ((eq? (car e) 'cast)
          (let ((x (normalize-scalar-expr (caddr e))))
            (if (and (pair? x) (eq? (car x) 'cast) (eq? (cadr x) (cadr e)))
@@ -796,7 +821,7 @@
   (define (walk e acc)
     (cond ((not (pair? e)) acc)
           ((eq? (car e) 'in) (if (memv (cadr e) acc) acc (cons (cadr e) acc)))
-          ((memq (car e) '(param idx acc)) acc)
+          ((memq (car e) '(param idx reduced)) acc)
           ((eq? (car e) 'cast) (walk (caddr e) acc))
           ((eq? (car e) 'let*)
            (walk (caddr e) (fold (lambda (b acc) (walk (cadr b) acc)) acc (cadr e))))
@@ -874,8 +899,8 @@
 ;;   out:      the output operand; its map uses only the parallel dimensions.
 ;;   body:     value at each point before combining.
 ;;   combine:  a combine-spec.
-;;   finalize: expression over (acc) and inputs read at the output point,
-;;             or #f for (acc) itself.
+;;   finalize: expression over (reduced) and inputs read at the output point,
+;;             or #f for (reduced) itself.
 (define-record red-result out body combine finalize)
 
 
@@ -935,8 +960,8 @@
     (unless (linear-injective? (cdr lin) space)
       (error who "an output map must be one-to-one" (segop-operand-map o)))))
 
-(define (check-body who e n-in space-rank acc?)
-  (unless (scalar-expr-valid? e n-in space-rank acc?: acc?)
+(define (check-body who e n-in space-rank reduced?)
+  (unless (scalar-expr-valid? e n-in space-rank reduced?: reduced?)
     (error who "malformed scalar expression" e)))
 
 (define (make-seg-map space ins outs bodies #!optional (fallback #f))
@@ -1174,7 +1199,7 @@
                         (coords (point (make-vector nred 0)))
                         (v (if fin
                                (eval-scalar-expr fin (reader coords)
-                                                 params: params coords: p acc: acc)
+                                                 params: params coords: p reduced: acc)
                                acc)))
                    (write-operand! (red-result-out res) buf coords v)))
                results res-bufs))))))
@@ -1190,15 +1215,39 @@
 ;;;; Segop templates
 ;;;; ============================================================
 
-;; A layout-free description of a seg-map, for the questions that are
+;; A layout-free description of a seg-map or a seg-red, for questions
 ;; asked before the arrays exist, such as whether a backend could run it
-;; natively.  ins lists one template-input per input: its dtype, the
-;; index map from the space to its logical index, and whether its layout
-;; is expected to be flat (row-major, of the input's shape, at offset 0).
-;; outs lists one template-output per output: its dtype and its body.
-(define-record segop-template space ins outs)
+;; natively.  ins lists one template-input per input: its dtype, the index
+;; map from the space to its index, and whether its layout is expected to
+;; be flat (row-major, of the input's shape, at offset 0).  outs lists one
+;; template-output per output: its dtype and body, and for a reduced
+;; result its combine spec and finalize body.  map, when not #f, takes the
+;; space to the output's index.  nred is the number of trailing dimensions
+;; of the space that are reduced, 0 for a seg-map.
+(define-record-type segop-template
+  (%make-segop-template space ins outs nred)
+  segop-template?
+  (space segop-template-space)
+  (ins   segop-template-ins)
+  (outs  segop-template-outs)
+  (nred  segop-template-nred))
+
+(define (make-segop-template space ins outs #!optional (nred 0))
+  (%make-segop-template space ins outs nred))
+
 (define-record template-input dtype map flat?)
-(define-record template-output dtype body)
+
+(define-record-type template-output
+  (%make-template-output dtype body combine finalize map)
+  template-output?
+  (dtype    template-output-dtype)
+  (body     template-output-body)
+  (combine  template-output-combine)
+  (finalize template-output-finalize)
+  (map      template-output-map))
+
+(define (make-template-output dtype body #!optional (combine #f) (finalize #f) (map #f))
+  (%make-template-output dtype body combine finalize map))
 
 ;;;; ============================================================
 ;;;; Backends

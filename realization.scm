@@ -113,7 +113,8 @@
           array-morphisms-blas-compat
           array-morphisms-blas-exec
           array-morphisms-activation-exec
-          array-morphisms-micro-blas-backend)
+          array-morphisms-micro-blas-backend
+          (only array-morphisms-scalar-ops scalar-add))
 
   ;; Default-backend bootstrap: register the dependency-free microBLAS
   ;; backend unless something (e.g. the system-BLAS egg backend) has
@@ -1297,7 +1298,7 @@
     (define-syntax by-op
       (syntax-rules ()
         ((_ ref set!)
-         (cond ((eq? combiner +) (run ref set! fp+))
+         (cond ((or (eq? combiner scalar-add) (eq? combiner +)) (run ref set! fp+))
                ((eq? combiner -) (run ref set! fp-))
                ((eq? combiner *) (run ref set! fp*))
                ((eq? combiner /) (run ref set! fp/))
@@ -1323,7 +1324,7 @@
       (define-syntax by-op
         (syntax-rules ()
           ((_ ref set!)
-           (cond ((eq? combiner +) (run ref set! fp+))
+           (cond ((or (eq? combiner scalar-add) (eq? combiner +)) (run ref set! fp+))
                  ((eq? combiner -) (run ref set! fp-))
                  ((eq? combiner *) (run ref set! fp*))
                  ((eq? combiner /) (run ref set! fp/))
@@ -3257,7 +3258,7 @@
   (define (procedure-name proc)
     "Attempt to get name of procedure (for built-in operators)"
     (cond
-      ((eq? proc +) '+)
+      ((or (eq? proc scalar-add) (eq? proc +)) '+)
       ((eq? proc *) '*)
       ((eq? proc max) 'max)
       ((eq? proc min) 'min)

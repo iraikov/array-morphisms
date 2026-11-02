@@ -36,10 +36,13 @@
         1e30 -1e30 3.4028234663852886e38 1e300 -1e300 709.0 710.0 -745.0
         -746.0 20.0 -20.0 0.1 -0.7 123.456 +inf.0 -inf.0 +nan.0))
 
-;; (op x ...) evaluated from the table expression of op.
+;; (op x ...) evaluated from the table expression of op.  The + of a table
+;; expression is scalar-add, as in eval-scalar-expr, so that -0.0 + -0.0
+;; gives -0.0.
 (eval '(import (only (chicken flonum) fpabs)))
 (define (so-expr-proc op)
-  (eval `(lambda ,(scalar-op-params op) ,(scalar-op-expr op))))
+  (eval `(let ((+ ',scalar-add))
+           (lambda ,(scalar-op-params op) ,(scalar-op-expr op)))))
 
 ;; True when f and g agree on every argument tuple of args.
 (define (so-agree? f g args)
@@ -206,8 +209,8 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (test-group "combiner identity"
-  (test-assert "generic combiners are the standard procedures"
-    (and (eq? (scalar-op-combiner 'add) +) (eq? (scalar-op-combiner 'sub) -)
+  (test-assert "generic combiners are the standard procedures, and scalar-add for add"
+    (and (eq? (scalar-op-combiner 'add) scalar-add) (eq? (scalar-op-combiner 'sub) -)
          (eq? (scalar-op-combiner 'mul) *) (eq? (scalar-op-combiner 'div) /)
          (eq? (scalar-op-combiner 'pow) expt) (eq? (scalar-op-combiner 'exp) exp)
          (eq? (scalar-op-combiner 'sqrt) sqrt) (eq? (scalar-op-combiner 'negate) -)))

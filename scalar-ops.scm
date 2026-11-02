@@ -19,13 +19,24 @@
    scalar-op-expr
    scalar-op-combiner
    scalar-op-generic?
+   scalar-add
    scalar-primitive?
    scalar-primitives)
 
   (import scheme (chicken base)
-          (only (chicken flonum) fpabs)
+          (only (chicken flonum) fp+ fpabs)
           (only srfi-69 make-hash-table hash-table-ref/default hash-table-set!))
   (import-for-syntax scheme (chicken base) array-morphisms-scalar-ops-table)
+
+  (define (scalar-add x y)
+    "The sum of x and y, the combiner of the add op.  Two flonums are added
+    with fp+, which follows IEEE 754 and so gives -0.0 for -0.0 + -0.0, as
+    the compiled element-wise kernels do.  The generic + of some CHICKEN
+    versions starts its sum from exact 0 and gives 0.0 there.  Other
+    arguments, such as integers, are added with the generic +."
+    (if (and (flonum? x) (flonum? y))
+        (fp+ x y)
+        (+ x y)))
 
   ;; (define-scalar-ops name) binds name to a list with one vector per table
   ;; entry: #(op params expr combiner generic?).  The combiner is built as

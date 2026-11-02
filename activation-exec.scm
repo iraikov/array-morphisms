@@ -102,7 +102,11 @@
    ;; Fused kernels
    activation-backend-add-fused-kernel!
    lookup-fused-kernel
-   activation-backend-fused-patterns)
+   activation-backend-fused-patterns
+
+   ;; Fused column-sum kernels
+   activation-backend-add-colsum-kernel!
+   lookup-colsum-kernel)
 
   (import scheme (chicken base))
   (import (only srfi-69
@@ -117,11 +121,12 @@
   ;; equal?, so they hash by content rather than by address.
   ;; binary-table, reduction-table and copy-table hold the binary,
   ;; reduction and strided-copy kernels in the same way.
-  ;; broadcast-table holds the broadcast binary kernels, and fused-table
-  ;; the fused kernels, keyed by (body . dtype).
+  ;; broadcast-table holds the broadcast binary kernels, fused-table the
+  ;; fused kernels and colsum-table the fused column-sum kernels, both
+  ;; keyed by (body . dtype).
   (define-record-type activation-backend
     (%make-activation-backend name table binary-table reduction-table copy-table
-                              broadcast-table fused-table)
+                              broadcast-table fused-table colsum-table)
     activation-backend?
     (name            activation-backend-name)
     (table           activation-backend-table)
@@ -129,13 +134,15 @@
     (reduction-table activation-backend-reduction-table)
     (copy-table      activation-backend-copy-table)
     (broadcast-table activation-backend-broadcast-table)
-    (fused-table     activation-backend-fused-table))
+    (fused-table     activation-backend-fused-table)
+    (colsum-table    activation-backend-colsum-table))
 
   (define (make-activation-backend name)
     "Create an activation backend called name (a symbol) with no kernels."
     (%make-activation-backend name (make-hash-table equal?) (make-hash-table equal?)
                               (make-hash-table equal?) (make-hash-table equal?)
-                              (make-hash-table equal?) (make-hash-table equal?)))
+                              (make-hash-table equal?) (make-hash-table equal?)
+                              (make-hash-table equal?)))
 
   (define (check-kernel who dtype kernel)
     (unless (memq dtype '(f32 f64))
@@ -219,6 +226,22 @@
     arrays, or #f."
     (and bkend
          (hash-table-ref/default (activation-backend-fused-table bkend) (cons body dtype) #f)))
+
+  (define (activation-backend-add-colsum-kernel! bkend body dtype kernel)
+    "Installs kernel, a procedure (rows cols ins mo out) -> void, as the
+    backend's column-sum kernel for body on dtype arrays.  ins lists the
+    inputs, row-major rows x cols arrays read as (in 0), (in 1), ....  The
+    kernel stores body's value at each element in mo, a rows x cols array,
+    and the sum of each column in out, adding the rows in order.  body must
+    be in canonical form (see canonical-scalar-body in segop.scm)."
+    (check-kernel 'activation-backend-add-colsum-kernel! dtype kernel)
+    (hash-table-set! (activation-backend-colsum-table bkend) (cons body dtype) kernel))
+
+  (define (lookup-colsum-kernel bkend body dtype)
+    "The fused column-sum kernel bkend holds for the canonical body body on
+    dtype arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-colsum-table bkend) (cons body dtype) #f)))
 
   (define (activation-backend-fused-patterns bkend)
     "The (body . dtype) pairs of the fused kernels bkend holds."

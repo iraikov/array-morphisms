@@ -32,11 +32,14 @@
 ;;;
 ;;; The props say how the Scheme combiner of the op is obtained:
 ;;;
-;;;   (generic name)  the combiner is the standard procedure name itself.
-;;;                   It accepts exact as well as inexact numbers, so the op
-;;;                   keeps integer dtypes, and procedures that recognize
-;;;                   common combiners by identity (eq? to +, exp, ...) keep
-;;;                   working.  expr must agree with name on flonums.
+;;;   (generic name)  the combiner is the procedure name itself: a standard
+;;;                   procedure, or scalar-add, which the scalar-ops module
+;;;                   defines.  It accepts exact as well as inexact numbers,
+;;;                   so the op keeps integer dtypes, and procedures that
+;;;                   recognize common combiners by identity (eq? to
+;;;                   scalar-add, exp, ...) keep working.  expr must agree
+;;;                   with name on flonums.  add uses scalar-add rather than
+;;;                   + so that -0.0 + -0.0 gives -0.0 (see scalar-ops.scm).
 ;;;   exact-args      the combiner is (lambda (param ...) expr), applied to
 ;;;                   the arguments as given.
 ;;;   (none)          the combiner is (lambda (param ...) expr) applied to
@@ -77,7 +80,7 @@
       (ceiling (x) (ceiling x)   (generic ceiling))
 
       ;; Binary arithmetic
-      (add (x y) (+ x y)    (generic +))
+      (add (x y) (+ x y)    (generic scalar-add))
       (sub (x y) (- x y)    (generic -))
       (mul (x y) (* x y)    (generic *))
       (div (x y) (/ x y)    (generic /))
