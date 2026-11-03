@@ -407,16 +407,28 @@
                                     (or (index-map-guard m) '()))))))))
 
 (define (index-map->linear m strides offset space-rank)
-  "The flat-offset form of reading through m an operand laid out with
-   strides (a vector) and offset: a pair (base . coefs), coefs a vector of
-   length space-rank, such that the element at iteration point i is at
-   base + sum coefs[d] * i[d].  Returns #f when m is opaque, guarded, or not
-   affine."
+  "The position in the operand's buffer of the element that index map m
+   reads at each iteration point, as a linear function of the point.
+
+   m:          the index map, from the iteration space to the operand's
+               index
+   strides:    the operand's strides, a vector with one entry per operand
+               dimension
+   offset:     the buffer position of the operand's element at index 0
+   space-rank: the number of dimensions of the iteration space
+
+   Returns a pair (base . coefs), coefs a vector of length space-rank, such
+   that the element read at point i is at base + sum over d of
+   coefs[d] * i[d].  Returns #f when m is opaque, has a guard, or has an
+   index expression that is not affine (such as a floor division)."
   (and (not (index-map-proc m))
        (not (index-map-guard m))
        (let ((affs (map ie->affine (vector->list (index-map-exprs m)))))
          (and (every values affs)
               (let ((coefs (make-vector space-rank 0)))
+                ;; Operand dimension k has the index c + sum of c_d * i[d]
+                ;; (a is (c . ((d . c_d) ...))); it adds strides[k] * c to
+                ;; base and strides[k] * c_d to coefs[d].
                 (let loop ((affs affs) (k 0) (base offset))
                   (if (null? affs)
                       (cons base coefs)
@@ -457,7 +469,7 @@
            (make-index-map exprs (and (pair? guard) guard) fill #f)))))
 
 (define (linear-injective? coefs space)
-  "True when the linear map with coefficient vector coefs is one-to-one on
+  "Return True when the linear map with coefficient vector coefs is one-to-one on
    the iteration space of extents space.  The test is sufficient, not
    necessary: sorted by magnitude, each coefficient of a dimension of
    extent above 1 must exceed the largest offset the smaller ones reach."
@@ -483,7 +495,7 @@
 ;;;; Operands
 ;;;; ============================================================
 
-;; One array a segop reads or writes.
+;; One array that a segop reads or writes.
 ;;   slot:    where the executor finds the array (for replay plans, a
 ;;            replay-ref or a pool index); not interpreted here.
 ;;   dtype:   element type.
@@ -944,13 +956,13 @@
 
 (define (check-operands who ops space-rank)
   (for-each
-   (lambda (o)
-     (unless (segop-operand? o)
-       (error who "not a segop operand" o))
-     (let ((dims (index-map-dims (segop-operand-map o))))
+   (lambda (op)
+     (unless (segop-operand? op)
+       (error who "not a segop operand" op))
+     (let ((dims (index-map-dims (segop-operand-map op))))
        (when (and dims (pair? dims) (>= (car (reverse dims)) space-rank))
          (error who "index map refers to a dimension outside the space"
-                (segop-operand-map o) space-rank))))
+                (segop-operand-map op) space-rank))))
    ops))
 
 (define (check-output who o space)
