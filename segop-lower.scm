@@ -142,7 +142,8 @@
 
 ;; map takes the space to the output's index, or is #f for an output
 ;; written in row-major order.  red is (combine-spec . finalize) for a
-;; reduced result, or #f.
+;; reduced result, (gemm . finalize) for the product of a GEMM (see
+;; Contractions below), or #f.
 (define-record fused-out name shape dtype body combiner map red)
 
 (define (fused-out-index-map o)
@@ -165,9 +166,13 @@
                    (let ((shape (fused-out-shape o)))
                      (make-segop-operand slot (fused-out-dtype o) shape (compute-strides shape) 0
                                          (fused-out-index-map o))))))
-    (if (= nred 0)
+    (cond
+     ((= nred 0)
         (make-seg-map space ins (map out-op outs out-slots) (map fused-out-body outs)
-                      (and (null? (cdr outs)) (fused-out-combiner (car outs))))
+                      (and (null? (cdr outs)) (fused-out-combiner (car outs)))))
+     ((gemm-fused-out? (car outs))
+      (lower-gemm-template tpl in-arrs in-slots (car out-slots)))
+     (else
         (let loop ((os outs) (slots out-slots) (results '()))
           (if (and (pair? os) (fused-out-red (car os)))
               (loop (cdr os) (cdr slots)
@@ -179,7 +184,7 @@
                   (error "lower-fused-binding: reduced results must come before map outputs"))
                 (make-seg-red space nred ins (reverse results)
                               (map (lambda (o slot) (cons (out-op o slot) (fused-out-body o)))
-                                   os slots))))))))
+                                   os slots)))))))))
 
 ;;; ------------------------------------------------------------
 ;;; Operand patterns
@@ -899,12 +904,13 @@
 ;;; plan without one runs the Scheme loop, which sums over increasing k in
 ;;; double precision and rounds once when storing.
 ;;;
-;;; A GEMM can absorb the element-wise binding that consumes it (the
-;;; epilogue): the finalize is the epilogue's body with its input 0
+;;; A GEMM can absorb the element-wise bindings that consume its product
+;;; (the epilogue): the finalize is the epilogue's body with its input 0
 ;;; replaced by (cast dtype (reduced)), the product as stored in the output,
-;;; and its other inputs (a bias) appended to the seg-red's inputs.  The
-;;; seg-red's fallback is the epilogue's combiner, which the executor
-;;; applies to the stored product in place.
+;;; and its other inputs appended to the seg-red's inputs.  The seg-red's
+;;; fallback is the epilogue's combiner, which the executor applies to the
+;;; stored product in place.  The fusion pass makes such seg-reds from
+;;; fusion templates whose result has red (gemm . finalize).
 
 (define gemm-A-exprs '#((dim 0) (dim 2)))
 (define gemm-B-exprs '#((dim 2) (dim 1)))
@@ -960,8 +966,7 @@
            (let* ((sA    (segop-operand-shape A))
                   (sB    (segop-operand-shape B))
                   (space (vector (vector-ref sA 0) (vector-ref sB 1) (vector-ref sA 1)))
-                  ;; a fused epilogue always runs with the strided plan
-                  (plan  (prepare-gemm-plan (if epilogue 'gemm-strided kind) A B))
+                  (plan  (prepare-gemm-plan kind A B))
                   (spec  (gemm-combine-spec plan dtype))
                   (out   (lambda (slot)
                            (make-segop-operand slot dtype shape strides 0
@@ -985,13 +990,14 @@
   "The GEMM that computes seg-red sg, as a list (A B out kind plan epilogue),
    or #f when sg is not in the form lower-matmul-binding produces, combine
    spec included.  kind is gemm or gemm-strided and plan the gemm-plan for
-   the operands; epilogue is #f, (unary . combiner) or
-   (bias bias-operand . combiner)."
+   the operands; epilogue is #f, (unary . combiner),
+   (bias bias-operand . combiner) for a row bias read along the columns,
+   or (map operands . combiner) for any other inputs."
   (cases segop sg
     (seg-red (space nred ins results map-outs fallback)
       (and
        (= (vector-length space) 3) (= nred 1) (= (length results) 1) (null? map-outs)
-       (<= 2 (length ins) 3)
+       (>= (length ins) 2)
        (let* ((A     (car ins))
               (B     (cadr ins))
               (res   (car results))
@@ -1011,22 +1017,54 @@
                  (cond ((not fin) (and (= (length ins) 2) 'none))
                        ((not fallback) #f)
                        ((= (length ins) 2) (cons 'unary fallback))
-                       (else
-                        (let ((bias (caddr ins)))
-                          (and (operand-exprs-are? bias '#((dim 1)))
-                               (operand-row-major? bias)
-                               (equal? (segop-operand-shape bias) (vector N))
-                               (eq? (segop-operand-dtype bias) dtype)
-                               (cons 'bias (cons bias fallback)))))))
-                (kind (if fin 'gemm-strided (gemm-plan-kind A B))))
+                       ((and (= (length ins) 3)
+                             (let ((bias (caddr ins)))
+                               (and (operand-exprs-are? bias '#((dim 1)))
+                                    (operand-row-major? bias)
+                                    (equal? (segop-operand-shape bias) (vector N))
+                                    (eq? (segop-operand-dtype bias) dtype))))
+                        (cons 'bias (cons (caddr ins) fallback)))
+                       ((every (lambda (o) (segop-operand-linear o 2)) (cddr ins))
+                        (cons 'map (cons (cddr ins) fallback)))
+                       (else #f)))
+                (kind (gemm-plan-kind A B)))
             (and epilogue kind
                  (let ((plan (prepare-gemm-plan kind A B)))
                    (and (combine-specs-equal? (red-result-combine res) (gemm-combine-spec plan dtype))
                         (list A B out kind plan (if (eq? epilogue 'none) #f epilogue))))))))))
     (else #f)))
 
+;; The executor that applies combiner in place to the GEMM product in the
+;; row-major buffer of out: each element x becomes (combiner x y ...), with
+;; y ... the elements of the operands ins at its index.
+(define (gemm-map-epilogue-executor out ins combiner)
+  (let* ((space  (segop-operand-shape out))
+         (dtype  (segop-operand-dtype out))
+         (refs   (map segop-operand-slot ins))
+         (dtypes (list->vector (map segop-operand-dtype ins)))
+         (n      (length ins))
+         (lins   (append (map (lambda (o) (segop-operand-linear o 2)) ins)
+                         (list (segop-operand-linear out 2))))
+         (store  (strided-store dtype)))
+    (lambda (deref buf)
+      (let ((datas (list->vector (map (lambda (r) (operand-data 'gemm-epilogue (deref r))) refs))))
+        (define (arg offs k) (typed-vector-ref (vector-ref datas k) (vector-ref dtypes k)
+                                               (vector-ref offs k)))
+        (for-each-strided-point
+         space lins
+         (if (= n 1)
+             (lambda (offs)
+               (let ((i (vector-ref offs 1)))
+                 (store buf i (combiner (typed-vector-ref buf dtype i) (arg offs 0)))))
+             (lambda (offs)
+               (let ((i (vector-ref offs n)))
+                 (store buf i (apply combiner (typed-vector-ref buf dtype i)
+                                     (map (lambda (k) (arg offs k)) (iota n))))))))))))
+
 ;; The registry routes GEMMs to the active BLAS backend through prepared
-;; gemm-plans; a fused epilogue then runs in place on the stored product.
+;; gemm-plans; a fused epilogue then runs in place on the stored product,
+;; through the flat unary and bias kernels when it has one of those forms
+;; and through a strided loop on the host otherwise.
 (define (registry-gemm-select sg)
   (let ((g (standard-gemm sg)))
     (and g
@@ -1042,6 +1080,12 @@
            (cond
             ((not epilogue)
              (cons (if (eq? (list-ref g 3) 'gemm) 'segop/gemm 'segop/gemm-strided) gemm!))
+            ((eq? (car epilogue) 'map)
+             (let ((host (gemm-map-epilogue-executor out (cadr epilogue) (cddr epilogue))))
+               (cons 'segop/gemm-epilogue-host
+                     (lambda (deref buf)
+                       (gemm! deref buf)
+                       (host deref buf)))))
             ((eq? (car epilogue) 'unary)
              (let ((combiner (cdr epilogue)))
                (cons 'segop/gemm-epilogue
@@ -1059,6 +1103,85 @@
                          (concrete-array (bias-data _ _ _ _ _ _)
                            (execute-flat-bias-broadcast-inplace! combiner buf bias-data size N dtype))
                          (else (error "gemm epilogue: bias not concrete"))))))))))))
+
+;; True when fused output o is the product of a GEMM.
+(define (gemm-fused-out? o)
+  (let ((red (fused-out-red o))) (and red (eq? (car red) 'gemm))))
+
+;; The epilogue body of a GEMM finalize fin of dtype dtype: the product as
+;; stored, (cast dtype (reduced)) or (reduced), becomes (in 0), and the
+;; finalize's input j, j >= 2, becomes (in j-1).
+(define (gemm-finalize->epilogue fin dtype)
+  (let walk ((e fin))
+    (cond ((not (pair? e)) e)
+          ((equal? e '(reduced)) '(in 0))
+          ((and (eq? (car e) 'cast) (eq? (cadr e) dtype) (equal? (caddr e) '(reduced))) '(in 0))
+          ((eq? (car e) 'in) `(in ,(- (cadr e) 1)))
+          (else (map walk e)))))
+
+;; True when body e applies one op, or one opaque procedure, to the inputs
+;; (in 0) ... (in (n - 1)) in order.
+(define (single-call-body? e n)
+  (or (and (single-op-body-op e n) #t)
+      (and (pair? e) (eq? (car e) 'opaque) (equal? (cddr e) (input-body-args n)))))
+
+;; The procedure computing epilogue body e of n inputs: the combiner of
+;; the op, or the opaque procedure, that e applies to its inputs in order;
+;; otherwise e compiled.
+(define (epilogue-combiner e n)
+  (let ((op (single-op-body-op e n)))
+    (cond ((and op (scalar-op? op) (= (scalar-op-arity op) n)) (scalar-op-combiner op))
+          ((and (pair? e) (eq? (car e) 'opaque) (equal? (cddr e) (input-body-args n))) (cadr e))
+          (else (scalar-expr->procedure e n)))))
+
+(define (lower-gemm-template tpl in-arrs in-slots out-slot)
+  "The seg-red of fusion template tpl, whose result is a GEMM product
+   with its epilogue as finalize: the product of the first two arrays of
+   in-arrs, with the epilogue applied to it in place, written to pool slot
+   out-slot.  The other arrays are the epilogue's inputs, read through
+   tpl's maps.  #f when blas-exec cannot multiply the first two arrays."
+  (let* ((o      (car (fusion-template-outs tpl)))
+         (shape  (fused-out-shape o))
+         (dtype  (fused-out-dtype o))
+         (fin    (cdr (fused-out-red o)))
+         (out    (make-segop-operand out-slot dtype shape (compute-strides shape) 0
+                                     (identity-index-map 2)))
+         (extras (map (lambda (arr slot m)
+                        (cases array-morphism arr
+                          (concrete-array (_ s st off dt _ _) (make-segop-operand slot dt s st off m))
+                          (else (error "lower-gemm-template: input not concrete" arr))))
+                      (cddr in-arrs) (cddr in-slots) (cddr (fusion-template-in-maps tpl)))))
+    (lower-matmul-binding (car in-arrs) (cadr in-arrs) (car in-slots) (cadr in-slots)
+                          out-slot shape (compute-strides shape) dtype
+                          (and fin
+                               (let ((e (gemm-finalize->epilogue fin dtype)))
+                                 (make-seg-map shape (cons out extras) (list out) (list e)
+                                               (epilogue-combiner e (+ 1 (length extras)))))))))
+
+;; True when segop template tpl describes a GEMM with an epilogue.
+(define (gemm-template? tpl)
+  (let ((outs (segop-template-outs tpl)))
+    (and (pair? outs) (eq? (template-output-combine (car outs)) 'gemm))))
+
+;; True when the registry runs GEMM template tpl natively: its epilogue is
+;; one op applied to the product, or to the product and a row bias of the
+;; output's dtype, f32 or f64, read along the columns.  These run as flat
+;; kernels on the stored product.
+(define (gemm-template-native? tpl)
+  (let* ((ins (segop-template-ins tpl))
+         (res (car (segop-template-outs tpl)))
+         (dt  (template-output-dtype res))
+         (fin (template-output-finalize res))
+         (extras (cddr ins)))
+    (and (null? (cdr (segop-template-outs tpl)))
+         (fused-kernel-dtype? dt)
+         fin
+         (<= (length extras) 1)
+         (single-call-body? (gemm-finalize->epilogue fin dt) (+ 1 (length extras)))
+         (every (lambda (b) (and (template-input-flat? b)
+                                 (eq? (template-input-dtype b) dt)
+                                 (equal? (index-map-exprs (template-input-map b)) '#((dim 1)))))
+                extras))))
 
 ;;; ------------------------------------------------------------
 ;;; Fused kernels
@@ -1098,11 +1221,13 @@
    segop template tpl has one output and one to three flat inputs read at
    the iteration point, all of the output's dtype, f32 or f64, and the
    active activation backend holds a fused kernel for its canonical body;
-   or when tpl is a column sum that a fused column-sum kernel of the
-   active activation backend computes (see colsum-template?)."
-  (if (> (segop-template-nred tpl) 0)
-      (colsum-template? tpl)
-      (registry-map-native? tpl)))
+   when tpl is a GEMM whose epilogue runs as a flat kernel (see
+   gemm-template-native?); or when tpl is a column sum that a fused
+   column-sum kernel of the active activation backend computes (see
+   colsum-template?)."
+  (cond ((= (segop-template-nred tpl) 0) (registry-map-native? tpl))
+        ((gemm-template? tpl) (gemm-template-native? tpl))
+        (else (colsum-template? tpl))))
 
 (define (registry-map-native? tpl)
   (let ((ins (segop-template-ins tpl)) (outs (segop-template-outs tpl))

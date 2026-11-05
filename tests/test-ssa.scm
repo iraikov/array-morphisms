@@ -1446,6 +1446,10 @@
                      (every (lambda (u v) (<= (abs (- u v)) (* tol (max 1.0 (abs v))))) x y)))
               a b)))
 
+;; True when b is a GEMM fused with its epilogue.
+(define (gemm-epilogue-binding? b)
+  (and (fused-red-binding? b) (eq? 'gemm (alist-ref 'path (ssa-binding-meta b)))))
+
 (define (fused-bindings joint)
   (filter (lambda (b) (eq? (ssa-binding-op b) 'fused))
           (ssa-program-bindings joint)))
@@ -2646,12 +2650,14 @@
 
 (test-group "segop fusion"
  ;; Under the default policy nothing is fused on the host, whose fused
- ;; executors are slower than the separate bindings'.
+ ;; executors are slower than the separate bindings'; GEMM epilogues of
+ ;; one op run as flat kernels on the stored product.
  (let-values (((loss params) (seg-mlp-loss 'f32)))
    (let* ((fwd (morphism-to-ssa loss))
           (pv  (filter-map (lambda (p) (ssa-constant-id fwd (am:var-value p))) params)))
-     (test "the default policy fuses nothing on the host" '()
-       (fused-bindings (ssa-vjp fwd pv (ssa-loss-binding-val fwd))))
+     (test "the default policy fuses only GEMM epilogues" '()
+       (filter (lambda (b) (not (gemm-epilogue-binding? b)))
+               (fused-bindings (ssa-vjp fwd pv (ssa-loss-binding-val fwd)))))
      (test "the policy all fuses" #t
        (pair? (fused-bindings (parameterize ((segop-fusion 'all))
                                 (ssa-vjp fwd pv (ssa-loss-binding-val fwd))))))))
@@ -3118,7 +3124,10 @@
 ;;;; from ssa-realize, the trace and the replays.
 ;;;; ============================================================
 
-(define (rd-fused-reds prog) (filter fused-red-binding? (ssa-program-bindings prog)))
+;; The fused reductions of prog other than GEMM epilogues.
+(define (rd-fused-reds prog)
+  (filter (lambda (b) (and (fused-red-binding? b) (not (gemm-epilogue-binding? b))))
+          (ssa-program-bindings prog)))
 
 ;; The names of the outputs of binding b, its own first.
 (define fused-outputs binding-out-names)
@@ -3533,16 +3542,22 @@
          (test (sprintf "~A: a fused producer is kept too" dtype) 1 (mo-stat stats 'kept))
          (test-assert (sprintf "~A: with the values of the unfused program" dtype) same?))
        ;; C = P*z with z a GEMM after P: the fused binding takes C's
-       ;; position, since P's other use comes after C.
+       ;; position, since P's other use comes after C.  z has a second use,
+       ;; so that C does not become z's epilogue.
        (let-values (((fused stats same?)
                      (rd-check (let ((p (morph-exp x)) (z (morph-matmul A Bm)))
-                                 (morph+ (morph-matmul (morph* p z) W2) (morph-matmul p W))))))
+                                 (morph+ (morph+ (morph-matmul (morph* p z) W2) (morph-matmul p W))
+                                         (morph-matmul z W))))))
          (test (sprintf "~A: a kept producer may take the consumer's position" dtype) 1 (mo-stat stats 'kept))
          (test-assert (sprintf "~A: with the values of the unfused program" dtype) same?))
-       ;; P's other use comes before C, and C's other input after P.
+       ;; P's other use comes before C, and C's other input after P.  The
+       ;; GEMMs reading P and z have second uses, so that neither takes the
+       ;; adds as an epilogue and moves.
        (let-values (((fused stats same?)
-                     (rd-check (let ((p (morph-exp x)) (z (morph-matmul A Bm)))
-                                 (morph+ (morph-matmul p W) (morph-matmul (morph* p z) W2)))
+                     (rd-check (let* ((p (morph-exp x)) (z (morph-matmul A Bm)) (g (morph-matmul p W)))
+                                 (morph+ (morph+ (morph+ g (morph-matmul (morph* p z) W2))
+                                                 (morph-matmul z W))
+                                         g))
                                1)))
          (test (sprintf "~A: no position fits: the producer is not kept" dtype) 0 (mo-stat stats 'kept))
          (test-assert (sprintf "~A: and it is reported" dtype) (alist-ref 'placement (rd-missed stats)))
@@ -3621,5 +3636,124 @@
                                                                      (fk-arr mo-w '(3 2) 'f32)))))))
     (test "the default policy makes no horizontal fusion without a native backend" 0
       (mo-stat (ssa-fusion-pass-stats) 'horizontal))))
+
+;;;; ============================================================
+;;;; GEMM epilogues
+;;;;
+;;;; Maps that read a GEMM's product are fused into the GEMM as its
+;;;; epilogue, which runs in place on the stored product.  The default
+;;;; policy fuses one op applied to the product, or to the product and a
+;;;; row bias; under all, chains and other inputs are fused too.
+;;;; ============================================================
+
+;; The forward program of m fused under policy, or unfused under #f, as
+;; ssa-realize/ctx would run it.
+(define (ge-fused policy m)
+  (if policy
+      (parameterize ((segop-fusion policy)) (ssa-segop-fusion-pass (fk-prog m)))
+      (sf-as-given (fk-prog m))))
+
+(define (ge-epilogues prog) (filter gemm-epilogue-binding? (ssa-program-bindings prog)))
+
+;; The segop tags of the replay plan of fused forward program prog.
+(define (ge-tags prog)
+  (let ((ctx (make-morphism-context)))
+    (ssa-realize/ctx ctx prog)
+    (finalize-context! ctx)
+    (reset-context! ctx)
+    (ssa-realize/ctx ctx prog)
+    (map car (plan-segops prog))))
+
+(define (ge-gemm-tags prog)
+  (filter (lambda (t) (memq t '(segop/gemm segop/gemm-strided segop/gemm-epilogue
+                                segop/gemm-epilogue-host)))
+          (ge-tags prog)))
+
+(test-group "GEMM epilogues"
+  (for-each
+   (lambda (dtype)
+     (let* ((x  (fk-arr mo-x '(2 3) dtype))
+            (xt (fk-arr mo-x '(3 2) dtype))
+            (W  (fk-arr mo-w '(3 2) dtype))
+            (W2 (fk-arr (reverse mo-w) '(3 2) dtype))
+            (b  (fk-arr '(0.25 -0.5) '(2) dtype))
+            (bc (fk-arr '(0.25 -0.5) '(2 1) dtype))
+            (y  (fk-arr '(1.0 -2.0 0.5 3.0) '(2 2) dtype))
+            (other (if (eq? dtype 'f32) 'f64 'f32))
+            (name (lambda (s) (sprintf "~A: ~A" dtype s))))
+       ;; A row bias: fused by default, and run by the flat bias kernel.
+       (let* ((m   (morph+ (morph-matmul x W) b))
+              (on  (ge-fused #t m))
+              (off (ge-fused #f m)))
+         (test (name "a row bias is fused by default") 1 (length (ge-epilogues on)))
+         (test (name "the fused binding takes the GEMM's position") 0 (rd-position on (ssa-binding-name (car (ge-epilogues on)))))
+         (test (name "it runs as one native GEMM epilogue") '(segop/gemm-epilogue) (ge-tags on))
+         (test (name "the plan counts it as native") '((native . 1) (host . 0))
+           (cdr (assq 'fused (replay-plan-stats on))))
+         (test (name "unfused, the GEMM and the bias are separate") '(segop/gemm) (ge-gemm-tags off))
+         (test (name "the values are those of the unfused program") (sf-run off) (sf-run on)))
+       ;; One op on the product alone.
+       (let ((on (ge-fused #t (morph-exp (morph-matmul x W)))))
+         (test (name "a unary op is fused by default") '(segop/gemm-epilogue) (ge-tags on)))
+       ;; relu(x W + b): the default fuses the bias only; all fuses the chain.
+       (let* ((m (morph-relu (morph+ (morph-matmul x W) b))))
+         (test (name "by default a chain is not the epilogue") 1
+           (length (filter (lambda (b) (eq? (ssa-binding-op b) 'relu)) (ssa-program-bindings (ge-fused #t m)))))
+         (let-values (((fused stats same?) (rd-check m)))
+           (test (name "under all the chain is the epilogue") 1 (length (ge-epilogues fused)))
+           (test (name "with no other binding") 1 (length (ssa-program-bindings fused)))
+           (test-assert (name "and the values of the unfused program") same?)))
+       ;; A transposed operand: the GEMM runs with the strided plan.
+       (let-values (((fused stats same?) (rd-check (morph+ (morph-matmul (morph-transpose xt '(1 0)) W) b))))
+         (test (name "a GEMM of a transposed operand takes an epilogue") 1 (length (ge-epilogues fused)))
+         (test-assert (name "with the values of the unfused program") same?))
+       ;; A second input of the product's shape: on the host, under all only.
+       (let ((m (morph* (morph-matmul x W) y)))
+         (test (name "by default a full-shape input is not fused") '() (ge-epilogues (ge-fused #t m)))
+         (test-assert (name "and it is reported as not native")
+           (alist-ref 'not-native (rd-missed (ssa-fusion-pass-stats))))
+         (let-values (((fused stats same?) (rd-check m)))
+           (test (name "under all it is fused") 1 (length (ge-epilogues fused)))
+           (test (name "and runs on the host") '(segop/gemm-epilogue-host) (ge-gemm-tags fused))
+           (test-assert (name "with the values of the unfused program") same?)))
+       ;; The product as the second operand of the map.
+       (let-values (((fused stats same?) (rd-check (morph- y (morph-matmul x W)))))
+         (test (name "the product may be the map's second operand") 1 (length (ge-epilogues fused)))
+         (test-assert (name "with the values of the unfused program") same?))
+       ;; A column bias, read along the rows.
+       (let ((m (morph+ (morph-matmul x W) bc)))
+         (test (name "by default a column bias is not fused") '() (ge-epilogues (ge-fused #t m)))
+         (let-values (((fused stats same?) (rd-check m)))
+           (test (name "under all it is fused") 1 (length (ge-epilogues fused)))
+           (test-assert (name "with the values of the unfused program") same?)))
+       ;; Two GEMMs read by one add: the later one is the earlier's input,
+       ;; so the fused binding takes the add's position.
+       (let-values (((fused stats same?) (rd-check (morph+ (morph-matmul x W) (morph-matmul x W2)))))
+         (test (name "two GEMMs added: one takes the add as epilogue") 1 (length (ge-epilogues fused)))
+         (test (name "placed after the other GEMM") 1
+           (rd-position fused (ssa-binding-name (car (ge-epilogues fused)))))
+         (test-assert (name "with the values of the unfused program") same?))
+       ;; Refusals.
+       (let-values (((fused stats same?) (rd-check (morph-cast (morph-matmul x W) other))))
+         (test (name "a change of dtype is not an epilogue") '() (ge-epilogues fused))
+         (test-assert (name "and it is reported") (alist-ref 'gemm-epilogue-form (rd-missed stats)))
+         (test-assert (name "the values are unchanged") same?))
+       (let-values (((fused stats same?)
+                     (rd-check (let ((g (morph-matmul x W))) (morph+ (morph+ g y) (morph-exp g))))))
+         (test (name "a product with two uses is not fused") '() (ge-epilogues fused))
+         (test-assert (name "and it is reported") (alist-ref 'multi-use-reduction (rd-missed stats)))
+         (test-assert (name "the values are unchanged") same?))
+       (let-values (((fused stats same?) (rd-check (morph+ (morph-matmul (fk-arr '(1.0 2.0 3.0) '(1 3) dtype) W) y))))
+         (test (name "a broadcast read of the product is not fused") '() (ge-epilogues fused))
+         (test-assert (name "the values are unchanged") same?))
+       ;; The joint program of a dense layer, replayed: the same gradients,
+       ;; and no more pool memory than unfused.
+       (let-values (((r-on bytes-on) (rd-replays (rd-dense-joint #t dtype)))
+                    ((r-all bytes-all) (rd-replays (rd-dense-joint 'all dtype)))
+                    ((r-off bytes-off) (rd-replays (rd-dense-joint #f dtype))))
+         (test (name "dense layer: default gradients are those of the unfused program") r-off r-on)
+         (test (name "dense layer: so are those under all") r-off r-all)
+         (test-assert (name "dense layer: the default pool is not larger than unfused") (<= bytes-on bytes-off)))))
+   '(f32 f64)))
 
 (test-end)

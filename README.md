@@ -352,6 +352,12 @@ A fused reduction adds its values in the same order as the unfused one, so
 results do not change. Sums of rank-1 arrays are not fused, because their
 order is left to the BLAS backend.
 
+A matrix product is treated as a reduction too. Element-wise bindings that
+read only its result become its *epilogue*, which is applied to the stored
+product in place, so the product needs no buffer of its own. The default
+policy fuses one op on the product, or on the product and a bias row; `'all`
+also fuses chains of ops and other inputs.
+
 A fused binding can also have several outputs. An element-wise binding
 with other readers can still be fused into one of them, and it keeps its
 value as a second output for the others. Two element-wise bindings of the
@@ -527,8 +533,9 @@ each segop instruction by its pattern:
 - reductions: `segop/reduce-1d`, `segop/reduce-axis0`, `segop/reduce-axis1`
   and `segop/reduce-general`;
 - matrix products: `segop/gemm` (row-major operands), `segop/gemm-strided`
-  (transposed or strided operands) and `segop/gemm-epilogue` (with a fused
-  consumer);
+  (transposed or strided operands), `segop/gemm-epilogue` (with an
+  epilogue run as a flat kernel) and `segop/gemm-epilogue-host` (with an
+  epilogue run on the host);
 - `segop/gather` for materialized views, `segop/host-index-fn` for index
   functions run on the host, and `segop/interpreted`.
 

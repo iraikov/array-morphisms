@@ -60,12 +60,10 @@
    replay-instruction replay-instruction?
    ri-view
    ri-segop
-   ri-alias
    ri-im2col ri-col2im
    ri-conv-fwd ri-conv-bwd-data ri-conv-bwd-weights
 
    ;; Segop fusion
-   ssa-compute-use-counts
    segop-fusion
    ssa-segop-fusion-pass
    ssa-fusion-graph
@@ -246,17 +244,6 @@
     (tag          symbol?)
     (extra-outs   list?))
 
-  ;; Alias for the epilogue binding position after a GEMM segop with a
-  ;; fused epilogue (tag segop/gemm-epilogue).
-  ;; Advances alloc-ctr to stay in sync with trace-time pool allocation.
-  ;; Returns the already-computed epilogue result from in-ref (the GEMM step).
-  (ri-alias
-    (pool-idx  integer?)
-    (shape     vector?)
-    (strides   vector?)
-    (dtype     symbol?)
-    (in-ref    replay-ref?))
-
   ;; Fast im2col: all index parameters baked in at compile time from morph meta.
   ;; col-layout: 'nchw-standard (unbatched), 'nchw-classic (batched NCHW), 'nhwc-classic (batched NHWC).
   (ri-im2col
@@ -353,8 +340,7 @@
 ;;; ============================================================
 ;;; Binding helpers
 ;;;
-;;; Queries on element-wise bindings and their uses, for the segop
-;;; fusion pass and the replay compiler.
+;;; Queries on element-wise bindings, for the segop fusion pass.
 ;;; ============================================================
 
 (define (ssa-binding-combiner b)
@@ -371,33 +357,6 @@
               (error "ssa-binding-combiner: no combiner in meta"
                      (ssa-binding-name b) (ssa-binding-op b)))))))
 
-(define (ssa-binding-elementwise? b)
-  "True when b is an element-wise compute op (not matmul, reduce, or structural)."
-  (let ((op (ssa-binding-op b)))
-    (and (not (eq? op 'matmul))
-         (not (and (pair? op) (eq? (car op) 'reduce)))
-         (not (memq op '(reshape transpose broadcast-expand slice))))))
-
-(define (ssa-compute-use-counts bindings)
-  "Return hash-table: binding-name-sym -> integer (number of consuming bindings)."
-  (let ((counts (make-hash-table)))
-    (for-each (lambda (b)
-                (hash-table-set! counts (ssa-binding-name b) 0))
-              bindings)
-    (for-each
-     (lambda (b)
-       (for-each
-        (lambda (v)
-          (cases ssa-value v
-            (binding-ref (bid)
-              (when (hash-table-ref/default counts bid #f)
-                (hash-table-set! counts bid
-                  (+ 1 (hash-table-ref counts bid)))))
-            (const-ref (_) #f)))
-        (ssa-binding-inputs b)))
-     bindings)
-    counts))
-
 (define (ssa-binding-has-combiner? b)
   "True when b carries an extractable element-wise combiner in meta."
   (let ((meta (ssa-binding-meta b)))
@@ -405,9 +364,9 @@
         (let ((ip (assq 'index-fn meta)))
           (and ip (compute-index-fn? (cdr ip)))))))
 
-;; The fusion policy of ssa-vjp and ssa-realize/ctx: #t (the default) fuses the bindings whose
-;; fusion is expected to be faster, all fuses every pair that may legally
-;; be fused, and #f runs no fusion pass.  Fusion does not change results,
+;; The fusion policy of ssa-vjp and ssa-realize/ctx: #t (the default)
+;; fuses the bindings whose fusion is expected to be faster, all fuses
+;; every pair that may legally be fused, and #f runs no fusion pass.  Fusion does not change results,
 ;; so a program run with all and with #f gives the same values, which
 ;; tests use as an oracle.
 (define segop-fusion
@@ -484,7 +443,7 @@
    body and dtype, and their total number of elements; red-candidates,
    the fused seg-reds made, each a list (canonical-body combine-op path
    map-output? dtype count elements), elements counting the reduced
-   values; and missed, an alist from reason to the number of pairs the
+   values (combine-op and path are gemm for a GEMM epilogue); and missed, an alist from reason to the number of pairs the
    last round left unfused for that reason:
      not-native           no backend runs the fused segop natively
      broadcast-input      the same, for a fused segop with a broadcast input
@@ -497,7 +456,10 @@
                           inputs come after a reduction that keeps a map
                           output, or a kept producer has a use before its
                           consumer, whose inputs come after it
-     horizontal-placement no position fits two siblings"
+     horizontal-placement no position fits two siblings
+     gemm-operands        a matrix product's operands are not two matrices
+                          of its dtype, f32 or f64
+     gemm-epilogue-form   an epilogue would change the product's dtype"
   *fusion-pass-stats*)
 
 ;; Views: their values share the buffer of their source, in a layout that
@@ -537,7 +499,8 @@
                                 (lambda () (canonical-scalar-body (fused-out-body o)
                                                                   (length (ssa-binding-inputs b))))
                               (lambda (c perm) c))
-                            (combine-spec-op (car (fused-out-red o)))
+                            (let ((c (car (fused-out-red o))))
+                              (if (eq? c 'gemm) 'gemm (combine-spec-op c)))
                             (cdr (assq 'path (ssa-binding-meta b)))
                             (and (any (lambda (x) (not (fused-out-red x))) outs) #t)
                             (fused-out-dtype o)))
@@ -886,19 +849,52 @@
 ;;;
 ;;; A reduction whose order is left to its backend (the 1d sum, which may
 ;;; use the BLAS dot product) is never fused.
+;;;
+;;; A matmul is a reduction over the space (M N K) with K reduced, whose
+;;; result has red (gemm . finalize) (see segop-lower.scm): maps that read
+;;; its product become its epilogue, as above, when the epilogue keeps the
+;;; product's dtype, since it runs in place on the stored product.  No map
+;;; is fused into its operands, which BLAS reads from memory.
 
-;; The parts of reduction binding r (a reduce binding or a fused seg-red)
-;; as a list (inputs space in-maps outs nred src-shape path), outs in the
-;; list form of make-fused-ssa-binding; or #f and the reason r cannot be
-;; fused.  A reduce binding's source must be expected flat (flat?), since
-;; its combine spec depends on its layout.
+(define (gemm-binding? b) (eq? (ssa-binding-op b) 'matmul))
+
+;; The parts of matmul binding g, in the form of reduction-parts; or #f and
+;; the reason when its operands are not two matrices of its dtype, f32 or
+;; f64.
+(define (gemm-parts g vtab)
+  (let* ((ins (ssa-binding-inputs g))
+         (dt  (ssa-binding-dtype g))
+         (sds (map (lambda (v) (hash-table-ref vtab (ssa-value-id v))) ins)))
+    (if (and (= 2 (length ins))
+             (memq dt '(f32 f64))
+             (every (lambda (sd) (and (= 2 (vector-length (car sd))) (eq? (cdr sd) dt))) sds))
+        (let ((space (vector (vector-ref (car (car sds)) 0)
+                             (vector-ref (car (cadr sds)) 1)
+                             (vector-ref (car (car sds)) 1))))
+          (values (list ins space
+                        (list (make-index-map gemm-A-exprs #f 0.0 #f)
+                              (make-index-map gemm-B-exprs #f 0.0 #f))
+                        (list (list (ssa-binding-name g) (ssa-binding-shape g) dt gemm-body
+                                    (make-index-map gemm-out-exprs #f 0.0 #f) (cons 'gemm #f)))
+                        1 space 'gemm)
+                  #f))
+        (values #f 'gemm-operands))))
+
+;; The parts of reduction binding r (a reduce binding, a matmul or a fused
+;; seg-red) as a list (inputs space in-maps outs nred src-shape path), outs
+;; in the list form of make-fused-ssa-binding; or #f and the reason r
+;; cannot be fused.  A reduce binding's source must be expected flat
+;; (flat?), since its combine spec depends on its layout.
 (define (reduction-parts r vtab flat?)
-  (if (fused-binding? r)
+  (cond
+   ((fused-binding? r)
       (let ((tpl (fused-binding-template r)) (meta (ssa-binding-meta r)))
         (values (list (ssa-binding-inputs r) (fusion-template-space tpl) (fusion-template-in-maps tpl)
                       (map fused-out->list (fusion-template-outs tpl)) (fusion-template-nred tpl)
                       (cdr (assq 'src-shape meta)) (cdr (assq 'path meta)))
-                #f))
+                #f)))
+   ((gemm-binding? r) (gemm-parts r vtab))
+   (else
       (let* ((meta  (ssa-binding-meta r))
              (rop   (cadr (ssa-binding-op r)))
              (src   (car (ssa-binding-inputs r)))
@@ -931,7 +927,7 @@
                                          '(in 0) out-map
                                          (cons spec (and (eq? rop 'mean) `(/ (reduced) ,count)))))
                              (length red) s path)
-                       #f))))))
+                       #f)))))))
 
 ;; True when index maps a and b read the same element at every point.
 (define (same-index-map? a b)
@@ -1388,7 +1384,7 @@
           (and (pair? vs)
                (or (let ((r (binding-of (car vs))))
                      (and r
-                          (or (reduce-binding? r) (fused-red-binding? r))
+                          (or (reduce-binding? r) (fused-red-binding? r) (gemm-binding? r))
                           (eq? (ssa-binding-name r) (ssa-value-id (car vs)))
                           (let* ((r-name (ssa-binding-name r))
                                  (u      (hash-table-ref/default uses r-name '())))
@@ -1412,8 +1408,14 @@
                                   (else
                                    (call-with-values (lambda () (reduction-parts r vtab flat?))
                                      (lambda (parts reason)
-                                       (if (not parts)
-                                           (begin (miss! reason) #f)
+                                       (cond
+                                        ((not parts) (miss! reason) #f)
+                                        ;; a GEMM epilogue is stored in the product's buffer
+                                        ((and (eq? (list-ref parts 6) 'gemm)
+                                              (not (eq? (ssa-binding-dtype c)
+                                                        (list-ref (car (list-ref parts 3)) 2))))
+                                         (miss! 'gemm-epilogue-form) #f)
+                                        (else
                                            (let* ((r-at (hash-table-ref pos-of-binding r-name))
                                                   (early? (every (lambda (v)
                                                                    (or (not (ssa-binding-ref? v))
@@ -1432,7 +1434,7 @@
                                                   (fuse-epilogue parts c k
                                                                  (append (binding-members r) (binding-members c))
                                                                  vtab)
-                                                  at))))))))))))
+                                                  at)))))))))))))
                    (loop (cdr vs) (+ k 1)))))))
 
     ;; Tries rule on each binding that satisfies pred, from last to first,
@@ -3039,147 +3041,36 @@
                                              j (cdr (fused-binding-outs (car bs))))
                                        j))))
                          eb)))
-    ;; Detect GEMM bindings whose only consumer is an adjacent element-wise
-    ;; binding of the same shape and dtype that compiles to a flat unary or
-    ;; bias-broadcast segop.  When found, compile the GEMM with that binding
-    ;; fused as its epilogue (a segop/gemm-epilogue writing the epilogue's
-    ;; slot) at the GEMM position, and an ri-alias at the epilogue position.
-    (define use-counts (ssa-compute-use-counts bindings))
-    ;; Pool slot holding the value of binding input v at replay time, or #f
-    ;; for constants and values without a slot.  A view shares the
-    ;; allocation id, and so the slot, of the array it views.
-    (define (input-pool-idx v)
-      (cases ssa-value v
-        (binding-ref (bid)
-          (let ((info (morph-env-lookup trace-info bid)))
-            (and info
-                 (let ((aid (concrete-alloc-id (car info))))
-                   (and (>= aid 0) (context-alloc->pool-idx ctx aid))))))
-        (else #f)))
-    ;; Trace-time array of binding input v: the recorded result of the
-    ;; binding it refers to, or the constant itself.
-    (define (trace-input-arr v)
-      (cases ssa-value v
-        (binding-ref (bid)
-          (car (or (morph-env-lookup trace-info bid)
-                   (error "compile-replay-plan: no trace-info for input" bid))))
-        (const-ref (cid) (hash-table-ref constants cid))))
-    (define gemm-epilogue-eb (make-env-builder))  ;; g.name -> fused GEMM ri-segop
-    (define epilogue-gemm-eb (make-env-builder))  ;; e.name -> g's position index
-    (let lp ((bs bindings) (i 0))
-      (when (and (pair? bs) (pair? (cdr bs)))
-        (let ((g (car bs)) (e (cadr bs)))
-          (when (and (eq? (ssa-binding-op g) 'matmul)
-                     (= 1 (hash-table-ref/default use-counts (ssa-binding-name g) 0))
-                     (let ((in0 (and (pair? (ssa-binding-inputs e))
-                                     (car (ssa-binding-inputs e)))))
-                       (cases ssa-value in0
-                         (binding-ref (bid) (eq? bid (ssa-binding-name g)))
-                         (else #f)))
-                     (ssa-binding-elementwise? e)
-                     (not (and (fused-binding? e)
-                               (or (fused-red-binding? e) (pair? (cdr (fused-binding-outs e)))))))
-            ;; Try to compile e as a flat instruction
-            (let* ((e-in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
-                                    (ssa-binding-inputs e)))
-                   (e-info     (or (morph-env-lookup trace-info (ssa-binding-name e))
-                        (error "compile-replay-plan: no trace-info for epilogue binding"
-                               (ssa-binding-name e))))
-                   (e-pool-idx (if (cdr e-info)
-                                   (context-alloc->pool-idx ctx (concrete-alloc-id (car e-info)))
-                                   -1))
-                   (e-instr    (compile-one-instruction e e-in-refs e-pool-idx
-                                                        trace-info constants))
-                   ;; g's pool-idx and refs for the GEMM part
-                   (g-info     (or (morph-env-lookup trace-info (ssa-binding-name g))
-                       (error "compile-replay-plan: no trace-info for gemm binding"
-                              (ssa-binding-name g))))
-                   (g-pool-idx (if (cdr g-info)
-                                   (context-alloc->pool-idx ctx (concrete-alloc-id (car g-info)))
-                                   -1))
-                   (g-in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
-                                    (ssa-binding-inputs g)))
-                   (g-shape    (ssa-binding-shape g))
-                   (g-strides  (compute-strides g-shape))
-                   (g-dtype    (ssa-binding-dtype g)))
-              ;; The fused instruction writes the product straight into e's
-              ;; slot while it still reads g's inputs.  The trace allocated
-              ;; e's slot only after g had run, so it may be the slot of one
-              ;; of g's inputs; the pair is then left unfused.
-              (unless (memv e-pool-idx (filter-map input-pool-idx (ssa-binding-inputs g)))
-                (cases replay-instruction e-instr
-                  (ri-segop (_ e-shape _ e-dtype e-sg _ tag _)
-                    ;; The product is stored in e's buffer, so e must have g's
-                    ;; shape and dtype, as must a bias.
-                    (when (and (memq tag '(segop/flat-unary segop/activation-unary
-                                           segop/bias-broadcast))
-                               (equal? e-shape g-shape)
-                               (eq? e-dtype g-dtype)
-                               (every (lambda (o) (eq? (segop-operand-dtype o) g-dtype))
-                                      (segop-inputs e-sg)))
-                      (let* ((ins   (ssa-binding-inputs g))
-                             (fused (compile-matmul-segop (trace-input-arr (car ins))
-                                                          (trace-input-arr (cadr ins))
-                                                          (car g-in-refs) (cadr g-in-refs)
-                                                          e-pool-idx g-shape g-strides g-dtype
-                                                          e-sg)))
-                        (when (and fused
-                                   (cases replay-instruction fused
-                                     (ri-segop (_ _ _ _ _ _ tag _) (eq? tag 'segop/gemm-epilogue))
-                                     (else #f)))
-                          (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g) fused)
-                          (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i)))))
-                  (else #f))))))
-        (lp (cdr bs) (+ i 1))))
-
     (let loop ((bs bindings) (i 0))
       (unless (null? bs)
         (let* ((b     (car bs))
                (bname (ssa-binding-name b))
                (instr
-                (cond
-                  ;; GEMM with a fused epilogue, compiled above
-                  ((env-builder-lookup gemm-epilogue-eb bname) => (lambda (ri) ri))
-                  ;; Epilogue position: the GEMM already applied it in-place
-                  ((env-builder-lookup epilogue-gemm-eb bname) =>
-                   (lambda (g-pos)
-                     (let* ((info     (or (morph-env-lookup trace-info bname)
-                                          (error "compile-replay-plan: no trace-info for alias"
-                                                 bname)))
-                            (pool-idx (if (cdr info)
-                                          (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
-                                          -1))
-                            (shape    (ssa-binding-shape b))
-                            (strides  (compute-strides shape))
-                            (dtype    (ssa-binding-dtype b)))
-                       (ri-alias pool-idx shape strides dtype (rr-val g-pos)))))
-                  ;; Normal path
-                  (else
-                   (let* ((in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
-                                         (ssa-binding-inputs b)))
-                          (info     (or (morph-env-lookup trace-info bname)
-                                        (error "compile-replay-plan: no trace-info for binding"
-                                               bname)))
-                          (is-pool? (cdr info))
-                          (pool-idx (if is-pool?
-                                        (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
-                                        -1))
-                          (extra-outs
-                           (if (fused-binding? b)
-                               (map (lambda (o)
-                                      (let* ((name  (fused-out-name o))
-                                             (oinfo (or (morph-env-lookup trace-info name)
-                                                        (error "compile-replay-plan: no trace-info for output"
-                                                               name)))
-                                             (shape (fused-out-shape o)))
-                                        (vector (env-builder-lookup name->pos-eb name)
-                                                (context-alloc->pool-idx
-                                                 ctx (concrete-alloc-id (car oinfo)))
-                                                shape (compute-strides shape) (fused-out-dtype o))))
-                                    (cdr (fused-binding-outs b)))
-                               '())))
-                     (compile-one-instruction b in-refs pool-idx trace-info constants
-                                              extra-outs))))))
+                (let* ((in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
+                                      (ssa-binding-inputs b)))
+                       (info     (or (morph-env-lookup trace-info bname)
+                                     (error "compile-replay-plan: no trace-info for binding"
+                                            bname)))
+                       (is-pool? (cdr info))
+                       (pool-idx (if is-pool?
+                                     (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
+                                     -1))
+                       (extra-outs
+                        (if (fused-binding? b)
+                            (map (lambda (o)
+                                   (let* ((name  (fused-out-name o))
+                                          (oinfo (or (morph-env-lookup trace-info name)
+                                                     (error "compile-replay-plan: no trace-info for output"
+                                                            name)))
+                                          (shape (fused-out-shape o)))
+                                     (vector (env-builder-lookup name->pos-eb name)
+                                             (context-alloc->pool-idx
+                                              ctx (concrete-alloc-id (car oinfo)))
+                                             shape (compute-strides shape) (fused-out-dtype o))))
+                                 (cdr (fused-binding-outs b)))
+                            '())))
+                  (compile-one-instruction b in-refs pool-idx trace-info constants
+                                           extra-outs))))
           (vector-set! plan-vec i instr)
           (loop (cdr bs) (+ i 1)))))
 
@@ -3327,19 +3218,6 @@
                                                                     (vector-ref e 3) (vector-ref e 4))))
                                       extra-outs)
                             first)))))
-
-                (ri-alias (pool-idx shape strides dtype in-ref)
-                  ;; The epilogue was applied in place by the preceding GEMM segop.
-                  ;; Advance alloc-ctr to stay in sync with trace-time pool allocation,
-                  ;; then return the GEMM result (already epilogue-applied) with the
-                  ;; correct alloc-id for this binding position.
-                  (let* ((src (deref in-ref))
-                         (aid alloc-ctr))
-                    (set! alloc-ctr (+ alloc-ctr 1))
-                    (cases array-morphism src
-                      (concrete-array (src-data _ _ _ _ _ _)
-                        (concrete-array src-data shape strides 0 dtype aid -1))
-                      (else (error "ri-alias: source not concrete" src)))))
 
                 (ri-im2col (pool-idx shape strides dtype src-ref
                              N C H W KH KW SH SW PH PW OH OW col-layout)
@@ -3606,7 +3484,8 @@
       (cond ((null? bs) `((native . ,native) (host . ,host)))
             ((fused-binding? (car bs))
              (if (cases replay-instruction (vector-ref plan i)
-                   (ri-segop (_ _ _ _ _ _ tag _) (memq tag '(segop/fused-kernel segop/colsum-kernel)))
+                   (ri-segop (_ _ _ _ _ _ tag _)
+                     (memq tag '(segop/fused-kernel segop/colsum-kernel segop/gemm-epilogue)))
                    (else #f))
                  (loop (cdr bs) (+ i 1) (+ native 1) host)
                  (loop (cdr bs) (+ i 1) native (+ host 1))))
@@ -3637,7 +3516,6 @@
                                 (when r
                                   (stack-push! reduce-specs (list i (cadr r) (caddr r) shape))))
                               tag)
-                            (ri-alias            (_ _ _ _ _)             'ri-alias)
                             (ri-im2col           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-im2col)
                             (ri-col2im           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _)     'ri-col2im)
                             (ri-conv-fwd         (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-conv-fwd)
