@@ -698,6 +698,37 @@
         '(add (in 0) (mul (cast f32 (in 1)) (cast f32 (in 1))))
         (scalar-expr-substitute-reduced '(add (in 0) (mul (reduced) (reduced))) '(cast f32 (in 1))))
   (test-error "an invalid body is rejected" (scalar-expr->procedure '(relu (in 0) (in 1)) 2))
+  (let* ((calls 0)
+         (f (lambda (x) (set! calls (+ calls 1)) (* x 3.0)))
+         (shared (list 'opaque f '(in 0)))
+         (bodies (list `(add ,shared (in 1)) `(mul ,shared (cast f32 (in 1))) shared))
+         (proc (scalar-exprs->procedure bodies 2)))
+    (test "several bodies give one value each" (list (+ 6.0 0.5) (* 6.0 0.5) 6.0)
+      (vector->list (proc 2.0 0.5)))
+    (test "a subexpression shared by the bodies is computed once per call" 1
+      (begin (set! calls 0) (proc 2.0 0.5) calls))
+    (test-assert "the result vector is reused by the next call" (eq? (proc 1.0 1.0) (proc 2.0 2.0))))
+  (let* ((calls 0)
+         (f (lambda (x) (set! calls (+ calls 1)) x))
+         (proc (scalar-exprs->procedure (list (list 'opaque f '(in 0)) (list 'opaque f '(in 0))) 1)))
+    (test "equal bodies that are not the same object are computed separately" 2
+      (begin (proc 1.0) calls)))
+  (let* ((calls 0)
+         (f (lambda (x) (set! calls (+ calls 1)) x))
+         (inner (list 'opaque f 't))
+         (proc (scalar-exprs->procedure (list `(let* ((t (in 0))) ,inner) `(let* ((t (in 1))) ,inner)) 2)))
+    (test "a subexpression referring to let* variables is not shared" '(1.0 2.0)
+      (vector->list (proc 1.0 2.0)))
+    (test "and is computed for each body" 4 (begin (proc 1.0 2.0) calls)))
+  (test-assert "several bodies agree with eval-scalar-expr, casts and 5 inputs included"
+    (let* ((p0 '(cast f32 (mul (in 0) (in 1))))
+           (bodies (list `(add ,p0 (in 2)) p0 `(sub (in 4) (cast f32 (exp ,p0)))))
+           (args '(0.1 0.7 -2.5 3.0 1.25))
+           (vals (vector->list (apply (scalar-exprs->procedure bodies 5) args))))
+      (every (lambda (b v) (sg-same? v (eval-scalar-expr b (lambda (k) (list-ref args k)))))
+             bodies vals)))
+  (test-error "an invalid body among several is rejected"
+    (scalar-exprs->procedure (list '(in 0) '(relu (in 0) (in 1))) 2))
   (test-error "an input beyond the arity is rejected" (scalar-expr->procedure '(in 2) 2)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

@@ -101,7 +101,7 @@
           (only (scheme time) current-jiffy jiffies-per-second)
           (only (scheme base) make-parameter)
           (only srfi-1 iota fold filter map for-each append-map filter-map every any
-                take drop list-index)
+                take drop list-index delete-duplicates)
           (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
                 f32vector f32vector? f32vector-ref f32vector-set! f32vector-length
@@ -588,9 +588,10 @@
 ;;;
 ;;; The driver visits the bindings from last to first and fuses into each
 ;;; consumer until nothing more fuses, so a chain collapses in one visit.
-;;; Each round fuses maps into maps first, then fuses with reductions (see
-;;; below).  Rounds are repeated while they fuse something, at most
-;;; (segop-fusion-max-rounds) times.
+;;; Each round fuses maps into maps first, then fuses with reductions, then
+;;; makes the multi-output and horizontal fusions (see below).  Rounds are
+;;; repeated while they fuse something, at most (segop-fusion-max-rounds)
+;;; times.
 ;;; ============================================================
 
 ;; The largest number of rounds of the fusion driver.  Stopping at this
@@ -607,9 +608,11 @@
 
 (define (ssa-fusion-pass-stats)
   "An alist describing the last run of ssa-segop-fusion-pass: rounds (the
-   rounds run), fusions (the producers fused away), bound-reached? (true
-   when the last round still fused and the round bound stopped the pass)
-   candidates, the bodies of the fused seg-maps made, each a list
+   rounds run), fusions (the fusions made), bound-reached? (true when the
+   last round still fused and the round bound stopped the pass); kept,
+   horizontal and dead-outputs (the fusions that kept a producer as a
+   second output, the horizontal fusions, and the outputs removed for
+   having no uses); candidates, the bodies of the fused seg-maps made, each a list
    (canonical-body dtype count elements): how many bindings have that
    body and dtype, and their total number of elements; red-candidates,
    the fused seg-reds made, each a list (canonical-body combine-op path
@@ -623,8 +626,11 @@
                           transpose, or a reduction's source is a view
      reduction-order      the reduction's order is left to its backend
      multi-use-reduction  a reduction result has other uses, or is read twice
-     placement            a finalize's inputs come after a reduction that
-                          keeps a map output"
+     placement            no position fits a fused binding: a finalize's
+                          inputs come after a reduction that keeps a map
+                          output, or a kept producer has a use before its
+                          consumer, whose inputs come after it
+     horizontal-placement no position fits two siblings"
   *fusion-pass-stats*)
 
 ;; Views: their values share the buffer of their source, in a layout that
@@ -885,11 +891,13 @@
            (loop (cdr ins) acc))
           (else (loop (cdr ins) (cons (car ins) acc))))))
 
-(define (fuse-into p c k vtab)
+(define (fuse-into p c k vtab #!optional (kept? #f))
   "The fused binding computing producer p and consumer c, of which p is
    input k.  Its inputs are c's with p's in place of input k, each read
    once; its body is c's body with p's body, rounded to p's dtype, for
-   (in k)."
+   (in k).  When kept? is true, it also stores p's value as a second
+   output, whose body is the same object as p's body inside c's, so that
+   it is computed once."
   (let* ((p-ins  (ssa-binding-inputs p))
          (c-ins  (ssa-binding-inputs c))
          (ins    (distinct-values (append (take c-ins k) p-ins (drop c-ins (+ k 1)))))
@@ -905,8 +913,94 @@
      ins shape
      (map (lambda (v) (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) rank))
           ins)
-     (list (list (ssa-binding-name c) shape (ssa-binding-dtype c) body))
+     (cons (list (ssa-binding-name c) shape (ssa-binding-dtype c) body)
+           (if kept?
+               (list (list (ssa-binding-name p) (ssa-binding-shape p) (ssa-binding-dtype p) p-body*))
+               '()))
      (append (binding-members p) (binding-members c)))))
+
+;;; ------------------------------------------------------------
+;;; Multi-output and horizontal fusion
+;;; ------------------------------------------------------------
+;;;
+;;; A map P with several uses may still be fused into a map C that reads
+;;; it: the fused binding also stores P's value, as a second output, for
+;;; the other uses.  Two maps of the same shape that read a common input,
+;;; and neither of which depends on the other, may be fused into one
+;;; seg-map with an output for each (horizontal fusion), which reads the
+;;; common input once.  Outputs of fused bindings that are left without
+;;; uses are removed at the end of each round.
+
+;; The largest number of outputs of a fused binding.
+(define fusion-max-outputs 4)
+
+;; True when b computes one or more values at every point of its shape:
+;; a map binding, or a fused seg-map with any number of outputs.
+(define (fusion-group-binding? b)
+  (or (fusion-map-binding? b)
+      (and (fused-binding? b) (= 0 (fused-binding-nred b)))))
+
+;; The parts of map binding or fused seg-map b, as (inputs in-maps outs),
+;; outs in the list form of make-fused-ssa-binding.
+(define (map-parts b vtab)
+  (if (fused-binding? b)
+      (let ((tpl (fused-binding-template b)))
+        (list (ssa-binding-inputs b) (fusion-template-in-maps tpl)
+              (map fused-out->list (fusion-template-outs tpl))))
+      (let ((rank (vector-length (ssa-binding-shape b))))
+        (list (ssa-binding-inputs b)
+              (map (lambda (v) (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) rank))
+                   (ssa-binding-inputs b))
+              (list (list (ssa-binding-name b) (ssa-binding-shape b) (ssa-binding-dtype b)
+                          (binding-scalar-body b (ssa-binding-combiner b))))))))
+
+(define (fuse-siblings s1 s2 vtab)
+  "The fused seg-map computing map bindings or fused seg-maps s1 and s2,
+   of the same shape, with the outputs of s1 first.  An input that both
+   read through the same map is read once."
+  (let* ((p1    (map-parts s1 vtab))
+         (p2    (map-parts s2 vtab))
+         (reads (distinct-reads (append (map cons (car p1) (cadr p1)) (map cons (car p2) (cadr p2)))))
+         (renum (lambda (parts)
+                  (let ((memo (list '()))
+                        (subst (lambda (j)
+                                 `(in ,(read-position reads (list-ref (car parts) j)
+                                                      (list-ref (cadr parts) j))))))
+                    (map (lambda (o) (list (car o) (cadr o) (caddr o)
+                                           (renumber-body (cadddr o) subst memo)))
+                         (caddr parts))))))
+    (make-fused-ssa-binding (map car reads) (ssa-binding-shape s1) (map cdr reads)
+                            (append (renum p1) (renum p2))
+                            (append (binding-members s1) (binding-members s2)))))
+
+(define (drop-fused-outputs b dead)
+  "Fused binding b without its outputs named in dead, and without the
+   inputs that only those outputs read."
+  (let* ((tpl    (fused-binding-template b))
+         (outs   (filter (lambda (o) (not (memq (car o) dead)))
+                         (map fused-out->list (fusion-template-outs tpl))))
+         (ins    (ssa-binding-inputs b))
+         (maps   (fusion-template-in-maps tpl))
+         (used   (delete-duplicates
+                  (append-map (lambda (o)
+                                (let ((red (list-ref o 5)))
+                                  (append (scalar-expr-inputs (cadddr o))
+                                          (if (and red (cdr red)) (scalar-expr-inputs (cdr red)) '()))))
+                              outs)))
+         (keep   (filter (lambda (j) (memv j used)) (iota (length ins))))
+         (subst  (lambda (j) `(in ,(list-index (lambda (x) (= x j)) keep))))
+         (memo   (list '()))
+         (outs*  (map (lambda (o)
+                        (let ((red (list-ref o 5)))
+                          (list (car o) (cadr o) (caddr o) (renumber-body (cadddr o) subst memo)
+                                (list-ref o 4)
+                                (and red (cons (car red)
+                                               (and (cdr red) (scalar-expr-substitute-inputs (cdr red) subst)))))))
+                      outs))
+         (meta   (filter (lambda (kv) (memq (car kv) '(src-shape path))) (ssa-binding-meta b))))
+    (make-fused-ssa-binding (map (lambda (j) (list-ref ins j)) keep) (fusion-template-space tpl)
+                            (map (lambda (j) (list-ref maps j)) keep)
+                            outs* (binding-members b) (fusion-template-nred tpl) meta)))
 
 ;;; ------------------------------------------------------------
 ;;; Fusion with reductions
@@ -1222,6 +1316,54 @@
                                 (eq? (car (car u)) (ssa-binding-name p)))))))
              (miss! 'view))))
 
+    ;; Counts of the fusions that keep a producer, of horizontal fusions
+    ;; and of the outputs removed.
+    (define kept-count 0)
+    (define horizontal-count 0)
+    (define dead-count 0)
+
+    ;; The position of the binding that computes value v, or #f for a
+    ;; constant.
+    (define (value-position v)
+      (and (ssa-binding-ref? v) (hash-table-ref/default pos (ssa-value-id v) #f)))
+
+    ;; Fuses producer p, which has other uses, into map c, of which it is
+    ;; input k, keeping p's value as a second output; true if it did.  The
+    ;; fused binding takes p's position when c's other inputs exist there,
+    ;; and otherwise c's position when no other use of p comes before c.
+    (define (fuse-kept! p c k)
+      (let* ((p-name (ssa-binding-name p))
+             (c-name (ssa-binding-name c))
+             (u      (hash-table-ref/default uses p-name '())))
+        (and (fusion-map-binding? p)
+             (fusion-map-binding? c)
+             (eq? p-name (ssa-value-id (list-ref (ssa-binding-inputs c) k)))
+             (> (length u) 1)
+             (= 1 (length (filter (lambda (x) (eq? (car x) c-name)) u)))
+             (any (lambda (x) (and (eq? (car x) c-name) (eq? (caddr x) 'fusible))) u)
+             (= 1 (scalar-body-input-reads (binding-scalar-body c (ssa-binding-combiner c)) k))
+             (let* ((p-at (hash-table-ref pos-of-binding p-name))
+                    (c-at (hash-table-ref pos-of-binding c-name))
+                    (at   (cond ((every (lambda (v j)
+                                          (or (= j k)
+                                              (let ((q (value-position v))) (or (not q) (< q p-at)))))
+                                        (ssa-binding-inputs c) (iota (length (ssa-binding-inputs c))))
+                                 p-at)
+                                ((every (lambda (x)
+                                          (or (not (car x)) (eq? (car x) c-name)
+                                              (> (hash-table-ref pos-of-binding (car x)) c-at)))
+                                        u)
+                                 c-at)
+                                (else #f))))
+               (if (not at)
+                   (begin (miss! 'placement) #f)
+                   (let ((f (fuse-into p c k vtab #t)))
+                     (cond ((not (fused-result-legal? f vtab)) (miss! 'size-cap) #f)
+                           ((not (fusion-profitable? f vtab flat?)) (miss! 'not-native) #f)
+                           (else (commit-at! (list p c) f at)
+                                 (set! kept-count (+ kept-count 1))
+                                 #t))))))))
+
     ;; Fuses one producer into the binding at position i; true if it did.
     (define (fuse-one! i)
       (let ((c (vector-ref bv i)))
@@ -1236,6 +1378,93 @@
                                           (begin (commit! p c f) #t))))
                               (begin (note-missed! p c k) #f))))
                    (loop (cdr vs) (+ k 1)))))))
+
+    ;; Fuses into the map at position i one producer that has other uses,
+    ;; keeping it as an output; true if it did.
+    (define (fuse-one-kept! i)
+      (let ((c (vector-ref bv i)))
+        (let loop ((vs (ssa-binding-inputs c)) (k 0))
+          (and (pair? vs)
+               (or (let ((p (binding-of (car vs)))) (and p (fuse-kept! p c k)))
+                   (loop (cdr vs) (+ k 1)))))))
+
+    ;; True when the binding at position j depends on a value computed by
+    ;; the binding at position i < j.
+    (define (depends? j i)
+      (let ((names (binding-out-names (vector-ref bv i))))
+        (let walk ((stack (list j)) (seen '()))
+          (cond ((null? stack) #f)
+                ((memv (car stack) seen) (walk (cdr stack) seen))
+                (else
+                 (let ((ins (ssa-binding-inputs (vector-ref bv (car stack)))))
+                   (or (any (lambda (v) (and (ssa-binding-ref? v) (memq (ssa-value-id v) names))) ins)
+                       (walk (append (filter (lambda (q) (and q (> q i)))
+                                             (map value-position ins))
+                                     (cdr stack))
+                             (cons (car stack) seen)))))))))
+
+    ;; Fuses the map binding or fused seg-map at position i with an earlier
+    ;; sibling: one of the same shape that reads a common input through the
+    ;; same map and on which it does not depend; true if it did.  The fused
+    ;; binding takes position i when no use of the sibling comes before i,
+    ;; and otherwise the sibling's position when the inputs at i all exist
+    ;; there.
+    (define (fuse-horizontal! i)
+      (let* ((s2    (vector-ref bv i))
+             (pairs (map cons (ssa-binding-inputs s2) (cadr (map-parts s2 vtab)))))
+        (let loop ((j (- i 1)))
+          (and (>= j 0)
+               (or (let ((s1 (vector-ref bv j)))
+                     (and s1
+                          (fusion-group-binding? s1)
+                          (equal? (ssa-binding-shape s1) (ssa-binding-shape s2))
+                          (<= (+ (length (binding-out-names s1)) (length (binding-out-names s2)))
+                              fusion-max-outputs)
+                          (let ((pairs1 (map cons (ssa-binding-inputs s1) (cadr (map-parts s1 vtab)))))
+                            (any (lambda (p)
+                                   (any (lambda (q) (and (eq? (ssa-value-id (car p)) (ssa-value-id (car q)))
+                                                         (same-index-map? (cdr p) (cdr q))))
+                                        pairs1))
+                                 pairs))
+                          (not (depends? i j))
+                          (let ((at (cond ((every (lambda (name)
+                                                    (every (lambda (x)
+                                                             (or (not (car x))
+                                                                 (> (hash-table-ref pos-of-binding (car x)) i)))
+                                                           (hash-table-ref/default uses name '())))
+                                                  (binding-out-names s1))
+                                           i)
+                                          ((every (lambda (v) (let ((q (value-position v))) (or (not q) (< q j))))
+                                                  (ssa-binding-inputs s2))
+                                           j)
+                                          (else #f))))
+                            (if (not at)
+                                (begin (miss! 'horizontal-placement) #f)
+                                (let ((f (fuse-siblings s1 s2 vtab)))
+                                  (cond ((> (length (ssa-binding-inputs f)) fusion-max-inputs)
+                                         (miss! 'size-cap) #f)
+                                        ((not (fusion-profitable? f vtab flat?)) (miss! 'not-native) #f)
+                                        (else (commit-at! (list s1 s2) f at)
+                                              (set! horizontal-count (+ horizontal-count 1))
+                                              #t)))))))
+                   (loop (- j 1)))))))
+
+    ;; Removes the outputs of fused bindings, other than their first, that
+    ;; have no uses; returns how many it removed.
+    (define (remove-dead-outputs!)
+      (let loop ((i 0) (count 0))
+        (if (= i n)
+            count
+            (let ((b (vector-ref bv i)))
+              (if (and b (fused-binding? b))
+                  (let ((dead (filter (lambda (name) (null? (hash-table-ref/default uses name '())))
+                                      (cdr (binding-out-names b)))))
+                    (if (null? dead)
+                        (loop (+ i 1) count)
+                        (begin
+                          (commit-at! (list b) (drop-fused-outputs b dead) i)
+                          (loop (+ i 1) (+ count (length dead))))))
+                  (loop (+ i 1) count))))))
 
     ;; Puts fused binding f in place of olds at position at, if it is legal
     ;; and profitable; otherwise records why not.
@@ -1354,20 +1583,32 @@
                   (loop (- i 1) count))))))
 
     ;; Maps are fused first, so that a chain of maps is one map before it
-    ;; meets its reduction.
+    ;; meets its reduction.  Fusions that keep a producer as a second output,
+    ;; and horizontal fusions, come after the fusions with reductions, since
+    ;; a binding with several outputs no longer fuses into a reduction.
     (define (run-round)
       (set! missed '())
       (let* ((maps (run-phase fusion-map-binding? fuse-one!))
              (reds (run-phase (lambda (b) (or (reduce-binding? b) (fused-red-binding? b)))
                               fuse-into-reduction!))
-             (epis (run-phase fusion-map-binding? fuse-epilogue!)))
-        (+ maps reds epis)))
+             (epis (run-phase fusion-map-binding? fuse-epilogue!))
+             (kept (run-phase fusion-map-binding? fuse-one-kept!))
+             (horz (run-phase fusion-group-binding? fuse-horizontal!))
+             (dead (remove-dead-outputs!)))
+        (set! dead-count (+ dead-count dead))
+        (set! round-dead dead)
+        (+ maps reds epis kept horz)))
+
+    ;; The outputs the last round removed: a binding left with one output
+    ;; may fuse in the next round.
+    (define round-dead 0)
 
     (let rounds ((r 1) (total 0))
       (let* ((fused (run-round)) (total (+ total fused)))
-        (if (or (= fused 0) (>= r max-rounds))
+        (if (or (= 0 fused round-dead) (>= r max-rounds))
             (set! *fusion-pass-stats*
                   `((rounds . ,r) (fusions . ,total) (bound-reached? . ,(> fused 0))
+                    (kept . ,kept-count) (horizontal . ,horizontal-count) (dead-outputs . ,dead-count)
                     (candidates . ,(fusion-candidates (filter (lambda (b) b) (vector->list bv))))
                     (red-candidates . ,(fusion-red-candidates (filter (lambda (b) b) (vector->list bv))))
                     (missed . ,(reverse missed))))

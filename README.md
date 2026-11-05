@@ -352,6 +352,12 @@ A fused reduction adds its values in the same order as the unfused one, so
 results do not change. Sums of rank-1 arrays are not fused, because their
 order is left to the BLAS backend.
 
+A fused binding can also have several outputs. An element-wise binding
+with other readers can still be fused into one of them, and it keeps its
+value as a second output for the others. Two element-wise bindings of the
+same shape that read a common input, where neither depends on the other,
+can be computed in one pass, which reads that input once.
+
 Whether a legal fusion is made depends on the policy, the value of the
 parameter `segop-fusion` (`array-morphisms-ssa`):
 
@@ -389,8 +395,9 @@ over the rows in one pass; the crunch backends currently hold none.
 `replay-plan-stats` reports under `fused` how many fused bindings run as a
 native kernel and how many on the host.
 `ssa-fusion-pass-stats` lists the fused bodies the pass formed
-(`candidates`, and `red-candidates` for reductions) and counts the pairs it
-left unfused, by reason (`missed`). Run under `'all`, it shows which fused
+(`candidates`, and `red-candidates` for reductions), counts the fusions
+with several outputs (`kept`, `horizontal`, `dead-outputs`), and counts the
+pairs it left unfused, by reason (`missed`). Run under `'all`, it shows which fused
 kernels would be worth adding.
 
 Fusion does not change results. A fused binding rounds each intermediate

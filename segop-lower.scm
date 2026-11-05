@@ -738,6 +738,41 @@
                    (else #f)))))
     (else #f)))
 
+;; A seg-map with several outputs runs with its bodies compiled together,
+;; so that a value its outputs share is computed once per point, when
+;; every operand has a linear form.  Each output is stored with the
+;; rounding of its dtype, as segop-interpret stores it.
+(define (strided-multi-map-executor space ins outs bodies)
+  (let* ((rank   (vector-length space))
+         (n      (length ins))
+         (m      (length outs))
+         (refs   (map segop-operand-slot ins))
+         (dtypes (list->vector (map segop-operand-dtype ins)))
+         (odts   (list->vector (map segop-operand-dtype outs)))
+         (lins   (map (lambda (o) (segop-operand-linear o rank)) (append ins outs)))
+         (proc   (scalar-exprs->procedure bodies n)))
+    (lambda (deref buf #!optional (extra-bufs '()))
+      (let ((datas (list->vector (map (lambda (r) (operand-data 'strided-multi-map (deref r))) refs)))
+            (bufs  (list->vector (cons buf extra-bufs))))
+        (for-each-strided-point
+         space lins
+         (lambda (offs)
+           (let ((vals (apply proc (map (lambda (k) (typed-vector-ref (vector-ref datas k) (vector-ref dtypes k)
+                                                                      (vector-ref offs k)))
+                                        (iota n)))))
+             (do ((j 0 (+ j 1))) ((= j m))
+               (typed-vector-set! (vector-ref bufs j) (vector-ref odts j) (vector-ref offs (+ n j))
+                                  (vector-ref vals j))))))))))
+
+(define (strided-multi-select sg)
+  (cases segop sg
+    (seg-map (space ins outs bodies fallback)
+      (and (> (length outs) 1)
+           (all-linear? (append ins outs) (vector-length space))
+           (every (lambda (o) (memq (segop-operand-dtype o) '(f32 f64 s32 s64 u32 u64))) (append ins outs))
+           (cons 'segop/strided-multi-map (strided-multi-map-executor space ins outs bodies))))
+    (else #f)))
+
 ;;; ------------------------------------------------------------
 ;;; Strided reductions
 ;;; ------------------------------------------------------------
@@ -1243,6 +1278,7 @@
   (or (scheme-elementwise-select sg)
       (select-standard-reduction sg '(1d axis0 axis1 general))
       (strided-select sg)
+      (strided-multi-select sg)
       (strided-red-select sg)
       (host-index-fn-select sg)
       (interpreted-select sg)))

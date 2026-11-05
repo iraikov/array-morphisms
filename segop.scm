@@ -86,6 +86,7 @@
    scalar-expr-inputs
    scalar-expr-opaque?
    scalar-expr->procedure
+   scalar-exprs->procedure
    canonical-scalar-body
 
    ;; Reductions
@@ -138,6 +139,7 @@
           (only (scheme base) exact-integer? vector-map vector-copy vector-append make-parameter)
           (only srfi-1 every any iota filter delete-duplicates fold list-index)
           (only srfi-4 make-f32vector f32vector-ref f32vector-set!)
+          (only srfi-69 make-hash-table hash-table-ref/default hash-table-set!)
           datatype
           array-morphisms-core
           array-morphisms-scalar-ops)
@@ -705,8 +707,101 @@
       (compile-scalar-expr body n-inputs)))
 
 (define (compile-scalar-expr body n-inputs)
-  (let ((wide? (> n-inputs 3)))
+  (arity-procedure (car (compile-scalar-nodes (list body) n-inputs #f)) n-inputs))
+
+;; The procedure of n-inputs arguments that calls compiled node.
+(define (arity-procedure node n-inputs)
+  (case n-inputs
+    ((0) (lambda () (node #f #f #f #f)))
+    ((1) (lambda (x) (node x #f #f #f)))
+    ((2) (lambda (x y) (node x y #f #f)))
+    ((3) (lambda (x y z) (node x y z #f)))
+    (else (lambda args
+            (unless (= (length args) n-inputs)
+              (error 'scalar-expr->procedure "wrong number of arguments" n-inputs args))
+            (node #f #f #f (list->vector args))))))
+
+(define (scalar-exprs->procedure bodies n-inputs)
+  "A procedure of n-inputs arguments that computes every body of bodies
+   and returns their values in a vector, one per body, which the next call
+   reuses.  A subexpression that occurs more than once among the bodies,
+   as the same object (eq?), is computed once per call."
+  (for-each (lambda (body)
+              (unless (scalar-expr-valid? body n-inputs 0)
+                (error 'scalar-exprs->procedure "invalid body" body n-inputs)))
+            bodies)
+  (let* ((gen   (vector 0))
+         (nodes (list->vector (compile-scalar-nodes bodies n-inputs gen)))
+         (m     (vector-length nodes))
+         (out   (make-vector m #f))
+         (node  (lambda (a b c v)
+                  (vector-set! gen 0 (+ 1 (vector-ref gen 0)))
+                  (do ((j 0 (+ j 1))) ((= j m) out)
+                    (vector-set! out j ((vector-ref nodes j) a b c v))))))
+    (arity-procedure node n-inputs)))
+
+(define (compile-scalar-nodes bodies n-inputs gen)
+  "Compile each body of bodies into a node, a procedure (node a b c v) that
+   computes the body's value (see the body compiler above).  With gen,
+   a subexpression that occurs more than once among the bodies, as the
+   same object, is computed once per evaluation and its value reused.
+
+   bodies:   the scalar expressions to compile, all over the same inputs
+   n-inputs: the number of inputs the bodies read
+   gen:      #f to compile each body on its own; or a one-element vector
+             holding a counter, which the caller increases before each
+             evaluation, so that the nodes know when a value they share is
+             out of date
+
+   Returns the list of nodes, one per body.  Subexpressions that refer to
+   let* variables are never shared, since the same object may then stand
+   for different values."
+  (let ((wide?  (> n-inputs 3))
+        (counts (make-hash-table eq?))
+        (shared (make-hash-table eq?)))
+    ;; Counts the occurrences of each subexpression object, entering each
+    ;; object's own subexpressions only the first time it is met.
+    (define (count! e)
+      (when (pair? e)
+        (let ((k (hash-table-ref/default counts e 0)))
+          (hash-table-set! counts e (+ k 1))
+          (when (= k 0)
+            (case (car e)
+              ((in param idx reduced) #f)
+              ((cast) (count! (caddr e)))
+              ((opaque) (for-each count! (cddr e)))
+              ((let*) #f)
+              (else (for-each count! (cdr e))))))))
+    ;; True when e refers to no let* variable.
+    (define (closed? e)
+      (cond ((symbol? e) #f)
+            ((not (pair? e)) #t)
+            ((eq? (car e) 'let*) #f)
+            ((eq? (car e) 'cast) (closed? (caddr e)))
+            ((eq? (car e) 'opaque) (every closed? (cddr e)))
+            ((memq (car e) '(in param idx reduced)) #t)
+            (else (every closed? (cdr e)))))
+    ;; True when the value of e is computed once per evaluation.
+    (define (share? e)
+      (and gen (pair? e) (not (eq? (car e) 'in))
+           (> (hash-table-ref/default counts e 0) 1)
+           (closed? e)))
     (define (compile e env)
+      (if (share? e)
+          (or (hash-table-ref/default shared e #f)
+              (let* ((node (compile-form e env))
+                     (seen -1)
+                     (val  #f)
+                     ;; computes node once for each value of the counter
+                     (once (lambda (a b c v)
+                             (unless (eqv? seen (vector-ref gen 0))
+                               (set! val (node a b c v))
+                               (set! seen (vector-ref gen 0)))
+                             val)))
+                (hash-table-set! shared e once)
+                once))
+          (compile-form e env)))
+    (define (compile-form e env)
       (cond
        ((number? e) (lambda (a b c v) e))
        ((symbol? e)
@@ -765,16 +860,8 @@
                 (lambda (a b c v)
                   (typed-vector-set! cell dtype 0 (x a b c v))
                   (typed-vector-ref cell dtype 0))))))
-    (let ((node (compile body '())))
-      (case n-inputs
-        ((0) (lambda () (node #f #f #f #f)))
-        ((1) (lambda (x) (node x #f #f #f)))
-        ((2) (lambda (x y) (node x y #f #f)))
-        ((3) (lambda (x y z) (node x y z #f)))
-        (else (lambda args
-                (unless (= (length args) n-inputs)
-                  (error 'scalar-expr->procedure "wrong number of arguments" n-inputs args))
-                (node #f #f #f (list->vector args))))))))
+    (when gen (for-each count! bodies))
+    (map (lambda (body) (compile body '())) bodies)))
 
 
 ;; The canonical form of a body, under which bodies that compute the same

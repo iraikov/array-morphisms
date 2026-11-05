@@ -17,7 +17,7 @@
         test
         (only srfi-1 iota every any map filter filter-map take drop fold delete-duplicates list-index
               append-map)
-        (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set!
+        (only srfi-4 f64vector f64vector-ref f64vector-length f64vector-set! f32vector
               make-f32vector f32vector-ref f32vector-set! f32vector->list f64vector->list
               list->s32vector s32vector->list make-s32vector make-f64vector
               s32vector-set! s32vector-ref)
@@ -33,6 +33,7 @@
         (prefix array-morphisms-grad am:)
         array-morphisms-segop
         array-morphisms-activation-exec
+        (only array-morphisms-scalar-ops scalar-op-combiner)
         array-morphisms-ssa)
 
 
@@ -1388,6 +1389,31 @@
           (reset-context! ctx)
           (values joint trace-lists (map concrete->list (ssa-realize/ctx ctx joint))))))))
 
+;; The bodies of segop sg: those of a seg-map's outputs, or a seg-red's
+;; result and map-output bodies.
+(define (segop-bodies sg)
+  (cases segop sg
+    (seg-map (space ins outs bodies fallback) bodies)
+    (seg-red (space nred ins results map-outs fallback)
+      (append (map red-result-body results) (map cdr map-outs)))
+    (else '())))
+
+;; True when body b applies op somewhere.
+(define (body-has-op? b op)
+  (and (pair? b) (not (eq? (car b) 'opaque))
+       (or (eq? (car b) op) (any (lambda (e) (body-has-op? e op)) (cdr b)))))
+
+;; True when body b contains a subexpression of the form pattern, in which
+;; (in _) matches any input.
+(define (body-has-form? b pattern)
+  (define (matches? e p)
+    (cond ((equal? p '(in _)) (and (pair? e) (eq? (car e) 'in)))
+          ((and (pair? p) (pair? e)) (and (= (length p) (length e)) (every matches? e p)))
+          (else (equal? e p))))
+  (let walk ((e b))
+    (or (matches? e pattern)
+        (and (pair? e) (not (eq? (car e) 'opaque)) (any walk (cdr e))))))
+
 (test-group "segop lowering of element-wise bindings"
   (for-each
    (lambda (dtype)
@@ -1411,26 +1437,19 @@
                               segop/flat-broadcast segop/reduce-1d segop/reduce-axis0
                               segop/gemm segop/gemm-strided segop/gemm-epilogue
                               segop/reduce-axis1 segop/reduce-general segop/gather
-                              segop/strided-map segop/strided-red)))
+                              segop/strided-map segop/strided-red segop/strided-multi-map)))
                   tags))
          (test-assert (sprintf "~A: relu keeps its symbolic body" dtype)
-           (any (lambda (ts) (equal? (cases segop (cdr ts)
-                                       (seg-map (space ins outs bodies fallback) (car bodies))
-                                       (else #f))
-                                     '(relu (in 0))))
+           (any (lambda (ts) (any (lambda (b) (body-has-op? b 'relu)) (segop-bodies (cdr ts))))
                 segs))
-         ;; an f32 producer's value is rounded to f32 inside the fused body,
-         ;; which is the body of the mean the exp is fused into
+         ;; an f32 producer's value is rounded to f32 inside the fused body
          (test-assert (sprintf "~A: the fused negate and exp have a composed body" dtype)
-           (any (lambda (ts) (equal? (cases segop (cdr ts)
-                                       (seg-map (space ins outs bodies fallback) (car bodies))
-                                       (seg-red (space nred ins results map-outs fallback)
-                                         (let ((b (red-result-body (car results))))
-                                           (if (and (pair? b) (eq? (car b) 'cast)) (caddr b) b)))
-                                       (else #f))
-                                     (if (eq? dtype 'f32)
-                                         '(exp (cast f32 (negate (in 0))))
-                                         '(exp (negate (in 0))))))
+           (any (lambda (ts)
+                  (any (lambda (b)
+                         (body-has-form? b (if (eq? dtype 'f32)
+                                               '(exp (cast f32 (negate (in _))))
+                                               '(exp (negate (in _))))))
+                       (segop-bodies (cdr ts))))
                 segs))
          (test-assert (sprintf "~A: the checker ran on every segop execution" dtype)
            (>= checks (* 2 (length segs))))
@@ -2762,7 +2781,8 @@
         (= 3 (length (sf-members (car (sf-fused fused))))))
       (test "the fused program computes the same values" (sf-run prog) (sf-run fused))))
 
-  ;; A producer that is also a program output keeps its value.
+  ;; A producer that is also a program output is fused, and its value kept
+  ;; as a second output.
   (let* ((x  (sf-var sf-x '(2 3)))
          (fwd (morphism-to-ssa (am:make-var (morph-negate (morph-exp (am:var-value x))) #f)))
          (e   (sf-binding fwd 'exp))
@@ -2771,7 +2791,8 @@
                                 (append (ssa-program-outputs fwd) (list (binding-ref (ssa-binding-name e))))
                                 0 #f #f #f))
          (fused (ssa-segop-fusion-pass two)))
-    (test "a producer that is a program output is not fused" '() (sf-fused fused))
+    (test "a producer that is a program output is fused with its value kept" '(2)
+      (map (lambda (b) (length (binding-out-names b))) (sf-fused fused)))
     (test "both outputs are computed" (sf-run two) (sf-run fused))
     (test "without the second output, the producer is fused" 1
       (length (sf-fused (ssa-segop-fusion-pass fwd)))))
@@ -3525,5 +3546,172 @@
         (test "and agrees with the interpreter" 0 mismatches)))
     (register-activation-backend! #f)))
 
+
+;;;; ============================================================
+;;;; Multi-output and horizontal fusion
+;;;;
+;;;; A map with other uses is fused into a map that reads it, with its value
+;;;; kept as a second output; maps of the same shape that read a common
+;;;; input are fused into one seg-map; outputs left without uses are
+;;;; removed.  Under the policy all, the values are those of the unfused
+;;;; program, bit for bit.
+;;;; ============================================================
+
+(define mo-x '(0.5 -1.25 2.0 0.75 -0.5 1.5))
+(define mo-y '(1.0 -2.0 3.0 0.25 4.0 -0.75))
+(define mo-w '(0.3 -0.2 0.5 0.1 -0.4 0.6))
+
+(define (mo-stat stats key) (cdr (assq key stats)))
+
+;; The number of outputs of each fused seg-map of prog.
+(define (mo-outputs prog)
+  (map (lambda (b) (length (binding-out-names b)))
+       (filter (lambda (b) (and (eq? (ssa-binding-op b) 'fused) (not (fused-red-binding? b))))
+               (ssa-program-bindings prog))))
+
+(test-group "multi-output seg-map executor"
+  ;; Three outputs sharing exp(x), with x read transposed and b broadcast.
+  (let* ((x  (e4-arr (e4-values 6 'f32) #(3 2) #(1 3) 'f32))
+         (b  (e4-arr (f32vector 0.5 -1.0) #(1 2) #(2 1) 'f32))
+         (e  '(cast f32 (exp (in 0))))
+         (sg (make-seg-map #(3 2) (list (e4-op 'x x 'f32 (identity-index-map 2)) (e4-op 'b b 'f32 (e4-map 0 '(dim 1))))
+                           (list (e4-out 'f32 #(3 2) (identity-index-map 2)) (e4-out 'f32 #(3 2) (identity-index-map 2))
+                                 (e4-out 'f64 #(3 2) (identity-index-map 2)))
+                           (list `(add ,e (in 1)) e `(mul ,e 2.0))))
+         (r  (e4-run sg `((x . ,x) (b . ,b)) '((f32 6) (f32 6) (f64 6)))))
+    (test "a seg-map with several outputs runs on the strided multi-output executor" 'segop/strided-multi-map (car r))
+    (test-assert "its outputs equal the interpreter's, special values included" (cadr r)))
+  ;; s32 outputs over a rank-0 space.
+  (let* ((x  (e4-arr (e4-ints 1) #() #() 's32))
+         (sg (make-seg-map #() (list (e4-op 'x x 's32 (identity-index-map 0)))
+                           (list (e4-out 's32 #() (identity-index-map 0)) (e4-out 's32 #() (identity-index-map 0)))
+                           (list '(mul (in 0) (in 0)) '(negate (in 0)))))
+         (r  (e4-run sg `((x . ,x)) '((s32 1) (s32 1)))))
+    (test "a rank-0 s32 seg-map with two outputs" 'segop/strided-multi-map (car r))
+    (test-assert "equals the interpreter's" (cadr r)))
+  ;; A value shared by both outputs is computed once per point.
+  (let* ((calls 0)
+         (f  (lambda (v) (set! calls (+ calls 1)) (* v 3.0)))
+         (sh (list 'opaque f '(in 0)))
+         (x  (e4-arr (e4-values 6 'f64) #(2 3) #(3 1) 'f64))
+         (sg (make-seg-map #(2 3) (list (e4-op 'x x 'f64 (identity-index-map 2)))
+                           (list (e4-out 'f64 #(2 3) (identity-index-map 2)) (e4-out 'f64 #(2 3) (identity-index-map 2)))
+                           (list `(add ,sh 1.0) sh)))
+         (ex (select-segop-executor sg)))
+    ((cdr ex) (lambda (s) x) (make-f64vector 6) (list (make-f64vector 6)))
+    (test "a shared value is computed once per point" 6 calls)))
+
+(test-group "multi-output and horizontal fusion"
+  (for-each
+   (lambda (dtype)
+     (let* ((x  (fk-arr mo-x '(2 3) dtype))
+            (y  (fk-arr mo-y '(2 3) dtype))
+            (W  (fk-arr mo-w '(3 2) dtype))
+            (W2 (fk-arr (reverse mo-w) '(3 2) dtype))
+            (A  (fk-arr '(1.0 0.5 -0.5 2.0) '(2 2) dtype))
+            (Bm (fk-arr mo-y '(2 3) dtype)))
+       ;; P = exp(x) read by C = P*y and by a GEMM: C's other input is a
+       ;; constant, so the fused binding takes P's position.
+       (let-values (((fused stats same?)
+                     (rd-check (let ((p (morph-exp x)))
+                                 (morph+ (morph-matmul (morph* p y) W2) (morph-matmul p W))))))
+         (test (sprintf "~A: a producer read by a GEMM is kept as a second output" dtype) 1 (mo-stat stats 'kept))
+         (test (sprintf "~A: one fused seg-map with two outputs" dtype) '(2) (mo-outputs fused))
+         (test-assert (sprintf "~A: the values are those of the unfused program" dtype) same?))
+       ;; A chain, exp(negate(x)), fused first and then kept.
+       (let-values (((fused stats same?)
+                     (rd-check (let ((p (morph-exp (morph-negate x))))
+                                 (morph+ (morph-matmul (morph* p y) W2) (morph-matmul p W))))))
+         (test (sprintf "~A: a fused producer is kept too" dtype) 1 (mo-stat stats 'kept))
+         (test-assert (sprintf "~A: with the values of the unfused program" dtype) same?))
+       ;; C = P*z with z a GEMM after P: the fused binding takes C's
+       ;; position, since P's other use comes after C.
+       (let-values (((fused stats same?)
+                     (rd-check (let ((p (morph-exp x)) (z (morph-matmul A Bm)))
+                                 (morph+ (morph-matmul (morph* p z) W2) (morph-matmul p W))))))
+         (test (sprintf "~A: a kept producer may take the consumer's position" dtype) 1 (mo-stat stats 'kept))
+         (test-assert (sprintf "~A: with the values of the unfused program" dtype) same?))
+       ;; P's other use comes before C, and C's other input after P.
+       (let-values (((fused stats same?)
+                     (rd-check (let ((p (morph-exp x)) (z (morph-matmul A Bm)))
+                                 (morph+ (morph-matmul p W) (morph-matmul (morph* p z) W2)))
+                               1)))
+         (test (sprintf "~A: no position fits: the producer is not kept" dtype) 0 (mo-stat stats 'kept))
+         (test-assert (sprintf "~A: and it is reported" dtype) (alist-ref 'placement (rd-missed stats)))
+         (test-assert (sprintf "~A: the values are unchanged" dtype) same?))
+       ;; Siblings exp(x) and sin(x), each read by a GEMM.
+       (let-values (((fused stats same?)
+                     (rd-check (morph+ (morph-matmul (morph-exp x) W) (morph-matmul (morph-sin x) W)))))
+         (test (sprintf "~A: siblings that read x are fused horizontally" dtype) 1 (mo-stat stats 'horizontal))
+         (test (sprintf "~A: into one seg-map with two outputs" dtype) '(2) (mo-outputs fused))
+         (test-assert (sprintf "~A: with the values of the unfused program" dtype) same?))
+       ;; Siblings read by the same later GEMM: the fused binding takes the
+       ;; later sibling's position.
+       (let-values (((fused stats same?)
+                     (rd-check (morph-matmul (morph-exp x) (morph-transpose (morph-sin x) '(1 0))))))
+         (test (sprintf "~A: siblings read by one GEMM are fused" dtype) 1 (mo-stat stats 'horizontal))
+         (test-assert (sprintf "~A: with the values of the unfused program" dtype) same?))
+       ;; b = x + matmul(exp(x), I) depends on a = exp(x) through the GEMM.
+       (let-values (((fused stats same?)
+                     (rd-check (let* ((a (morph-exp x))
+                                      (b (morph+ x (morph-matmul a (fk-arr '(1 0 0 0 1 0 0 0 1) '(3 3) dtype)))))
+                                 (morph+ (morph-matmul a W) (morph-matmul b W))))))
+         (test (sprintf "~A: a sibling reachable from the other is not fused" dtype) 0 (mo-stat stats 'horizontal))
+         (test-assert (sprintf "~A: the values are unchanged" dtype) same?))
+       ;; Five siblings: no fused binding has more than four outputs.
+       (let-values (((fused stats same?)
+                     (rd-check (fold (lambda (f acc) (morph+ acc (morph-matmul (f x) W)))
+                                     (morph-matmul (morph-exp x) W)
+                                     (list morph-sin morph-cos morph-negate morph-abs)))))
+         (test-assert (sprintf "~A: at most four outputs per fused binding" dtype)
+           (and (pair? (mo-outputs fused)) (every (lambda (k) (<= k 4)) (mo-outputs fused))))
+         (test-assert (sprintf "~A: with the values of the unfused program" dtype) same?))))
+   '(f32 f64))
+  ;; Siblings of different dtypes: an f64 cast of x and exp(x).
+  (let* ((x (fk-arr mo-x '(2 3) 'f32))
+         (W64 (fk-arr mo-w '(3 2) 'f64))
+         (W32 (fk-arr mo-w '(3 2) 'f32)))
+    (let-values (((fused stats same?)
+                  (rd-check (morph+ (morph-cast (morph-matmul (morph-cast x 'f64) W64) 'f32)
+                                    (morph-matmul (morph-exp x) W32)))))
+      (test "siblings of different dtypes are fused" 1 (mo-stat stats 'horizontal))
+      (test-assert "with the values of the unfused program" same?))))
+
+;; The forward program of negate(exp(x)) with the exp binding replaced by a
+;; fused binding that also computes sin(x), under the name extra; when
+;; extra-output? is true, extra is also a program output.
+(define (mo-dead-prog extra-output?)
+  (let* ((x    (fk-arr mo-x '(2 3) 'f64))
+         (prog (fk-prog (morph-negate (morph-exp x))))
+         (e    (car (filter (lambda (b) (eq? (ssa-binding-op b) 'exp)) (ssa-program-bindings prog))))
+         (f    (make-fused-ssa-binding (ssa-binding-inputs e) #(2 3) (list (identity-index-map 2))
+                                       (list (list (ssa-binding-name e) #(2 3) 'f64 '(exp (in 0)))
+                                             (list 'extra #(2 3) 'f64 '(sin (in 0))))
+                                       (list (ssa-binding-name e)))))
+    (make-ssa-program (ssa-program-constants prog) (ssa-program-morph-to-val prog)
+                      (map (lambda (b) (if (eq? b e) f b)) (ssa-program-bindings prog))
+                      (if extra-output?
+                          (append (ssa-program-outputs prog) (list (binding-ref 'extra)))
+                          (ssa-program-outputs prog))
+                      0 #f #f #f #f)))
+
+(test-group "dead-output removal"
+  (let* ((prog  (mo-dead-prog #f))
+         (fused (parameterize ((segop-fusion 'all)) (ssa-segop-fusion-pass prog)))
+         (stats (ssa-fusion-pass-stats)))
+    (test "an output without uses is removed" 1 (mo-stat stats 'dead-outputs))
+    (test "the binding left with one output then fuses with its reader" 1 (length (ssa-program-bindings fused)))
+    (test "the values are unchanged" (sf-run prog) (sf-run fused)))
+  (let* ((prog  (mo-dead-prog #t))
+         (fused (parameterize ((segop-fusion 'all)) (ssa-segop-fusion-pass prog)))
+         (stats (ssa-fusion-pass-stats)))
+    (test "an output that is a program output is kept" 0 (mo-stat stats 'dead-outputs))
+    (test "both program outputs are computed" (sf-run prog) (sf-run fused)))
+  (let ((fused (ssa-segop-fusion-pass (fk-prog (morph+ (morph-matmul (morph-exp (fk-arr mo-x '(2 3) 'f32))
+                                                                     (fk-arr mo-w '(3 2) 'f32))
+                                                       (morph-matmul (morph-sin (fk-arr mo-x '(2 3) 'f32))
+                                                                     (fk-arr mo-w '(3 2) 'f32)))))))
+    (test "the default policy makes no horizontal fusion without a native backend" 0
+      (mo-stat (ssa-fusion-pass-stats) 'horizontal))))
 
 (test-end)
