@@ -385,10 +385,9 @@ An activation backend holds fused kernels through
 often in backward passes, such as `g * relu-deriv(x)`, and for Llama's
 `b * silu(a)`. An activation backend can also hold *column-sum kernels*
 (`activation-backend-add-colsum-kernel!`), which compute a body and sum it
-over the rows in one pass. The single-threaded crunch backend holds one,
-for the bias gradient of a relu layer. `replay-plan-stats` reports under
-`fused` how many fused bindings run as a native kernel and how many on the
-host.
+over the rows in one pass; the crunch backends currently hold none.
+`replay-plan-stats` reports under `fused` how many fused bindings run as a
+native kernel and how many on the host.
 `ssa-fusion-pass-stats` lists the fused bodies the pass formed
 (`candidates`, and `red-candidates` for reductions) and counts the pairs it
 left unfused, by reason (`missed`). Run under `'all`, it shows which fused
@@ -444,6 +443,14 @@ identities, broadcasts, transposes, slices, reshapes (with `floordiv` and
 `mod`) and padded reads (with a guard and a fill value). Because bodies and
 maps are data, a code generator can read them, which the Scheme functions
 inside the older instructions did not allow.
+
+The segop abstractions are inspired by and follow the design of the
+Futhark compiler [1, 2]. Futhark's internal representation expresses
+parallel code as segmented operations (`SegMap`, `SegRed` and others)
+over an iteration space, and `seg-map` and `seg-red` take their names
+and structure from them. The fusion of a map into the reduction that
+reads it, with the map's value kept as an extra output when other code
+needs it, follows Futhark's *redomap* construct [3].
 
 The ops a body can name come from the *scalar-op table*
 (`scalar-ops-table.scm`, module `array-morphisms-scalar-ops-table`). Each
@@ -605,5 +612,24 @@ LGPL-3
 ## Acknowledgments
 
 - Inspired by the Mathematics of Arrays (MoA) formalism by Lenore Mullin
+- Segmented operations and map-reduce fusion modeled on the Futhark
+  compiler (https://futhark-lang.org), by Troels Henriksen, Cosmin Oancea
+  and colleagues at DIKU, University of Copenhagen
 - Category-theoretic foundation from functional programming research
-- Memory reuse patterns from stream fusion and buffer optimization literature
+- Memory reuse patterns from stream fusion and buffer optimization literature.
+
+## References
+
+1. T. Henriksen, N. G. Serup, M. Elsman, F. Henglein and C. E. Oancea.
+   Futhark: Purely Functional GPU-Programming with Nested Parallelism and
+   In-Place Array Updates. In *Proceedings of the 38th ACM SIGPLAN
+   Conference on Programming Language Design and Implementation (PLDI)*,
+   2017.
+2. T. Henriksen, F. Thorøe, M. Elsman and C. E. Oancea. Incremental
+   Flattening for Nested Data Parallelism. In *Proceedings of the 24th ACM
+   SIGPLAN Symposium on Principles and Practice of Parallel Programming
+   (PPoPP)*, 2019.
+3. T. Henriksen, K. F. Larsen and C. E. Oancea. Design and GPGPU
+   Performance of Futhark's Redomap Construct. In *Proceedings of the 3rd
+   ACM SIGPLAN International Workshop on Libraries, Languages, and
+   Compilers for Array Programming (ARRAY)*, 2016.
