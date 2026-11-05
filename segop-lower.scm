@@ -71,21 +71,12 @@
           ((and (eq? op 'cast) (= n 1)
                 (eq? combiner (cast-combiner (ssa-binding-dtype b))))
            '(in 0))
-          ((and (not (assq 'fused? meta))
-                (symbol? op)
+          ((and (symbol? op)
                 (scalar-op? op)
                 (= (scalar-op-arity op) n)
                 (eq? combiner (scalar-op-combiner op)))
            (cons op (input-body-args n)))
           (else `(opaque ,combiner ,@(input-body-args n))))))
-
-(define (compose-binding-bodies p-body p-nargs c-body)
-  "The body of a producer fused into its consumer: the consumer's (in 0) is
-   replaced by the producer's body, and its other inputs follow the
-   producer's, as in compose-flat-combiners."
-  (scalar-expr-substitute-inputs
-   c-body
-   (lambda (k) (if (= k 0) p-body `(in ,(+ p-nargs k -1))))))
 
 ;; The op of a body that applies one op directly to its inputs (in 0) ...
 ;; (in (n - 1)), or #f.

@@ -828,89 +828,13 @@
 
 
 ;;;; ============================================================
-;;;; Group E2: compose-flat-combiners and SSA element-wise fusion pass
+;;;; Group E2: gradients through fused bindings
 ;;;; ============================================================
 
-(test-group "E2: compose-flat-combiners"
+(test-group "E2: gradients through fused bindings"
 
-  (test "unary+unary: abs then negate"
-    -3.0
-    (let ((fused (compose-flat-combiners abs 1 - 0)))
-      (fused -3.0)))
-
-  (test "unary+unary: negate then abs"
-    3.0
-    (let ((fused (compose-flat-combiners - 1 abs 0)))
-      (fused -3.0)))
-
-  (test "binary+unary: add then relu passes negative to zero"
-    0.0
-    (let ((fused (compose-flat-combiners + 2 (lambda (x) (max 0.0 x)) 0)))
-      (fused 1.0 -3.0)))
-
-  (test "binary+unary: add then relu passes positive through"
-    1.5
-    (let ((fused (compose-flat-combiners + 2 (lambda (x) (max 0.0 x)) 0)))
-      (fused 1.0 0.5)))
-
-  (test "unary chain of 3 composes correctly"
-    3.0
-    ;; abs(-3) = 3; negate(3) = -3; abs(-3) = 3
-    (let* ((f01  (compose-flat-combiners abs 1 (lambda (x) (- x)) 0))
-           (f012 (compose-flat-combiners f01 1 abs 0)))
-      (f012 -3.0))))
-
-
-(test-group "E2: ssa-element-wise-fusion-pass"
-
-  (test "unary chain abs+negate: fusion reduces binding count by 1"
-    1
-    (let* ((a     (morph-from-list '(-3.0 2.0) #(2) 'f64))
-           (prog0 (morphism-to-ssa (am:make-var (morph-negate (morph-abs a)) #f)))
-           (n-before (length (ssa-program-bindings prog0)))
-           (prog1 (ssa-element-wise-fusion-pass prog0))
-           (n-after  (length (ssa-program-bindings prog1))))
-      (- n-before n-after)))
-
-  (test "fused abs+negate produces correct numerics"
-    '(-3 -2)
-    ;; abs(-3)=3 -> negate(3)=-3; abs(2)=2 -> negate(2)=-2
-    (let* ((a     (morph-from-list '(-3.0 2.0) #(2) 'f64))
-           (prog0 (morphism-to-ssa (am:make-var (morph-negate (morph-abs a)) #f)))
-           (prog1 (ssa-element-wise-fusion-pass prog0))
-           (res   (ssa-realize prog1)))
-      (map inexact->exact (map exact->inexact (concrete->list (car res))))))
-
-  (test "multi-consumer binding is not fused (b has 2 consumers)"
-    3
-    ;; b = abs(a); c = negate(b); d = b + c  => b has use-count=2 -> no fusion of b into c
-    (let* ((a     (morph-from-list '(1.0 2.0) #(2) 'f64))
-           (b     (morph-abs a))
-           (c     (morph-negate b))
-           (d     (morph+ b c))
-           (prog0 (morphism-to-ssa (am:make-var d #f)))
-           (n-before (length (ssa-program-bindings prog0)))
-           (prog1 (ssa-element-wise-fusion-pass prog0))
-           (n-after  (length (ssa-program-bindings prog1))))
-      n-after))
-
-  (test "reduction is not fused (non-elementwise shape change)"
-    2
-    ;; abs on [4] -> reduce-sum to scalar: abs has 1 consumer but reduce is not elementwise
-    (let* ((a     (morph-from-list '(1.0 -2.0 3.0 -4.0) #(4) 'f64))
-           (b     (morph-abs a))
-           (c     (morph-reduce 'sum b '(0) #f))
-           (prog0 (morphism-to-ssa (am:make-var c #f)))
-           (prog1 (ssa-element-wise-fusion-pass prog0)))
-      (length (ssa-program-bindings prog1))))
-
-  (test "ssa-vjp fusion: negate+mul VJP bindings fuse when eligible"
+  (test "the gradient of sum(negate(x)) is -1 everywhere"
     #t
-    ;; loss = sum(negate(x)) for leaf x
-    ;; Forward: negate binding (1)
-    ;; Backward: negate-of-g (dx=-g), no reduction needed since x same shape as loss
-    ;; With E2, backward negate-of-g may fuse with the add(loss,zero) trailing binding
-    ;; The key invariant: gradient values must be correct after fusion
     (let* ((xs   '(1.0 2.0 3.0))
            (x-m  (morph-from-list xs #(3) 'f64))
            (xv   (am:make-var x-m #t))
@@ -1488,21 +1412,19 @@
       (and (eq? (car body) 'opaque) (eq? (cadr body) -))))
   (test-assert "a map binding gets an opaque body"
     (eq? 'opaque (car (binding-scalar-body (make-ssa-binding* 'map 1 '()) abs))))
-  (test "a fused binding keeps its composed body" '(mul (exp (in 0)) (in 1))
-    (binding-scalar-body (make-ssa-binding* 'mul 2 '((body . (mul (exp (in 0)) (in 1)))
-                                                      (fused? . #t)))
+  (test "a binding with a body in its meta keeps that body" '(mul (exp (in 0)) (in 1))
+    (binding-scalar-body (make-ssa-binding* 'mul 2 '((body . (mul (exp (in 0)) (in 1)))))
                          *)))
 
 
 ;;;; ============================================================
 ;;;; Fusion legality and gradient dtypes
 ;;;;
-;;;; The element-wise fusion pass reads every input of a fused binding at
-;;;; the output's index, so it may fuse only when all those inputs have the
-;;;; output's shape, when producer and consumer share a dtype, and when the
-;;;; input counts are ones compose-flat-combiners supports.  Gradients of
-;;;; parameters have the parameter's dtype, through a cast when the
-;;;; backward pass computes them in another dtype.
+;;;; Fused bindings must give the values of the unfused program when
+;;;; inputs broadcast, when producer and consumer differ in dtype, and when
+;;;; a fused body reads three or more inputs.  Gradients of parameters have
+;;;; the parameter's dtype, through a cast when the backward pass computes
+;;;; them in another dtype.
 ;;;; ============================================================
 
 ;; Loss and gradients of make-loss computed by the eager autodiff of
@@ -1525,7 +1447,7 @@
               a b)))
 
 (define (fused-bindings joint)
-  (filter (lambda (b) (or (eq? (ssa-binding-op b) 'fused) (assq 'fused? (ssa-binding-meta b))))
+  (filter (lambda (b) (eq? (ssa-binding-op b) 'fused))
           (ssa-program-bindings joint)))
 
 ;; True when every input of every fused binding of joint has the binding's
@@ -1584,17 +1506,6 @@
       (test-assert "trace agrees with the eager autodiff"
         (results-close? trace (eager-results make) 1e-12))
       (test-assert "replay gives the same values as the trace" (equal? trace replay))))
-
-  (let* ((mk (lambda (name op inputs dtype)
-               (make-ssa-binding name op inputs #(2 3) dtype `((combiner . ,+)))))
-         (p   (mk 'bid-p 'add (list (const-ref* 'c1) (const-ref* 'c2)) 'f32))
-         (c32 (mk 'bid-c 'add (list (binding-ref* 'bid-p) (const-ref* 'c3)) 'f32))
-         (c64 (mk 'bid-c 'add (list (binding-ref* 'bid-p) (const-ref* 'c3)) 'f64))
-         (p3  (mk 'bid-p 'add (list (const-ref* 'c1) (const-ref* 'c2) (const-ref* 'c4)) 'f32))
-         (counts (let ((h (make-hash-table))) (hash-table-set! h 'bid-p 1) h)))
-    (test-assert "same dtype, two inputs: eligible" (ssa-fusion-eligible? p c32 counts))
-    (test-assert "different dtypes: not eligible" (not (ssa-fusion-eligible? p c64 counts)))
-    (test-assert "a three-input producer: not eligible" (not (ssa-fusion-eligible? p3 c32 counts))))
 
   ;; loss = mean(sigmoid(x) * (x + y)) with x f32 and y f64.
   (let* ((xs '(-0.7 -0.4 -0.1 0.2 0.5 0.8))
@@ -2826,7 +2737,7 @@
     (test "a matmul operand is not fused" '() (sf-fused (ssa-segop-fusion-pass prog))))
 
   ;; e = exp(x) is consumed by a product after a matmul that does not read
-  ;; it: the old pass, which fuses only adjacent bindings, leaves it.
+  ;; it: the two need not be adjacent to fuse.
   (let* ((x (sf-var sf-x '(2 3)))
          (z (sf-var '(1.0 -1.0 0.5 0.25 2.0 -0.5) '(2 3)))
          (W (sf-var '(1.0 0.0 0.5 0.0 1.0 -1.0 2.0 0.5 1.0) '(3 3)))
@@ -2834,9 +2745,6 @@
                                                      (morph-matmul (am:var-value z) (am:var-value W)))
                                              #f)))
          (fused (ssa-segop-fusion-pass prog)))
-    (test "the old pass does not fuse across the matmul" '()
-      (filter (lambda (b) (assq 'fused? (ssa-binding-meta b)))
-              (ssa-program-bindings (ssa-element-wise-fusion-pass prog))))
     (test "exp(x) is fused into the product past the matmul" 1 (length (sf-fused fused)))
     (let-values (((r checks mismatches) (with-segop-checker (lambda () (sf-run fused)))))
       (test-assert "non-adjacent fusion keeps the values" (equal? (sf-run prog) r))

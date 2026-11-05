@@ -64,13 +64,9 @@
    ri-im2col ri-col2im
    ri-conv-fwd ri-conv-bwd-data ri-conv-bwd-weights
 
-   ;; Fusion pass
-   ssa-compute-use-counts
-   ssa-fusion-eligible?
-   ssa-element-wise-fusion-pass
-   segop-fusion
-
    ;; Segop fusion
+   ssa-compute-use-counts
+   segop-fusion
    ssa-segop-fusion-pass
    ssa-fusion-graph
    segop-fusion-max-rounds
@@ -355,12 +351,10 @@
 
 
 ;;; ============================================================
-;;; SSA Fusion Helpers (element-wise fusion pass)
+;;; Binding helpers
 ;;;
-;;; Implements MoA's psi-composition theorem at the SSA IR level:
-;;;   Psi(f, Psi(g, A)) = Psi(f o g, A)
-;;; Two adjacent element-wise bindings with use-count=1 are collapsed
-;;; into a single binding whose combiner is the composition of theirs.
+;;; Queries on element-wise bindings and their uses, for the segop
+;;; fusion pass and the replay compiler.
 ;;; ============================================================
 
 (define (ssa-binding-combiner b)
@@ -411,140 +405,13 @@
         (let ((ip (assq 'index-fn meta)))
           (and ip (compute-index-fn? (cdr ip)))))))
 
-(define (ssa-fusion-eligible? producer consumer use-counts)
-  "True when producer and consumer can be fused by MoA psi-composition.
-   Requires: use-count(producer)=1, consumer's first input is producer's output,
-   same shape and dtype, both element-wise, both have extractable combiners,
-   and input counts that compose-flat-combiners supports (a producer of one
-   or two inputs, a consumer with at most one input besides the producer).
-   The dtype condition keeps the fused result equal to the unfused one,
-   which rounds the producer's value to its dtype before the consumer reads
-   it."
-  (let* ((p-name  (ssa-binding-name producer))
-         (p-count (hash-table-ref/default use-counts p-name 0))
-         (c-in0   (and (pair? (ssa-binding-inputs consumer))
-                       (car (ssa-binding-inputs consumer)))))
-    (and (= p-count 1)
-         (cases ssa-value c-in0
-           (binding-ref (bid) (eq? bid p-name))
-           (else #f))
-         (equal? (ssa-binding-shape producer) (ssa-binding-shape consumer))
-         (eq? (ssa-binding-dtype producer) (ssa-binding-dtype consumer))
-         (<= 1 (length (ssa-binding-inputs producer)) 2)
-         (<= (length (ssa-binding-inputs consumer)) 2)
-         (ssa-binding-elementwise? producer)
-         (ssa-binding-elementwise? consumer)
-         (ssa-binding-has-combiner? producer)
-         (ssa-binding-has-combiner? consumer))))
-
-;; The fusion policy of ssa-vjp: #t (the default) fuses the bindings whose
+;; The fusion policy of ssa-vjp and ssa-realize/ctx: #t (the default) fuses the bindings whose
 ;; fusion is expected to be faster, all fuses every pair that may legally
 ;; be fused, and #f runs no fusion pass.  Fusion does not change results,
 ;; so a program run with all and with #f gives the same values, which
 ;; tests use as an oracle.
 (define segop-fusion
   (make-parameter #t (lambda (x) (cond ((eq? x 'all) 'all) (x #t) (else #f)))))
-
-(define (fuse-two-ssa-bindings producer consumer)
-  "Fuse producer into consumer by composing their scalar bodies.  The fused
-   binding's combiner is the compiled composed body, which rounds the
-   producer's value to the producer's dtype, so the result is the one the
-   two bindings give.  The fused binding inherits consumer's name
-   (preserving downstream refs).  Producer's intermediate buffer is
-   eliminated."
-  (let* ((p-inputs (ssa-binding-inputs producer))
-         (c-inputs (ssa-binding-inputs consumer))
-         (c-other  (cdr c-inputs))
-         (fused-inputs (append p-inputs c-other))
-         (p-comb  (ssa-binding-combiner producer))
-         (c-comb  (ssa-binding-combiner consumer))
-         (p-nargs (length p-inputs))
-         ;; The producer's value is rounded to its dtype, as storing it
-         ;; would round it, so that the fused binding computes what the
-         ;; two bindings computed.  Storing a flonum as f64 changes nothing.
-         (p-dtype (ssa-binding-dtype producer))
-         (p-body  (let ((b (binding-scalar-body producer p-comb)))
-                    (if (eq? p-dtype 'f64) b `(cast ,p-dtype ,b))))
-         (fused-body (compose-binding-bodies p-body p-nargs
-                                             (binding-scalar-body consumer c-comb)))
-         (fused-comb (scalar-expr->procedure fused-body (length fused-inputs)))
-         (base-meta (filter (lambda (kv)
-                                 (not (memq (car kv) '(combiner index-fn fused? body))))
-                               (ssa-binding-meta consumer)))
-         (fused-meta (cons `(combiner . ,fused-comb)
-                           (cons `(body . ,fused-body)
-                                 (cons `(fused? . #t) base-meta)))))
-    (make-ssa-binding (ssa-binding-name consumer)
-                      (ssa-binding-op consumer)
-                      fused-inputs
-                      (ssa-binding-shape consumer)
-                      (ssa-binding-dtype consumer)
-                      fused-meta)))
-
-(define (ssa-element-wise-fusion-pass prog)
-  "Apply MoA psi-composition to eligible adjacent binding pairs.
-   Greedy left-to-right scan: whenever a producer P has use-count=1 and
-   its only consumer C immediately follows, fuse them into one binding F.
-   Chains of length > 2 are handled by re-presenting F as the new producer.
-   Safety constraint: fusion is only applied when all inputs of the producer
-   and all other inputs of the consumer have the shape of the output, since
-   the fused binding reads every input through an identity index function."
-  (let* ((bindings    (ssa-program-bindings prog))
-         (use-counts  (ssa-compute-use-counts bindings))
-         ;; Shape lookup: id-sym -> shape vector (bindings + constants)
-         (shape-of-eb (make-env-builder))
-         ;; Eliminated-binding membership set: id-sym -> #t
-         (elim-eb     (make-env-builder)))
-    (for-each (lambda (b)
-                (env-builder-extend! shape-of-eb
-                                     (ssa-binding-name b) (ssa-binding-shape b)))
-              bindings)
-    (hash-table-walk (ssa-program-constants prog)
-      (lambda (k v) (env-builder-extend! shape-of-eb k (morph-shape v))))
-
-    ;; True when every input in vals has the shape shape.
-    (define (all-of-shape? vals shape)
-      (every (lambda (inp)
-               (let ((id (cases ssa-value inp
-                           (binding-ref (bid) bid)
-                           (const-ref   (cid) cid))))
-                 (equal? (env-builder-lookup shape-of-eb id) shape)))
-             vals))
-
-    ;; True when all inputs of b have the same shape as b's output.
-    (define (flat-producer? b)
-      (all-of-shape? (ssa-binding-inputs b) (ssa-binding-shape b)))
-
-    ;; True when the inputs of consumer c other than the producer's output
-    ;; have the shape of c's output.
-    (define (flat-consumer? c)
-      (all-of-shape? (cdr (ssa-binding-inputs c)) (ssa-binding-shape c)))
-
-    (let loop ((bs bindings) (result '()))
-      (cond
-        ((null? bs)
-         (make-ssa-program
-          (ssa-program-constants prog)
-          (ssa-program-morph-to-val prog)
-          (reverse result)
-          (ssa-program-outputs prog)
-          (ssa-program-n-params prog)
-          #f #f #f))
-        ((env-builder-lookup elim-eb (ssa-binding-name (car bs)))
-         (loop (cdr bs) result))
-        ((and (pair? (cdr bs))
-              (not (env-builder-lookup elim-eb (ssa-binding-name (cadr bs))))
-              (ssa-fusion-eligible? (car bs) (cadr bs) use-counts)
-              (flat-producer? (car bs))
-              (flat-consumer? (cadr bs)))
-         (let ((fused (fuse-two-ssa-bindings (car bs) (cadr bs))))
-           (env-builder-extend! elim-eb (ssa-binding-name (car bs)) #t)
-           ;; Update shape-of for the fused binding (inherits consumer's name+shape)
-           (env-builder-extend! shape-of-eb
-                                 (ssa-binding-name fused) (ssa-binding-shape fused))
-           (loop (cons fused (cddr bs)) result)))
-        (else
-         (loop (cdr bs) (cons (car bs) result)))))))
 
 ;;; ============================================================
 ;;; Segop fusion
@@ -2428,16 +2295,6 @@
         (meta (ssa-binding-meta b))
         (shp  (ssa-binding-shape b)))
     (cond
-      ;; Fused binding: op is consumer's op, inputs are the fused (producer's) inputs.
-      ;; Dispatch on the stored combiner instead of rebuilding from op name.
-      ((and (assq 'fused? meta) (assq 'combiner meta))
-       (let* ((comb   (cdr (assq 'combiner meta)))
-              (shapes (map morph-shape inputs))
-              (ifn    (make-compute-index-fn
-                        (map (lambda (_) (lambda (idx) idx)) inputs)
-                        comb
-                        shapes)))
-         (morphism-expr (gensym 'morph-) op inputs ifn shp (ssa-binding-dtype b) '() -1)))
       ((equal? op '(reduce mean))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
@@ -2898,28 +2755,19 @@
                                     (error "compile-one-instruction: no trace-info for input"
                                            bid))))))
 
-    ;; Extract index-fn from meta when present (morphism-to-ssa bindings),
-    ;; or rebuild the morphism with trace-time inputs to obtain it
-    ;; (VJP-emitted bindings whose meta never carries 'index-fn).
-    ;; rebuild-morphism can return morphism-expr (most ops) or reduction-morphism.
+    ;; The index function of b: from its meta when morphism-to-ssa stored
+    ;; one, else from the morphism rebuilt over the trace-time inputs (the
+    ;; bindings ssa-vjp emits carry none).
     (define (get-index-fn)
       (let ((ip (assq 'index-fn meta)))
         (if ip
             (cdr ip)
-            ;; Fused binding: (fused? . #t) + (combiner . proc); build compute-index-fn directly.
-            (let ((fp (assq 'fused? meta)))
-              (if fp
-                  (let ((cp (assq 'combiner meta)))
-                    (make-compute-index-fn
-                     (map (lambda (_) (lambda (idx) idx)) (ssa-binding-inputs b))
-                     (cdr cp)
-                     (map (lambda (_) shape) (ssa-binding-inputs b))))
-                  (let ((trace-inputs (map trace-arr-of (ssa-binding-inputs b))))
-                    (cases array-morphism (rebuild-morphism b trace-inputs)
-                      (morphism-expr (_ _ _ ifn _ _ _ _) ifn)
-                      (reduction-morphism (_ _ _ _ ifn _ _ _) ifn)
-                      (else (error "compile-one-instruction: rebuild-morphism returned unexpected type"
-                                   op meta)))))))))
+            (let ((trace-inputs (map trace-arr-of (ssa-binding-inputs b))))
+              (cases array-morphism (rebuild-morphism b trace-inputs)
+                (morphism-expr (_ _ _ ifn _ _ _ _) ifn)
+                (reduction-morphism (_ _ _ _ ifn _ _ _) ifn)
+                (else (error "compile-one-instruction: rebuild-morphism returned unexpected type"
+                             op meta)))))))
 
     (cond
       ;; Fused binding: its template lowered against the trace-time inputs.
