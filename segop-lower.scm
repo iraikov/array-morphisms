@@ -3,7 +3,8 @@
 ;;; Lowering of SSA bindings to segops, and the two built-in segop
 ;;; backends that turn them into replay executors.  Included into the
 ;;; array-morphisms-ssa module.  Element-wise bindings become seg-maps,
-;;; reductions and matmuls seg-reds, affine views gathers; other index
+;;; reductions and matmuls seg-reds, affine views gathers, and the
+;;; convolution ops seg-maps and seg-reds with guarded maps; other index
 ;;; functions run on the host through a seg-lib.
 ;;;
 ;;; An element-wise binding becomes a seg-map over the binding's shape.
@@ -45,6 +46,7 @@
 ;;;
 ;;; The registry backend also takes the GEMMs (segop/gemm, gemm-strided and
 ;;; gemm-epilogue, see Contractions below) and the axis-0/1 reductions.
+;;; Both backends take the convolutions (see Convolutions below).
 ;;;
 ;;; The registry backend is a catalogue backend (see segop.scm): it runs
 ;;; natively the bodies for which the active activation backend holds a
@@ -1379,11 +1381,459 @@
     (else #f)))
 
 ;;; ------------------------------------------------------------
+;;; Convolutions
+;;; ------------------------------------------------------------
+;;;
+;;; The convolution ops are segops over spaces with one dimension per loop
+;;; index, so that each index map is a short expression:
+;;;
+;;;   im2col            seg-map over (N C KH KW OH OW):
+;;;                     col[n, fan, oh*OW + ow] = x[n, c, ih, iw], or 0
+;;;                     where (ih, iw) is outside the image
+;;;   col2im            seg-red over (N C H W ; KH KW):
+;;;                     x[n, c, h, w] = sum of col[n, fan, oh*OW + ow]
+;;;   conv-fwd          seg-red over (N OH OW CO ; C KH KW):
+;;;                     y[row, co] = b[co] + sum of x[n, c, ih, iw] * wt[fan, co]
+;;;   conv-bwd-weights  seg-red over (C KH KW CO ; N OH OW):
+;;;                     dwt[fan, co] = sum of g[row, co] * x[n, c, ih, iw]
+;;;   conv-bwd-data     seg-red over (N C H W ; KH KW CO):
+;;;                     dx[n, c, h, w] = sum of g[row, co] * wt[fan, co]
+;;;
+;;; with fan = c*KH*KW + kh*KW + kw, row = n*OH*OW + oh*OW + ow,
+;;; ih = oh*SH + kh - PH and iw = ow*SW + kw - PW.  The image x is
+;;; [N C H W] (layout nchw), [N H W C] (nhwc), or [C H W] (rank 3, nchw,
+;;; with N = 1).  col2im and conv-bwd-data gather: at (h, w) they read the
+;;; windows that cover it, those where h + PH - kh is a multiple of SH with
+;;; the quotient oh in [0, OH), and likewise for w; the other terms read 0.
+;;;
+;;; col2im adds its terms in increasing (kh, kw), as its executors do.  The
+;;; contractions have the unspecified order, since BLAS orders their sums.
+;;;
+;;; conv-select recognizes these segops by reading the parameters back from
+;;; their maps and rebuilding the maps from them, and runs them with the
+;;; convolution executors of realization.scm.  The contractions take a
+;;; scratch buffer for the image columns from the plan's conv-scratch (see
+;;; current-conv-scratch).
+
+(define-record conv-geom kind layout rank N C H W KH KW SH SW PH PW OH OW CO)
+
+(define (conv-out-size n k s p) (+ 1 (quotient (+ n (* 2 p) (- k)) s)))
+
+;; ih for output dimension o and kernel dimension k.
+(define (conv-window o k S P) `(+ (* ,S (dim ,o)) (+ (dim ,k) ,(- P))))
+
+;; h + PH - kh, for image dimension d and kernel dimension k.
+(define (conv-cover d k P) `(+ (dim ,d) (+ (* -1 (dim ,k)) ,P)))
+
+;; The output index oh whose window covers d at kernel index k, and the
+;; guard entries that hold when there is one.
+(define (conv-gather d k S P) `(floordiv ,(conv-cover d k P) ,S))
+(define (conv-gather-guard d k S P O)
+  (list (list `(mod ,(conv-cover d k P) ,S) 0 1)
+        (list (conv-gather d k S P) 0 O)))
+
+(define (conv-fan g c kh kw)
+  `(+ (* ,(* (conv-geom-KH g) (conv-geom-KW g)) ,c) (+ (* ,(conv-geom-KW g) ,kh) ,kw)))
+(define (conv-row g n oh ow)
+  `(+ (* ,(* (conv-geom-OH g) (conv-geom-OW g)) ,n) (+ (* ,(conv-geom-OW g) ,oh) ,ow)))
+(define (conv-col g n fan oh ow)
+  (let ((ohw `(+ (* ,(conv-geom-OW g) ,oh) ,ow)))
+    (if (= (conv-geom-rank g) 4) (vector n fan ohw) (vector fan ohw))))
+
+;; The image index of (n, c, h, w) in g's layout.
+(define (conv-image g n c h w)
+  (cond ((= (conv-geom-rank g) 3) (vector c h w))
+        ((eq? (conv-geom-layout g) 'nhwc) (vector n h w c))
+        (else (vector n c h w))))
+
+(define (conv-image-shape g)
+  (let ((N (conv-geom-N g)) (C (conv-geom-C g)) (H (conv-geom-H g)) (W (conv-geom-W g)))
+    (cond ((= (conv-geom-rank g) 3) (vector C H W))
+          ((eq? (conv-geom-layout g) 'nhwc) (vector N H W C))
+          (else (vector N C H W)))))
+
+;; The image read at output dimensions oh, ow and kernel dimensions kh, kw,
+;; with 0 outside the image.
+(define (conv-image-read g n c oh kh ow kw)
+  (let ((ih (conv-window oh kh (conv-geom-SH g) (conv-geom-PH g)))
+        (iw (conv-window ow kw (conv-geom-SW g) (conv-geom-PW g))))
+    (make-index-map (conv-image g `(dim ,n) `(dim ,c) ih iw)
+                    (list (list ih 0 (conv-geom-H g)) (list iw 0 (conv-geom-W g)))
+                    0.0 #f)))
+
+(define (dims-map . ds) (make-index-map (list->vector (map (lambda (d) `(dim ,d)) ds)) #f 0.0 #f))
+(define (exprs-map . es) (make-index-map (list->vector es) #f 0.0 #f))
+
+;; The structure of the segop of convolution g of the given dtype, as a
+;; list (space nred in-maps out-map body combine finalize).  For im2col,
+;; nred is 0 and combine #f.
+(define (conv-skeleton g dtype)
+  (let* ((N (conv-geom-N g)) (C (conv-geom-C g)) (H (conv-geom-H g)) (W (conv-geom-W g))
+         (KH (conv-geom-KH g)) (KW (conv-geom-KW g)) (SH (conv-geom-SH g)) (SW (conv-geom-SW g))
+         (PH (conv-geom-PH g)) (PW (conv-geom-PW g)) (OH (conv-geom-OH g)) (OW (conv-geom-OW g))
+         (CO (conv-geom-CO g))
+         (contraction (make-combine-spec 'add 0.0 dtype 'unspecified))
+         (image-out (make-index-map (conv-image g '(dim 0) '(dim 1) '(dim 2) '(dim 3)) #f 0.0 #f))
+         ;; The gather over image dimensions 2, 3 and kernel dimensions 4, 5.
+         (gh (conv-gather 2 4 SH PH)) (gw (conv-gather 3 5 SW PW))
+         (gather-guard (append (conv-gather-guard 2 4 SH PH OH) (conv-gather-guard 3 5 SW PW OW))))
+    (case (conv-geom-kind g)
+      ((im2col)
+       (list (vector N C KH KW OH OW) 0
+             (list (conv-image-read g 0 1 4 2 5 3))
+             (make-index-map (conv-col g '(dim 0) (conv-fan g '(dim 1) '(dim 2) '(dim 3))
+                                       '(dim 4) '(dim 5))
+                             #f 0.0 #f)
+             '(in 0) #f #f))
+      ((col2im)
+       (list (vector N C H W KH KW) 2
+             (list (make-index-map (conv-col g '(dim 0) (conv-fan g '(dim 1) '(dim 4) '(dim 5)) gh gw)
+                                   gather-guard 0.0 #f))
+             image-out
+             '(in 0) (make-combine-spec 'add 0.0 dtype) #f))
+      ((conv-fwd)
+       (list (vector N OH OW CO C KH KW) 3
+             (list (conv-image-read g 0 4 1 5 2 6)
+                   (exprs-map (conv-fan g '(dim 4) '(dim 5) '(dim 6)) '(dim 3))
+                   (dims-map 3))
+             (exprs-map (conv-row g '(dim 0) '(dim 1) '(dim 2)) '(dim 3))
+             '(mul (in 0) (in 1)) contraction '(add (reduced) (in 2))))
+      ((conv-bwd-weights)
+       (list (vector C KH KW CO N OH OW) 3
+             (list (exprs-map (conv-row g '(dim 4) '(dim 5) '(dim 6)) '(dim 3))
+                   (conv-image-read g 4 0 5 1 6 2))
+             (exprs-map (conv-fan g '(dim 0) '(dim 1) '(dim 2)) '(dim 3))
+             '(mul (in 0) (in 1)) contraction #f))
+      ((conv-bwd-data)
+       (list (vector N C H W KH KW CO) 3
+             (list (make-index-map (vector (conv-row g '(dim 0) gh gw) '(dim 6)) gather-guard 0.0 #f)
+                   (exprs-map (conv-fan g '(dim 1) '(dim 4) '(dim 5)) '(dim 6)))
+             image-out
+             '(mul (in 0) (in 1)) contraction #f))
+      (else (error "conv-skeleton: unknown kind" (conv-geom-kind g))))))
+
+;; The segop of convolution g over operands ins (operand records whose
+;; maps are replaced by the skeleton's) writing out.
+(define (conv-segop g dtype ins out)
+  (let* ((sk     (conv-skeleton g dtype))
+         (with-map (lambda (o m)
+                     (make-segop-operand (segop-operand-slot o) (segop-operand-dtype o)
+                                         (segop-operand-shape o) (segop-operand-strides o)
+                                         (segop-operand-offset o) m)))
+         (ins    (map with-map ins (list-ref sk 2)))
+         (out    (with-map out (list-ref sk 3))))
+    (if (= (list-ref sk 1) 0)
+        (make-seg-map (list-ref sk 0) ins (list out) (list (list-ref sk 4)))
+        (make-seg-red (list-ref sk 0) (list-ref sk 1) ins
+                      (list (make-red-result out (list-ref sk 4) (list-ref sk 5) (list-ref sk 6)))))))
+
+;; The geometry of a convolution binding with op op and meta meta, whose
+;; inputs had the trace-time shapes in-shapes and whose output has shape
+;; out-shape.
+(define (conv-binding-geom op meta in-shapes out-shape)
+  (let* ((pair  (lambda (key) (cdr (assq key meta))))
+         (ks (pair 'kernel-size)) (st (pair 'stride)) (pd (pair 'padding))
+         (so (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
+         (layout (let ((p (assq 'layout meta))) (if (and p (eq? (cdr p) 'nhwc)) 'nhwc 'nchw)))
+         (kind (case op
+                 ((im2col) 'im2col) ((col2im) 'col2im) ((conv2d-fwd) 'conv-fwd)
+                 ((conv2d-bwd-data) 'conv-bwd-data) ((conv2d-bwd-weights) 'conv-bwd-weights)))
+         (image (case kind
+                  ((im2col conv-fwd) (car in-shapes))
+                  ((conv-bwd-weights) (cadr in-shapes))
+                  (else out-shape)))
+         (rank (vector-length image))
+         (nhwc? (and (= rank 4) (eq? layout 'nhwc)))
+         (dim (lambda (nchw4 nhwc4 nchw3)
+                (vector-ref image (cond (nhwc? nhwc4) ((= rank 4) nchw4) (else nchw3)))))
+         (H (dim 2 1 1)) (W (dim 3 2 2))
+         (KH (car ks)) (KW (cadr ks)) (SH (car st)) (SW (cadr st)) (PH (car pd)) (PW (cadr pd))
+         (CO (case kind
+               ((conv-fwd) (vector-ref out-shape 1))
+               ((conv-bwd-data conv-bwd-weights) (vector-ref (car in-shapes) 1))
+               (else 0))))
+    (make-conv-geom kind (if nhwc? 'nhwc 'nchw) rank
+                    (if (= rank 4) (vector-ref image 0) 1) (dim 1 3 0) H W KH KW SH SW PH PW
+                    (if so (car so) (conv-out-size H KH SH PH))
+                    (if so (cadr so) (conv-out-size W KW SW PW))
+                    CO)))
+
+(define (lower-conv-binding op meta in-traces in-refs pool-idx shape strides dtype)
+  "The segop of a convolution binding (im2col, col2im, conv2d-fwd,
+   conv2d-bwd-data or conv2d-bwd-weights) with meta meta, whose inputs had
+   the trace-time arrays in-traces and are found at in-refs, writing pool
+   slot pool-idx of the given shape, strides and dtype."
+  (let* ((operand (lambda (tr ref)
+                    (cases array-morphism tr
+                      (concrete-array (_ s st off dt _ _)
+                        (make-segop-operand ref dt s st off seg-lib-operand-map))
+                      (else (error "lower-conv-binding: input not concrete" op tr)))))
+         (ins (map operand in-traces in-refs))
+         (g   (conv-binding-geom op meta (map segop-operand-shape ins) shape)))
+    (conv-segop g dtype ins (make-segop-operand pool-idx dtype shape strides 0 seg-lib-operand-map))))
+
+;; The parameters of window expression e, (S o k P) for oh*S + kh - P
+;; with o and k the dimensions of oh and kh, or #f.
+(define (parse-conv-window e)
+  (match e
+    (('+ ('* (? integer? S) ('dim o)) ('+ ('dim k) (? integer? negP))) (list S o k (- negP)))
+    (_ #f)))
+
+;; The parameters (S P O) of a gather guard entry pair, or #f.
+(define (parse-conv-gather-guard g1 g2)
+  (match (list g1 g2)
+    (((('mod ('+ ('dim _) ('+ ('* -1 ('dim _)) (? integer? P))) (? integer? S)) 0 1)
+      (_ 0 (? integer? O)))
+     (list S P O))
+    (_ #f)))
+
+;; The geometry of a convolution of kind kind that segop sg could be, read
+;; from its maps and shapes, or #f.  conv-segop-geom checks that sg is that
+;; convolution.
+(define (read-conv-geom kind sg)
+  (let* ((space (segop-space sg))
+         (ins   (segop-inputs sg))
+         (out   (car (segop-outputs sg)))
+         (ext   (lambda (d) (vector-ref space d)))
+         (image-geom
+          ;; From an image operand read through windows.
+          (lambda (o CO)
+            (let* ((shape (segop-operand-shape o))
+                   (rank  (vector-length shape))
+                   (exprs (index-map-exprs (segop-operand-map o)))
+                   (try   (lambda (layout ih iw)
+                            (let ((h (parse-conv-window (vector-ref exprs ih)))
+                                  (w (parse-conv-window (vector-ref exprs iw))))
+                              (and h w
+                                   (let* ((nhwc? (eq? layout 'nhwc))
+                                          (dim (lambda (nchw4 nhwc4 nchw3)
+                                                 (vector-ref shape (cond (nhwc? nhwc4) ((= rank 4) nchw4)
+                                                                         (else nchw3))))))
+                                     (make-conv-geom kind layout rank
+                                                     (if (= rank 4) (vector-ref shape 0) 1)
+                                                     (dim 1 3 0) (dim 2 1 1) (dim 3 2 2)
+                                                     (ext (cadr (cdr h))) (ext (cadr (cdr w)))
+                                                     (car h) (car w) (cadddr h) (cadddr w)
+                                                     (ext (cadr h)) (ext (cadr w)) CO)))))))
+              (and exprs (memv rank '(3 4))
+                   (if (= rank 3)
+                       (try 'nchw 1 2)
+                       (or (try 'nchw 2 3) (try 'nhwc 1 2)))))))
+         (gather-geom
+          ;; From a gather operand and the image output.
+          (lambda (o CO)
+            (let* ((guard (index-map-guard (segop-operand-map o)))
+                   (shape (segop-operand-shape out))
+                   (rank  (vector-length shape))
+                   (exprs (index-map-exprs (segop-operand-map out)))
+                   (layout (cond ((equal? exprs '#((dim 0) (dim 1) (dim 2) (dim 3))) 'nchw)
+                                 ((equal? exprs '#((dim 0) (dim 2) (dim 3) (dim 1))) 'nhwc)
+                                 ((equal? exprs '#((dim 1) (dim 2) (dim 3))) 'nchw)
+                                 (else #f)))
+                   (h (and guard (= (length guard) 4)
+                           (parse-conv-gather-guard (list-ref guard 0) (list-ref guard 1))))
+                   (w (and h (parse-conv-gather-guard (list-ref guard 2) (list-ref guard 3)))))
+              (and layout w
+                   (make-conv-geom kind layout rank (ext 0) (ext 1) (ext 2) (ext 3) (ext 4) (ext 5)
+                                   (car h) (car w) (cadr h) (cadr w) (caddr h) (caddr w) CO))))))
+    (and (= (vector-length space) (if (memq kind '(im2col col2im)) 6 7))
+         (case kind
+           ((im2col) (and (= (length ins) 1) (image-geom (car ins) 0)))
+           ((conv-fwd) (and (= (length ins) 3) (image-geom (car ins) (ext 3))))
+           ((conv-bwd-weights) (and (= (length ins) 2) (image-geom (cadr ins) (ext 3))))
+           ((col2im) (and (= (length ins) 1) (gather-geom (car ins) 0)))
+           ((conv-bwd-data) (and (= (length ins) 2) (gather-geom (car ins) (ext 6))))
+           (else #f)))))
+
+(define (index-map-equal? a b)
+  (and (not (index-map-proc a)) (not (index-map-proc b))
+       (equal? (index-map-exprs a) (index-map-exprs b))
+       (equal? (index-map-guard a) (index-map-guard b))
+       (equal? (index-map-fill a) (index-map-fill b))))
+
+(define (combine-spec-equal? a b)
+  (or (and (not a) (not b))
+      (and a b
+           (eq? (combine-spec-op a) (combine-spec-op b))
+           (eqv? (combine-spec-neutral a) (combine-spec-neutral b))
+           (eq? (combine-spec-acc-dtype a) (combine-spec-acc-dtype b))
+           (eq? (combine-spec-order a) (combine-spec-order b)))))
+
+;; True when sg is exactly the segop conv-segop builds for geometry g.
+(define (conv-segop-matches? sg g)
+  (let* ((out   (car (segop-outputs sg)))
+         (dtype (segop-operand-dtype out))
+         (sk    (conv-skeleton g dtype)))
+    (and (memq dtype '(f32 f64))
+         (every (lambda (o) (eq? (segop-operand-dtype o) dtype)) (segop-inputs sg))
+         (equal? (segop-space sg) (list-ref sk 0))
+         (= (length (segop-inputs sg)) (length (list-ref sk 2)))
+         (every index-map-equal? (map segop-operand-map (segop-inputs sg)) (list-ref sk 2))
+         (index-map-equal? (segop-operand-map out) (list-ref sk 3))
+         (cases segop sg
+           (seg-map (space ins outs bodies fallback)
+             (and (= (list-ref sk 1) 0) (= (length outs) 1)
+                  (equal? bodies (list (list-ref sk 4)))))
+           (seg-red (space nred ins results map-outs fallback)
+             (and (= nred (list-ref sk 1)) (= (length results) 1) (null? map-outs)
+                  (let ((r (car results)))
+                    (and (equal? (red-result-body r) (list-ref sk 4))
+                         (combine-spec-equal? (red-result-combine r) (list-ref sk 5))
+                         (equal? (red-result-finalize r) (list-ref sk 6))))))
+           (else #f)))))
+
+(define (conv-segop-geom sg)
+  "The geometry of the convolution segop sg, or #f when sg is not one."
+  (let ((kinds (cases segop sg
+                 (seg-map (space ins outs bodies fallback) '(im2col))
+                 (seg-red (space nred ins results map-outs fallback)
+                   (case nred ((2) '(col2im)) ((3) '(conv-fwd conv-bwd-weights conv-bwd-data)) (else '())))
+                 (else '()))))
+    (any (lambda (kind)
+           (let ((g (read-conv-geom kind sg)))
+             (and g (conv-segop-matches? sg g) g)))
+         kinds)))
+
+;; The number of elements of the image-column scratch buffer that
+;; convolution g needs, 0 for im2col and col2im.
+(define (conv-scratch-size g)
+  (if (memq (conv-geom-kind g) '(conv-fwd conv-bwd-data conv-bwd-weights))
+      (* (conv-geom-N g) (conv-geom-OH g) (conv-geom-OW g)
+         (conv-geom-C g) (conv-geom-KH g) (conv-geom-KW g))
+      0))
+
+;; The key of the scratch buffer convolution g of dtype dtype may share.
+;; conv-bwd-data computes its whole buffer with a GEMM, so all of them
+;; share one.  conv-fwd and conv-bwd-weights write the image columns, and a
+;; backend kernel may leave the padding positions as they are, which must
+;; be 0; such a buffer is shared only by convolutions of the same
+;; geometry, which write the same positions.
+(define (conv-scratch-key g dtype)
+  (if (eq? (conv-geom-kind g) 'conv-bwd-data)
+      (list dtype 'gemm)
+      (list dtype 'columns (conv-geom-layout g) (conv-geom-rank g)
+            (conv-geom-N g) (conv-geom-C g) (conv-geom-H g) (conv-geom-W g)
+            (conv-geom-KH g) (conv-geom-KW g) (conv-geom-SH g) (conv-geom-SW g)
+            (conv-geom-PH g) (conv-geom-PW g) (conv-geom-OH g) (conv-geom-OW g))))
+
+;; Scratch buffers that the convolutions of a plan share (see
+;; conv-scratch-key).  The convolutions ask for a size while the plan is
+;; compiled; each buffer is allocated at the largest size asked for once
+;; the plan is compiled, and looked up each time a convolution runs.  The
+;; instructions of a plan run one at a time, so they can share a buffer.
+;; entries is a list of mutable vectors #(key dtype size buffer).
+(define-record conv-scratch entries)
+
+(define (new-conv-scratch) (make-conv-scratch '()))
+
+;; The scratch of the plan being compiled, or #f.  A convolution compiled
+;; outside a plan gets a buffer of its own.
+(define current-conv-scratch (make-parameter #f))
+
+;; The entry of s for convolution g of dtype dtype, now at least n
+;; elements long.
+(define (conv-scratch-request! s g dtype n)
+  (let* ((key (conv-scratch-key g dtype))
+         (e   (or (find (lambda (e) (equal? (vector-ref e 0) key)) (conv-scratch-entries s))
+                  (let ((e (vector key dtype 0 #f)))
+                    (conv-scratch-entries-set! s (cons e (conv-scratch-entries s)))
+                    e))))
+    (vector-set! e 2 (max n (vector-ref e 2)))
+    e))
+
+(define (conv-scratch-allocate! s)
+  (for-each (lambda (e) (vector-set! e 3 (allocate-typed-vector (vector-ref e 1) (vector-ref e 2))))
+            (conv-scratch-entries s)))
+
+(define (conv-scratch-bytes s)
+  (fold (lambda (e sum) (+ sum (* (if (eq? (vector-ref e 1) 'f32) 4 8) (vector-ref e 2))))
+        0 (conv-scratch-entries s)))
+
+;; A procedure of no arguments returning the scratch buffer of convolution
+;; g, of dtype dtype and at least n elements.
+(define (conv-scratch-getter g dtype n)
+  (let ((s (current-conv-scratch)))
+    (if s
+        (let ((e (conv-scratch-request! s g dtype n)))
+          (lambda () (vector-ref e 3)))
+        (let ((buf (allocate-typed-vector dtype n)))
+          (lambda () buf)))))
+
+(define (conv-select sg)
+  (let ((g (conv-segop-geom sg)))
+    (and g
+         (let* ((ins    (segop-inputs sg))
+                (refs   (map segop-operand-slot ins))
+                (out    (car (segop-outputs sg)))
+                (dtype  (segop-operand-dtype out))
+                (shape  (segop-operand-shape out))
+                (N (conv-geom-N g)) (C (conv-geom-C g)) (H (conv-geom-H g)) (W (conv-geom-W g))
+                (KH (conv-geom-KH g)) (KW (conv-geom-KW g)) (SH (conv-geom-SH g)) (SW (conv-geom-SW g))
+                (PH (conv-geom-PH g)) (PW (conv-geom-PW g)) (OH (conv-geom-OH g)) (OW (conv-geom-OW g))
+                (CO (conv-geom-CO g))
+                (nhwc? (eq? (conv-geom-layout g) 'nhwc))
+                (data  (lambda (deref k) (concrete-data/row-major (deref (list-ref refs k)))))
+                (blas? (lambda () (and (blas-enabled?) (blas-available?))))
+                (scratch (and (> (conv-scratch-size g) 0)
+                              (conv-scratch-getter g dtype (conv-scratch-size g)))))
+           (case (conv-geom-kind g)
+             ((im2col)
+              (let ((exec (cond ((= (conv-geom-rank g) 3)
+                                 (lambda (buf src)
+                                   (execute-im2col-unbatched buf src C H W KH KW SH SW PH PW OH OW dtype)))
+                                (nhwc? execute-im2col-nhwc-classic)
+                                (else execute-im2col-batched))))
+                (cons 'segop/im2col
+                      (if (= (conv-geom-rank g) 3)
+                          (lambda (deref buf) (exec buf (data deref 0)))
+                          (lambda (deref buf)
+                            (exec buf (data deref 0) N C H W KH KW SH SW PH PW OH OW dtype))))))
+             ((col2im)
+              (let ((exec (cond ((= (conv-geom-rank g) 3) execute-col2im-unbatched)
+                                (nhwc? execute-col2im-nhwc-classic)
+                                (else execute-col2im-batched)))
+                    (col-shape (segop-operand-shape (car ins))))
+                (cons 'segop/col2im
+                      (lambda (deref buf)
+                        (exec buf shape (data deref 0) col-shape KH KW SH SW PH PW dtype)))))
+             ((conv-fwd)
+              (let ((fast (if nhwc? execute-conv-fwd-nhwc-blas execute-conv-fwd-blas))
+                    (slow (if nhwc? execute-conv-fwd-nhwc execute-conv-fwd-nchw)))
+                (cons 'segop/conv-fwd
+                      (lambda (deref buf)
+                        (let ((src (data deref 0)) (wt (data deref 1)) (b (data deref 2)))
+                          (if (blas?)
+                              (fast buf src wt b N C H W KH KW SH SW PH PW OH OW CO dtype (scratch))
+                              (slow buf src wt b N C H W KH KW SH SW PH PW OH OW CO dtype)))))))
+             ((conv-bwd-data)
+              (let ((fast (if nhwc? execute-conv-bwd-data-nhwc-blas execute-conv-bwd-data-blas))
+                    (slow (if nhwc? execute-conv-bwd-data-nhwc execute-conv-bwd-data-nchw))
+                    (g-shape (segop-operand-shape (car ins))))
+                (cons 'segop/conv-bwd-data
+                      (lambda (deref buf)
+                        (let ((gd (data deref 0)) (wt (data deref 1)))
+                          (if (blas?)
+                              (fast buf shape gd g-shape wt N C H W KH KW SH SW PH PW OH OW CO dtype (scratch))
+                              (slow buf shape gd g-shape wt N C H W KH KW SH SW PH PW OH OW CO dtype)))))))
+             ((conv-bwd-weights)
+              (let ((fast (if nhwc? execute-conv-bwd-weights-nhwc-blas execute-conv-bwd-weights-blas))
+                    (slow (if nhwc? execute-conv-bwd-weights-nhwc execute-conv-bwd-weights-nchw))
+                    (g-shape (segop-operand-shape (car ins))))
+                (cons 'segop/conv-bwd-weights
+                      (lambda (deref buf)
+                        (let ((gd (data deref 0)) (src (data deref 1)))
+                          (if (blas?)
+                              (fast buf shape gd g-shape src N C H W KH KW SH SW PH PW OH OW CO dtype (scratch))
+                              (slow buf shape gd g-shape src N C H W KH KW SH SW PH PW OH OW CO dtype)))))))
+             (else #f))))))
+
+;;; ------------------------------------------------------------
 ;;; Backend registration and instruction compilation
 ;;; ------------------------------------------------------------
 
 (define (registry-select sg)
   (or (registry-gemm-select sg)
+      (conv-select sg)
       (registry-fused-select sg)
       (registry-colsum-select sg)
       (registry-elementwise-select sg)
@@ -1391,7 +1841,8 @@
       (registry-gather-select sg)))
 
 (define (scheme-select sg)
-  (or (scheme-elementwise-select sg)
+  (or (conv-select sg)
+      (scheme-elementwise-select sg)
       (select-standard-reduction sg '(1d axis0 axis1 general))
       (strided-select sg)
       (strided-multi-select sg)
@@ -1449,6 +1900,13 @@
   (segop-instruction
    (lower-matmul-binding A-tr B-tr A-ref B-ref pool-idx shape strides dtype epilogue)
    pool-idx shape strides dtype))
+
+(define (compile-conv-segop op meta in-traces in-refs pool-idx shape strides dtype)
+  "The ri-segop instruction of a convolution binding with op op and meta
+   meta (see lower-conv-binding)."
+  (or (segop-instruction (lower-conv-binding op meta in-traces in-refs pool-idx shape strides dtype)
+                         pool-idx shape strides dtype)
+      (error "compile-conv-segop: no backend accepts the convolution" op)))
 
 (define (compile-host-segop fn in-traces in-refs pool-idx shape strides dtype)
   "The ri-segop instruction evaluating index function fn on the host."

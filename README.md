@@ -451,7 +451,7 @@ represented as *segmented operations* (segops,
 There are three kinds: `seg-map` (element-wise maps, possibly with several
 outputs), `seg-red` (reductions, with a combine spec giving the operator,
 neutral element, accumulator precision and summation order) and `seg-lib`
-(named library operations such as convolutions). Index maps cover
+(named library operations, such as an index function run on the host). Index maps cover
 identities, broadcasts, transposes, slices, reshapes (with `floordiv` and
 `mod`) and padded reads (with a guard and a fill value). Because bodies and
 maps are data, a code generator can read them, which the Scheme functions
@@ -476,8 +476,8 @@ same formula.
 `segop-interpret` executes any `seg-map` or `seg-red` directly from its
 definition. It is slow and is meant for testing.
 
-When a replay plan is compiled, every binding except convolutions and
-zero-copy views is lowered to a segop:
+When a replay plan is compiled, every binding except zero-copy views is
+lowered to a segop:
 
 - element-wise ops become a `seg-map` whose inputs are read through
   broadcast maps and their own strides, so transposed views are read in
@@ -495,6 +495,13 @@ zero-copy views is lowered to a segop:
   (`(sigmoid (cast f32 (reduced)))`);
 - materialized views (such as a reshape of a transposed array) become a
   gather, a `seg-map` with the body `(in 0)`;
+- the convolution ops become segops over spaces with one dimension per
+  loop index: `im2col` is a `seg-map` reading the image through a padded
+  map, `col2im` a `seg-red` that gathers the windows covering each pixel,
+  and the forward convolution and its two gradients are contractions like
+  the matrix product. They run on the convolution kernels of the BLAS
+  backend, which use a buffer for the image columns; the convolutions of a
+  plan share these buffers;
 - the remaining index functions run on the host through a `seg-lib`.
 
 Each segop is offered to the segop backends in turn; the first that accepts
@@ -536,8 +543,13 @@ each segop instruction by its pattern:
   (transposed or strided operands), `segop/gemm-epilogue` (with an
   epilogue run as a flat kernel) and `segop/gemm-epilogue-host` (with an
   epilogue run on the host);
+- convolutions: `segop/im2col`, `segop/col2im`, `segop/conv-fwd`,
+  `segop/conv-bwd-data` and `segop/conv-bwd-weights`;
 - `segop/gather` for materialized views, `segop/host-index-fn` for index
   functions run on the host, and `segop/interpreted`.
+
+`replay-plan-stats` also reports `conv-scratch-bytes`, the size of the
+image-column buffers that the plan's convolutions share.
 
 ## Examples
 

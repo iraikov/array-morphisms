@@ -60,8 +60,6 @@
    replay-instruction replay-instruction?
    ri-view
    ri-segop
-   ri-im2col ri-col2im
-   ri-conv-fwd ri-conv-bwd-data ri-conv-bwd-weights
 
    ;; Segop fusion
    segop-fusion
@@ -77,6 +75,9 @@
    binding-scalar-body
    standard-reduction
    standard-gemm
+   lower-conv-binding
+   conv-segop-geom
+   conv-geom-kind
 
    ;; Replay plan compilation and execution
    compile-replay-plan
@@ -95,7 +96,7 @@
           (only (scheme time) current-jiffy jiffies-per-second)
           (only (scheme base) make-parameter)
           (only srfi-1 iota fold filter map for-each append-map filter-map every any
-                take drop list-index delete-duplicates)
+                take drop list-index delete-duplicates find)
           (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
                 f32vector f32vector? f32vector-ref f32vector-set! f32vector-length
@@ -215,9 +216,6 @@
   (rr-val   (val-idx integer?))
   (rr-const (cid symbol?)))
 
-;; Predicate for SRFI-4 float typed vectors (col scratch buffers).
-(define (typed-float-vec? x) (or (f32vector? x) (f64vector? x)))
-
 ;; One pre-compiled instruction per SSA binding.
 (define-datatype replay-instruction replay-instruction?
 
@@ -242,99 +240,7 @@
     (segop        segop?)
     (executor     procedure?)
     (tag          symbol?)
-    (extra-outs   list?))
-
-  ;; Fast im2col: all index parameters baked in at compile time from morph meta.
-  ;; col-layout: 'nchw-standard (unbatched), 'nchw-classic (batched NCHW), 'nhwc-classic (batched NHWC).
-  (ri-im2col
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (src-ref      replay-ref?)
-    (N            integer?)
-    (C            integer?)
-    (H            integer?)
-    (W            integer?)
-    (KH           integer?)
-    (KW           integer?)
-    (SH           integer?)
-    (SW           integer?)
-    (PH           integer?)
-    (PW           integer?)
-    (OH           integer?)
-    (OW           integer?)
-    (col-layout   symbol?))
-
-  ;; Fast col2im: all index parameters baked in at compile time from VJP meta.
-  ;; col-layout: 'nchw-standard (unbatched), 'nchw-classic (batched NCHW), 'nhwc-classic (batched NHWC).
-  (ri-col2im
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (col-ref      replay-ref?)
-    (N            integer?)
-    (C            integer?)
-    (H            integer?)
-    (W            integer?)
-    (KH           integer?)
-    (KW           integer?)
-    (SH           integer?)
-    (SW           integer?)
-    (PH           integer?)
-    (PW           integer?)
-    (col-layout   symbol?))
-
-  ;; Implicit GEMM forward: fused im2col+GEMM+bias, no col buffer.
-  ;; src: [N,C,H,W] or [N,H,W,C]; wt: [fan_in, out_ch]; b: [out_ch]
-  ;; out: [N*OH_OW, out_ch]
-  (ri-conv-fwd
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (src-ref      replay-ref?)
-    (wt-ref       replay-ref?)
-    (b-ref        replay-ref?)
-    (col-buf      typed-float-vec?)
-    (N   integer?) (C   integer?) (H   integer?) (W   integer?)
-    (KH  integer?) (KW  integer?) (SH  integer?) (SW  integer?)
-    (PH  integer?) (PW  integer?) (OH  integer?) (OW  integer?)
-    (out-ch     integer?)
-    (col-layout symbol?))
-
-  ;; Backward w.r.t. input: dX = scatter(g x WT), no col buffer.
-  ;; g: [N*OH_OW, out_ch]; wt: [fan_in, out_ch]; out: x-shape
-  (ri-conv-bwd-data
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (g-ref        replay-ref?)
-    (wt-ref       replay-ref?)
-    (col-buf      typed-float-vec?)
-    (N   integer?) (C   integer?) (H   integer?) (W   integer?)
-    (KH  integer?) (KW  integer?) (SH  integer?) (SW  integer?)
-    (PH  integer?) (PW  integer?) (OH  integer?) (OW  integer?)
-    (out-ch     integer?)
-    (col-layout symbol?))
-
-  ;; Backward w.r.t. weights: dWT = outer product sum, no col buffer.
-  ;; g: [N*OH_OW, out_ch]; src: x-shape; out: [fan_in, out_ch]
-  (ri-conv-bwd-weights
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (g-ref        replay-ref?)
-    (src-ref      replay-ref?)
-    (col-buf      typed-float-vec?)
-    (N   integer?) (C   integer?) (H   integer?) (W   integer?)
-    (KH  integer?) (KW  integer?) (SH  integer?) (SW  integer?)
-    (PH  integer?) (PW  integer?) (OH  integer?) (OW  integer?)
-    (out-ch     integer?)
-    (col-layout symbol?)))
+    (extra-outs   list?)))
 
 
 ;;; ============================================================
@@ -2807,188 +2713,11 @@
                                 (trace-arr-of (car (ssa-binding-inputs b)))
                                 (car in-refs) pool-idx shape strides dtype))
 
-      ;; Fast im2col: extract kernel/stride/padding from morph meta; bake into ri-im2col.
-      ;; The morph meta carries kernel-size/stride/padding/spatial-output from im2col-morph.
-      ;; Source shape comes from the trace-time concrete-array for the input binding.
-      ((eq? op 'im2col)
-       (let* ((meta-ks  (cdr (assq 'kernel-size meta)))
-              (meta-st  (cdr (assq 'stride meta)))
-              (meta-pd  (cdr (assq 'padding meta)))
-              (meta-so  (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
-              (KH       (car  meta-ks)) (KW (cadr meta-ks))
-              (SH       (car  meta-st)) (SW (cadr meta-st))
-              (PH       (car  meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (src-arr  (trace-arr-of (car (ssa-binding-inputs b))))
-              (src-shape (cases array-morphism src-arr
-                           (concrete-array (_ s _ _ _ _ _) s)
-                           (else (error "compile-one-instruction im2col: source not concrete"
-                                        (ssa-binding-name b)))))
-              (rank     (vector-length src-shape))
-              (batched? (= rank 4))
-              (col-layout (cond (nhwc?    'nhwc-classic)
-                                (batched? 'nchw-classic)
-                                (else     'nchw-standard)))
-              (N        (if batched? (vector-ref src-shape 0) 1))
-              ;; For NHWC input [N,H,W,C]: C is at index 3, H at 1, W at 2
-              (C        (cond (nhwc?    (vector-ref src-shape 3))
-                              (batched? (vector-ref src-shape 1))
-                              (else     (vector-ref src-shape 0))))
-              (H        (cond (nhwc?    (vector-ref src-shape 1))
-                              (batched? (vector-ref src-shape 2))
-                              (else     (vector-ref src-shape 1))))
-              (W        (cond (nhwc?    (vector-ref src-shape 2))
-                              (batched? (vector-ref src-shape 3))
-                              (else     (vector-ref src-shape 2))))
-              (OH       (if meta-so (car  meta-so)
-                           (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
-              (OW       (if meta-so (cadr meta-so)
-                           (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))))
-         (ri-im2col pool-idx shape strides dtype
-                    (car in-refs) N C H W KH KW SH SW PH PW OH OW col-layout)))
-
-      ;; Fast col2im: VJP-emitted backward of im2col.
-      ;; Meta carries output-shape (= grad target shape), kernel-size, stride, padding.
-      ;; The output shape (= col2im output = im2col input gradient shape) is ssa-binding-shape.
-      ((eq? op 'col2im)
-       (let* ((meta-ks  (cdr (assq 'kernel-size meta)))
-              (meta-st  (cdr (assq 'stride meta)))
-              (meta-pd  (cdr (assq 'padding meta)))
-              (KH       (car  meta-ks)) (KW (cadr meta-ks))
-              (SH       (car  meta-st)) (SW (cadr meta-st))
-              (PH       (car  meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (rank     (vector-length shape))
-              (batched? (= rank 4))
-              (col-layout (cond (nhwc?    'nhwc-classic)
-                                (batched? 'nchw-classic)
-                                (else     'nchw-standard)))
-              (N        (if batched? (vector-ref shape 0) 1))
-              ;; For NHWC output [N,H,W,C]: C is at index 3, H at 1, W at 2
-              (C        (cond (nhwc?    (vector-ref shape 3))
-                              (batched? (vector-ref shape 1))
-                              (else     (vector-ref shape 0))))
-              (H        (cond (nhwc?    (vector-ref shape 1))
-                              (batched? (vector-ref shape 2))
-                              (else     (vector-ref shape 1))))
-              (W        (cond (nhwc?    (vector-ref shape 2))
-                              (batched? (vector-ref shape 3))
-                              (else     (vector-ref shape 2)))))
-         (ri-col2im pool-idx shape strides dtype
-                    (car in-refs) N C H W KH KW SH SW PH PW col-layout)))
-
-      ;; conv2d-fwd: fused im2col+GEMM+bias, no col buffer.
-      ;; inputs: [x-val, wt-val, b-val]; shape = [N*OH_OW, out_ch]
-      ((eq? op 'conv2d-fwd)
-       (let* ((meta-ks (cdr (assq 'kernel-size meta)))
-              (meta-st (cdr (assq 'stride meta)))
-              (meta-pd (cdr (assq 'padding meta)))
-              (meta-so (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
-              (KH (car meta-ks)) (KW (cadr meta-ks))
-              (SH (car meta-st)) (SW (cadr meta-st))
-              (PH (car meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (src-arr  (trace-arr-of (list-ref (ssa-binding-inputs b) 0)))
-              (src-shape (cases array-morphism src-arr
-                           (concrete-array (_ s _ _ _ _ _) s)
-                           (else (error "conv2d-fwd: src not concrete"
-                                        (ssa-binding-name b)))))
-              (rank     (vector-length src-shape))
-              (N   (if (= rank 4) (vector-ref src-shape 0) 1))
-              (C   (cond (nhwc?    (vector-ref src-shape 3))
-                         ((= rank 4) (vector-ref src-shape 1))
-                         (else       (vector-ref src-shape 0))))
-              (H   (cond (nhwc?    (vector-ref src-shape 1))
-                         ((= rank 4) (vector-ref src-shape 2))
-                         (else       (vector-ref src-shape 1))))
-              (W   (cond (nhwc?    (vector-ref src-shape 2))
-                         ((= rank 4) (vector-ref src-shape 3))
-                         (else       (vector-ref src-shape 2))))
-              (OH  (if meta-so (car  meta-so) (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
-              (OW  (if meta-so (cadr meta-so) (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW))))
-              (out-ch     (vector-ref shape 1))
-              (col-layout (if nhwc? 'nhwc-classic 'nchw-classic))
-              (col-buf    (allocate-typed-vector dtype (* N OH OW C KH KW))))
-         (ri-conv-fwd pool-idx shape strides dtype
-                      (car in-refs) (cadr in-refs) (caddr in-refs)
-                      col-buf
-                      N C H W KH KW SH SW PH PW OH OW out-ch col-layout)))
-
-      ;; conv2d-bwd-data: dX = scatter(g x WT), no col buffer.
-      ;; inputs: [g-val, wt-val]; shape = x-shape
-      ((eq? op 'conv2d-bwd-data)
-       (let* ((meta-ks (cdr (assq 'kernel-size meta)))
-              (meta-st (cdr (assq 'stride meta)))
-              (meta-pd (cdr (assq 'padding meta)))
-              (meta-so (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
-              (KH (car meta-ks)) (KW (cadr meta-ks))
-              (SH (car meta-st)) (SW (cadr meta-st))
-              (PH (car meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (rank     (vector-length shape))
-              (N   (if (= rank 4) (vector-ref shape 0) 1))
-              (C   (cond (nhwc?    (vector-ref shape 3))
-                         ((= rank 4) (vector-ref shape 1))
-                         (else       (vector-ref shape 0))))
-              (H   (cond (nhwc?    (vector-ref shape 1))
-                         ((= rank 4) (vector-ref shape 2))
-                         (else       (vector-ref shape 1))))
-              (W   (cond (nhwc?    (vector-ref shape 2))
-                         ((= rank 4) (vector-ref shape 3))
-                         (else       (vector-ref shape 2))))
-              (OH  (if meta-so (car  meta-so) (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
-              (OW  (if meta-so (cadr meta-so) (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW))))
-              (g-arr   (trace-arr-of (list-ref (ssa-binding-inputs b) 0)))
-              (g-shape (cases array-morphism g-arr
-                          (concrete-array (_ s _ _ _ _ _) s)
-                          (else (error "conv2d-bwd-data: g not concrete"))))
-              (out-ch     (vector-ref g-shape 1))
-              (col-layout (if nhwc? 'nhwc-classic 'nchw-classic))
-              (col-buf    (allocate-typed-vector dtype (* N OH OW C KH KW))))
-         (ri-conv-bwd-data pool-idx shape strides dtype
-                           (car in-refs) (cadr in-refs)
-                           col-buf
-                           N C H W KH KW SH SW PH PW OH OW out-ch col-layout)))
-
-      ;; conv2d-bwd-weights: dWT = outer product, no col buffer.
-      ;; inputs: [g-val, x-val]; shape = wt-shape [fan_in, out_ch]
-      ((eq? op 'conv2d-bwd-weights)
-       (let* ((meta-ks (cdr (assq 'kernel-size meta)))
-              (meta-st (cdr (assq 'stride meta)))
-              (meta-pd (cdr (assq 'padding meta)))
-              (meta-so (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
-              (KH (car meta-ks)) (KW (cadr meta-ks))
-              (SH (car meta-st)) (SW (cadr meta-st))
-              (PH (car meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (src-arr  (trace-arr-of (list-ref (ssa-binding-inputs b) 1)))
-              (src-shape (cases array-morphism src-arr
-                            (concrete-array (_ s _ _ _ _ _) s)
-                            (else (error "conv2d-bwd-weights: src not concrete"))))
-              (rank     (vector-length src-shape))
-              (N   (if (= rank 4) (vector-ref src-shape 0) 1))
-              (C   (cond (nhwc?    (vector-ref src-shape 3))
-                         ((= rank 4) (vector-ref src-shape 1))
-                         (else       (vector-ref src-shape 0))))
-              (H   (cond (nhwc?    (vector-ref src-shape 1))
-                         ((= rank 4) (vector-ref src-shape 2))
-                         (else       (vector-ref src-shape 1))))
-              (W   (cond (nhwc?    (vector-ref src-shape 2))
-                         ((= rank 4) (vector-ref src-shape 3))
-                         (else       (vector-ref src-shape 2))))
-              (OH  (if meta-so (car  meta-so) (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
-              (OW  (if meta-so (cadr meta-so) (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW))))
-              (g-arr   (trace-arr-of (list-ref (ssa-binding-inputs b) 0)))
-              (g-shape (cases array-morphism g-arr
-                          (concrete-array (_ s _ _ _ _ _) s)
-                          (else (error "conv2d-bwd-weights: g not concrete"))))
-              (out-ch     (vector-ref g-shape 1))
-              (col-layout (if nhwc? 'nhwc-classic 'nchw-classic))
-              (col-buf    (allocate-typed-vector dtype (* N OH OW C KH KW))))
-         (ri-conv-bwd-weights pool-idx shape strides dtype
-                              (car in-refs) (cadr in-refs)
-                              col-buf
-                              N C H W KH KW SH SW PH PW OH OW out-ch col-layout)))
+      ;; The convolution family: segops read through guarded maps, run by
+      ;; the convolution executors (see Convolutions in segop-lower.scm).
+      ((memq op '(im2col col2im conv2d-fwd conv2d-bwd-data conv2d-bwd-weights))
+       (compile-conv-segop op meta (map trace-arr-of (ssa-binding-inputs b)) in-refs
+                           pool-idx shape strides dtype))
 
       ;; Element-wise ops, materialized affine views and all other
       ;; pool-backed ops.  VJP-emitted bindings have empty meta; get-index-fn
@@ -3040,8 +2769,10 @@
                                                (+ j 1))
                                              j (cdr (fused-binding-outs (car bs))))
                                        j))))
-                         eb)))
-    (let loop ((bs bindings) (i 0))
+                         eb))
+         (scratch     (new-conv-scratch)))
+    (parameterize ((current-conv-scratch scratch))
+     (let loop ((bs bindings) (i 0))
       (unless (null? bs)
         (let* ((b     (car bs))
                (bname (ssa-binding-name b))
@@ -3072,7 +2803,8 @@
                   (compile-one-instruction b in-refs pool-idx trace-info constants
                                            extra-outs))))
           (vector-set! plan-vec i instr)
-          (loop (cdr bs) (+ i 1)))))
+          (loop (cdr bs) (+ i 1))))))
+    (conv-scratch-allocate! scratch)
 
     ;; Pre-compute output specs to eliminate name->idx hash-table rebuild per replay step.
     ;; Each spec is one of
@@ -3218,117 +2950,6 @@
                                                                     (vector-ref e 3) (vector-ref e 4))))
                                       extra-outs)
                             first)))))
-
-                (ri-im2col (pool-idx shape strides dtype src-ref
-                             N C H W KH KW SH SW PH PW OH OW col-layout)
-                  (time-instr 'ri-im2col
-                    (let* ((src (deref src-ref))
-                           (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism src
-                        (concrete-array (_ _ _ _ _ _ _)
-                          (let ((src-data (concrete-data/row-major src)))
-                          (case col-layout
-                            ((nchw-standard)
-                             (execute-im2col-unbatched buf src-data C H W KH KW SH SW PH PW OH OW dtype))
-                            ((nchw-classic)
-                             (execute-im2col-batched buf src-data N C H W KH KW SH SW PH PW OH OW dtype))
-                            ((nhwc-classic)
-                             (execute-im2col-nhwc-classic buf src-data N C H W KH KW SH SW PH PW OH OW dtype))
-                            (else (error "ri-im2col: unknown col-layout" col-layout))))
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else (error "ri-im2col: source not concrete" src))))))
-
-                (ri-col2im (pool-idx shape strides dtype col-ref
-                             N C H W KH KW SH SW PH PW col-layout)
-                  (time-instr 'ri-col2im
-                    (let* ((col (deref col-ref))
-                           (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism col
-                        (concrete-array (_ col-shape _ _ _ _ _)
-                          (let ((col-data (concrete-data/row-major col)))
-                          (case col-layout
-                            ((nchw-standard)
-                             (execute-col2im-unbatched buf shape col-data col-shape KH KW SH SW PH PW dtype))
-                            ((nchw-classic)
-                             (execute-col2im-batched buf shape col-data col-shape KH KW SH SW PH PW dtype))
-                            ((nhwc-classic)
-                             (execute-col2im-nhwc-classic buf shape col-data col-shape KH KW SH SW PH PW dtype))
-                            (else (error "ri-col2im: unknown col-layout" col-layout))))
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else (error "ri-col2im: col not concrete" col))))))
-
-                (ri-conv-fwd (pool-idx shape strides dtype src-ref wt-ref b-ref col-buf
-                              N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
-                  (time-instr 'ri-conv-fwd
-                    (let* ((src  (deref src-ref)) (wt (deref wt-ref)) (b (deref b-ref))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (src-d (concrete-data/row-major src))
-                           (wt-d  (concrete-data/row-major wt))
-                           (b-d   (concrete-data/row-major b)))
-                                  (if (and (blas-enabled?) (blas-available?))
-                                      (case col-layout
-                                        ((nchw-classic)
-                                         (execute-conv-fwd-blas buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                        ((nhwc-classic)
-                                         (execute-conv-fwd-nhwc-blas buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                        (else (error "ri-conv-fwd: unknown layout" col-layout)))
-                                      (case col-layout
-                                        ((nchw-classic)
-                                         (execute-conv-fwd-nchw buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                        ((nhwc-classic)
-                                         (execute-conv-fwd-nhwc buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                        (else (error "ri-conv-fwd: unknown layout" col-layout))))
-                                  (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-conv-bwd-data (pool-idx shape strides dtype g-ref wt-ref col-buf
-                                   N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
-                  (time-instr 'ri-conv-bwd-data
-                    (let* ((g  (deref g-ref)) (wt (deref wt-ref))
-                           (buf (vector-ref pool-bufs pool-idx))
-                           (g-shape (cases array-morphism g
-                                      (concrete-array (_ s _ _ _ _ _) s)
-                                      (else (error "ri-conv-bwd-data: g not concrete"))))
-                           (g-d  (concrete-data/row-major g))
-                           (wt-d (concrete-data/row-major wt)))
-                              (if (and (blas-enabled?) (blas-available?))
-                                  (case col-layout
-                                    ((nchw-classic)
-                                     (execute-conv-bwd-data-blas buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                    ((nhwc-classic)
-                                     (execute-conv-bwd-data-nhwc-blas buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                    (else (error "ri-conv-bwd-data: unknown layout" col-layout)))
-                                  (case col-layout
-                                    ((nchw-classic)
-                                     (execute-conv-bwd-data-nchw buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                    ((nhwc-classic)
-                                     (execute-conv-bwd-data-nhwc buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                    (else (error "ri-conv-bwd-data: unknown layout" col-layout))))
-                              (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-conv-bwd-weights (pool-idx shape strides dtype g-ref src-ref col-buf
-                                      N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
-                  (time-instr 'ri-conv-bwd-weights
-                    (let* ((g   (deref g-ref)) (src (deref src-ref))
-                           (buf (vector-ref pool-bufs pool-idx))
-                           (g-shape (cases array-morphism g
-                                      (concrete-array (_ s _ _ _ _ _) s)
-                                      (else (error "ri-conv-bwd-weights: g not concrete"))))
-                           (g-d   (concrete-data/row-major g))
-                           (src-d (concrete-data/row-major src)))
-                              (if (and (blas-enabled?) (blas-available?))
-                                  (case col-layout
-                                    ((nchw-classic)
-                                     (execute-conv-bwd-weights-blas buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                    ((nhwc-classic)
-                                     (execute-conv-bwd-weights-nhwc-blas buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                    (else (error "ri-conv-bwd-weights: unknown layout" col-layout)))
-                                  (case col-layout
-                                    ((nchw-classic)
-                                     (execute-conv-bwd-weights-nchw buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                    ((nhwc-classic)
-                                     (execute-conv-bwd-weights-nhwc buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                    (else (error "ri-conv-bwd-weights: unknown layout" col-layout))))
-                              (make-pool-arr pool-idx shape strides dtype))))
                 ))
              )
         (vector-set! vals i result)))
@@ -3497,36 +3118,38 @@
        (ri-index-shapes . list-of-(i . shape-vector)), the positions of the
           segops executed by the generic strided loops, gathers, host index
           functions and the interpreter
-       (ri-reduce-specs . list-of-(i axes keepdims? shape)), the reductions"
+       (ri-reduce-specs . list-of-(i axes keepdims? shape)), the reductions
+       (conv-scratch-bytes . n), the size of the image-column buffers the
+          plan's convolutions share"
     (let ((plan (ssa-program-replay-plan prog)))
       (if (not plan)
           '()
           (let ((counts       (make-hash-table))
                 (index-shapes (make-stack))
-                (reduce-specs (make-stack)))
+                (reduce-specs (make-stack))
+                (scratch      (new-conv-scratch)))
             (do ((i 0 (+ i 1))) ((= i (vector-length plan)))
               (let* ((instr (vector-ref plan i))
                      (tag (cases replay-instruction instr
                             (ri-view             (_ _)                   'ri-view)
-                            (ri-segop            (_ shape _ _ sg _ tag _)
+                            (ri-segop            (_ shape _ dtype sg _ tag _)
                               (when (memq tag '(segop/strided-map segop/gather
                                                 segop/host-index-fn segop/interpreted))
                                 (stack-push! index-shapes (cons i shape)))
                               (let ((r (and (eq? (segop-kind sg) 'seg-red) (standard-reduction sg))))
                                 (when r
                                   (stack-push! reduce-specs (list i (cadr r) (caddr r) shape))))
-                              tag)
-                            (ri-im2col           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-im2col)
-                            (ri-col2im           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _)     'ri-col2im)
-                            (ri-conv-fwd         (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-conv-fwd)
-                            (ri-conv-bwd-data    (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  'ri-conv-bwd-data)
-                            (ri-conv-bwd-weights (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  'ri-conv-bwd-weights))))
+                              (let ((g (conv-segop-geom sg)))
+                                (when (and g (> (conv-scratch-size g) 0))
+                                  (conv-scratch-request! scratch g dtype (conv-scratch-size g))))
+                              tag))))
                 (hash-table-set! counts tag
                                  (+ (hash-table-ref/default counts tag 0) 1))))
             `((counts . ,(hash-table->alist counts))
               (ri-index-shapes . ,(reverse (stack->list index-shapes)))
               (ri-reduce-specs . ,(reverse (stack->list reduce-specs)))
-              (fused . ,(fused-placement plan (ssa-program-bindings prog)))))))
+              (fused . ,(fused-placement plan (ssa-program-bindings prog)))
+              (conv-scratch-bytes . ,(conv-scratch-bytes scratch))))))
 
     )
 

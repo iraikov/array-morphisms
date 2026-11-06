@@ -3756,4 +3756,176 @@
          (test-assert (name "dense layer: the default pool is not larger than unfused") (<= bytes-on bytes-off)))))
    '(f32 f64)))
 
+;;;; ============================================================
+;;;; Convolution segops
+;;;;
+;;;; The convolution bindings lower to seg-maps and seg-reds read through
+;;;; guarded maps, which conv-select recognizes and runs with the
+;;;; convolution executors.  im2col and col2im must write exactly what
+;;;; segop-interpret writes; the contractions, whose order BLAS chooses,
+;;;; agree within a tolerance.
+;;;; ============================================================
+
+(define (cv-values n dtype seed)
+  (let ((v (allocate-typed-vector dtype n)))
+    (do ((i 0 (+ i 1))) ((= i n) v)
+      (typed-vector-set! v dtype i (* 0.9 (sin (+ (* 1.37 i) seed)))))))
+
+;; The meta of a convolution binding with kernel k, stride s, padding p,
+;; output size so (or #f) and layout.
+(define (cv-meta k s p so layout)
+  `((kernel-size . ,k) (stride . ,s) (padding . ,p)
+    ,@(if so `((spatial-output . ,so)) '())
+    ,@(if (eq? layout 'nhwc) '((layout . nhwc)) '())))
+
+;; Runs the segop of a convolution binding with its selected executor and
+;; with segop-interpret.  ins is a list of (slot . array).  Returns
+;; (tag kind executor-output interpreter-output).
+(define (cv-run op meta ins shape dtype)
+  (let* ((sg   (lower-conv-binding op meta (map cdr ins) (map car ins) #f
+                                   shape (compute-strides shape) dtype))
+         (ex   (select-segop-executor sg))
+         (n    (shape-size shape))
+         (b1   (allocate-typed-vector dtype n))
+         (b2   (allocate-typed-vector dtype n))
+         (geom (conv-segop-geom sg)))
+    ((cdr ex) (lambda (s) (cdr (assq s ins))) b1)
+    (segop-interpret sg (map (lambda (o) (e4-data (cdr (assq (segop-operand-slot o) ins))))
+                             (segop-inputs sg))
+                     (list b2))
+    (list (car ex) (and geom (conv-geom-kind geom)) b1 b2)))
+
+(define (cv-same? a b dtype n)
+  (every (lambda (i) (seg-same? (typed-vector-ref a dtype i) (typed-vector-ref b dtype i))) (iota n)))
+
+(define (cv-close? a b dtype n)
+  (let ((tol (if (eq? dtype 'f32) 1e-5 1e-12)))
+    (every (lambda (i)
+             (let ((u (typed-vector-ref a dtype i)) (v (typed-vector-ref b dtype i)))
+               (<= (abs (- u v)) (* tol (max 1.0 (abs u) (abs v))))))
+           (iota n))))
+
+(define (cv-out n k s p) (+ 1 (quotient (+ n (* 2 p) (- k)) s)))
+
+(test-group "convolution segops"
+  (for-each
+   (lambda (dtype)
+     (for-each
+      (lambda (cs)
+        (let* ((layout (list-ref cs 0)) (xs (list-ref cs 1)) (C (list-ref cs 2))
+               (k (list-ref cs 3)) (s (list-ref cs 4)) (p (list-ref cs 5))
+               (rank (length xs)) (nhwc? (eq? layout 'nhwc))
+               (N (if (= rank 4) (car xs) 1))
+               (H (cond (nhwc? (list-ref xs 1)) ((= rank 4) (list-ref xs 2)) (else (list-ref xs 1))))
+               (W (cond (nhwc? (list-ref xs 2)) ((= rank 4) (list-ref xs 3)) (else (list-ref xs 2))))
+               (OH (cv-out H (car k) (car s) (car p))) (OW (cv-out W (cadr k) (cadr s) (cadr p)))
+               (fan (* C (car k) (cadr k))) (M (* N OH OW)) (CO 3)
+               (xshape (list->vector xs))
+               (col-shape (if (= rank 4) (vector N fan (* OH OW)) (vector fan (* OH OW))))
+               (name (lambda (what) (sprintf "~A ~A ~A k~A s~A p~A: ~A" dtype layout xs k s p what)))
+               (arr (lambda (shape seed)
+                      (e4-arr (cv-values (shape-size shape) dtype seed) shape (compute-strides shape) dtype)))
+               (x (arr xshape 0.1))
+               (meta (cv-meta k s p #f layout)))
+          ;; im2col and col2im: exact, special values included.
+          (let* ((xsp (e4-arr (e4-values (shape-size xshape) dtype) xshape (compute-strides xshape) dtype))
+                 (r (cv-run 'im2col meta (list (cons 'x xsp)) col-shape dtype)))
+            (test (name "im2col runs on its executor") 'segop/im2col (car r))
+            (test (name "im2col is recognized") 'im2col (cadr r))
+            (test-assert (name "im2col writes what the interpreter writes")
+              (cv-same? (caddr r) (cadddr r) dtype (shape-size col-shape))))
+          (let* ((col (e4-arr (e4-values (shape-size col-shape) dtype) col-shape
+                              (compute-strides col-shape) dtype))
+                 (r (cv-run 'col2im meta (list (cons 'c col)) xshape dtype)))
+            (test (name "col2im runs on its executor") 'segop/col2im (car r))
+            (test (name "col2im is recognized") 'col2im (cadr r))
+            (test-assert (name "col2im writes what the interpreter writes")
+              (cv-same? (caddr r) (cadddr r) dtype (shape-size xshape))))
+          ;; The contractions take rank-4 images.
+          (when (= rank 4)
+            (let* ((cmeta (cv-meta k s p (list OH OW) layout))
+                   (wt (arr (vector fan CO) 0.2)) (b (arr (vector CO) 0.3)) (g (arr (vector M CO) 0.4)))
+              (for-each
+               (lambda (c)
+                 (let ((r (cv-run (car c) cmeta (cadr c) (caddr c) dtype)))
+                   (test (name (sprintf "~A runs on its executor" (car c))) (cadddr c) (car r))
+                   (test-assert (name (sprintf "~A agrees with the interpreter" (car c)))
+                     (cv-close? (caddr r) (cadddr r) dtype (shape-size (caddr c))))))
+               (list (list 'conv2d-fwd (list (cons 'x x) (cons 'w wt) (cons 'b b)) (vector M CO)
+                           'segop/conv-fwd)
+                     (list 'conv2d-bwd-data (list (cons 'g g) (cons 'w wt)) xshape
+                           'segop/conv-bwd-data)
+                     (list 'conv2d-bwd-weights (list (cons 'g g) (cons 'x x)) (vector fan CO)
+                           'segop/conv-bwd-weights)))))))
+      '((nchw (2 3 6 6) 3 (3 3) (1 1) (1 1))
+        (nchw (2 3 6 6) 3 (3 3) (2 2) (1 1))
+        (nchw (2 3 7 5) 3 (2 2) (2 2) (0 0))
+        (nchw (2 2 6 5) 2 (3 2) (2 1) (1 0))
+        (nchw (3 5 5)   3 (3 3) (1 1) (0 0))
+        (nhwc (2 6 6 3) 3 (3 3) (2 2) (1 1))
+        (nhwc (2 6 5 2) 2 (3 2) (2 1) (1 0)))))
+   '(f32 f64))
+
+  ;; A strided image: the executor reads it as the interpreter does.
+  (let* ((dtype 'f64) (shape #(2 3 5 5))
+         (data (cv-values 150 dtype 0.5))
+         ;; [N C H W] indices over NHWC storage
+         (x (e4-arr data shape (vector 75 1 15 3) dtype))
+         (r (cv-run 'conv2d-fwd (cv-meta '(3 3) '(1 1) '(1 1) '(5 5) 'nchw)
+                    (list (cons 'x x) (cons 'w (e4-arr (cv-values 108 dtype 0.6) #(27 4) #(4 1) dtype))
+                          (cons 'b (e4-arr (cv-values 4 dtype 0.7) #(4) #(1) dtype)))
+                    #(50 4) dtype)))
+    (test-assert "conv2d-fwd of a strided image agrees with the interpreter"
+      (cv-close? (caddr r) (cadddr r) dtype 200)))
+
+  ;; A seg-map with the maps of im2col but another body is not im2col.
+  (let* ((x (e4-arr (cv-values 72 'f64 0.1) #(2 1 6 6) #(36 36 6 1) 'f64))
+         (sg (lower-conv-binding 'im2col (cv-meta '(3 3) '(1 1) '(1 1) #f 'nchw) (list x) '(x) #f
+                                 #(2 9 36) (compute-strides #(2 9 36)) 'f64))
+         (neg (make-seg-map (segop-space sg) (segop-inputs sg) (segop-outputs sg) '((mul (in 0) (in 0))))))
+    (test-assert "im2col is recognized" (conv-segop-geom sg))
+    (test "a seg-map with another body is not" #f (conv-segop-geom neg)))
+
+  ;; A two-layer conv program: replays agree, the plan runs every
+  ;; convolution on its executor, and the convolutions share scratch
+  ;; buffers by geometry.
+  (let* ((dtype 'f32) (N 2)
+         (conv (lambda (x wt b C H)
+                 (am:make-var
+                  (morphism-expr (gensym 'conv2d-) 'conv2d-fwd
+                                 (list (am:var-value x) (am:var-value wt) (am:var-value b))
+                                 (lambda (i) i) (vector (* N H H) (vector-ref (morph-shape (am:var-value wt)) 1))
+                                 dtype
+                                 `((kernel-size . (3 3)) (stride . (1 1)) (padding . (1 1))
+                                   (spatial-output . (,H ,H)))
+                                 0)
+                  #f)))
+         (vals (lambda (n seed) (map (lambda (i) (* 0.5 (sin (+ (* 1.37 i) seed)))) (iota n))))
+         (x  (seg-var (vals (* N 1 8 8) 0.1) (list N 1 8 8) dtype #f))
+         (w1 (seg-var (vals (* 9 4) 0.2) '(9 4) dtype #t))
+         (b1 (seg-var (vals 4 0.3) '(4) dtype #t))
+         (w2 (seg-var (vals (* 36 6) 0.4) '(36 6) dtype #t))
+         (b2 (seg-var (vals 6 0.5) '(6) dtype #t))
+         (h  (am:var-relu (conv x w1 b1 1 8)))
+         ;; [N*8*8, 4] back to NCHW for the second layer
+         (h4 (am:var-transpose (am:var-reshape h (list N 8 8 4)) '(0 3 1 2)))
+         (y  (conv h4 w2 b2 4 8))
+         (loss (am:var-sum (am:var* y (seg-var (vals (* N 64 6) 0.6) (list (* N 64) 6) dtype #f))))
+         (fwd (morphism-to-ssa loss))
+         (pv (map (lambda (p) (ssa-constant-id fwd (am:var-value p))) (list w1 b1 w2 b2)))
+         (joint (ssa-vjp fwd pv (ssa-loss-binding-val fwd))))
+    (let-values (((rs bytes) (rd-replays joint)))
+      (test-assert "two conv layers: the replays agree" (every (lambda (r) (equal? r (cadr rs))) (cddr rs)))
+      (let ((tags (map car (plan-segops joint)))
+            (s1 (* N 64 9)) (s2 (* N 64 36)))
+        (test "two conv layers: two forward convolutions" 2
+          (length (filter (lambda (t) (eq? t 'segop/conv-fwd)) tags)))
+        (test "two conv layers: two weight gradients" 2
+          (length (filter (lambda (t) (eq? t 'segop/conv-bwd-weights)) tags)))
+        (test-assert "two conv layers: a data gradient"
+          (memq 'segop/conv-bwd-data tags))
+        (test "two conv layers: one column buffer per layer and one for the data gradients"
+          (* 4 (+ s1 s2 s2))
+          (cdr (assq 'conv-scratch-bytes (replay-plan-stats joint))))))))
+
 (test-end)

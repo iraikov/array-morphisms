@@ -1033,8 +1033,8 @@
     (map-outs list?)
     (fallback procedure-or-false?))
 
-  ;; A named operation with a fixed backend contract (the convolution
-  ;; family); attrs is an alist of its parameters.
+  ;; A named operation with a fixed backend contract, such as an index
+  ;; function run on the host; attrs is an alist of its parameters.
   (seg-lib
     (name  symbol?)
     (ins   list?)
