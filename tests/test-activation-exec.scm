@@ -400,8 +400,8 @@
       (list (equal? without with)
             (> (count-of counts 'tanh-deriv) 0))))
 
-  (test "matmul with a sigmoid epilogue: results unchanged with kernels"
-    '(#t 0 1)
+  (test "matmul with a sigmoid epilogue: the epilogue runs the kernel, results unchanged"
+    '(#t #t 1)
     (let* ((r (replay-both
                (lambda ()
                  (let ((xv (am:make-var (morph-from-list '(1.0 -2.0 3.0 -4.0 5.0 -6.0)
@@ -411,7 +411,7 @@
                                      (list Wv))))))
            (without (car r)) (with (cadr r)) (counts (caddr r)))
       (list (equal? without with)
-            (count-of counts 'sigmoid)
+            (> (count-of counts 'sigmoid) 0)
             (count-of counts 'sigmoid-deriv))))
 
   (test "sigmoid(-x) keeps the sigmoid kernel when the backend has one"

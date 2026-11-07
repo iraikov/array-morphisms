@@ -170,7 +170,8 @@
     out[i, j] = op(a[.], b[.]); the mode of an operand says how it is
     indexed: 0, a rows x cols array (index i*cols + j); 1, one value per
     row (index i); 2, one value per column (index j); 3, a single value
-    (index 0).  out is distinct from a and b."
+    (index 0).  out may be an operand of mode 0, which is then updated
+    in place; otherwise it is distinct from a and b."
     (check-kernel 'activation-backend-add-broadcast-kernel! dtype kernel)
     (unless (memq op '(add sub mul div))
       (error 'activation-backend-add-broadcast-kernel! "unsupported op" op))

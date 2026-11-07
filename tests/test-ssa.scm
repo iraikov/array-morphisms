@@ -3756,6 +3756,70 @@
          (test-assert (name "dense layer: the default pool is not larger than unfused") (<= bytes-on bytes-off)))))
    '(f32 f64)))
 
+;; A mock activation backend with a counting relu kernel and a counting add
+;; broadcast kernel.  calls is a list (relu add in-place), whose elements
+;; count the calls of each kernel and the calls that wrote over an operand.
+(define (ge-mock-backend calls)
+  (let ((be (make-activation-backend 'mock-epilogue))
+        (relu (scalar-op-combiner 'relu))
+        (add  (scalar-op-combiner 'add))
+        (bump! (lambda (k) (set-car! (list-tail calls k) (+ 1 (list-ref calls k))))))
+    (for-each
+     (lambda (dt)
+       (activation-backend-add-kernel!
+        be 'relu dt
+        (lambda (n in out)
+          (bump! 0)
+          (when (eq? in out) (bump! 2))
+          (do ((i 0 (+ i 1))) ((= i n))
+            (typed-vector-set! out dt i (relu (typed-vector-ref in dt i))))))
+       (activation-backend-add-broadcast-kernel!
+        be 'add dt
+        (lambda (rows cols a ma b mb out)
+          (bump! 1)
+          (when (or (eq? a out) (eq? b out)) (bump! 2))
+          (let ((at (lambda (v mode i j)
+                      (typed-vector-ref v dt (case mode
+                                               ((0) (+ (* i cols) j)) ((1) i) ((2) j) (else 0))))))
+            (do ((i 0 (+ i 1))) ((= i rows))
+              (do ((j 0 (+ j 1))) ((= j cols))
+                (typed-vector-set! out dt (+ (* i cols) j)
+                                   (add (at a ma i j) (at b mb i j)))))))))
+     '(f32 f64))
+    be))
+
+(test-group "GEMM epilogues through activation kernels"
+  (for-each
+   (lambda (dtype)
+     (let* ((x (fk-arr mo-x '(2 3) dtype))
+            (W (fk-arr mo-w '(3 2) dtype))
+            (b (fk-arr '(0.25 -0.5) '(2) dtype))
+            (name (lambda (s) (sprintf "~A: ~A" dtype s))))
+       (for-each
+        (lambda (case)
+          (let* ((m    ((cadr case) (morph-matmul x W) b))
+                 (off  (sf-run (ge-fused #f m)))
+                 (on   (ge-fused #t m))
+                 (all  (ge-fused 'all m))
+                 (what (lambda (s) (name (string-append (car case) ": " s)))))
+            (test (what "fused, it runs as one native GEMM epilogue") '(segop/gemm-epilogue) (ge-tags on))
+            (test (what "without a backend the values are those of the unfused program") off (sf-run on))
+            (test (what "under all too") off (sf-run all))
+            (let ((calls (list 0 0 0)))
+              (register-activation-backend! (ge-mock-backend calls))
+              (let ((off-k (sf-run (ge-fused #f m))))
+                (set-car! calls 0) (set-car! (cdr calls) 0) (set-car! (cddr calls) 0)
+                (let ((on-k (sf-run on)))
+                  (register-activation-backend! #f)
+                  (test-assert (what "the epilogue calls the backend's kernel")
+                    (> (list-ref calls (caddr case)) 0))
+                  (test-assert (what "in place on the product") (> (list-ref calls 2) 0))
+                  (test (what "with the values of the unfused program run by the kernel") off-k on-k)
+                  (test (what "which are those without a backend") off on-k))))))
+        (list (list "relu(x W)" (lambda (p b) (morph-relu p)) 0)
+              (list "x W + b" (lambda (p b) (morph+ p b)) 1)))))
+   '(f32 f64)))
+
 ;;;; ============================================================
 ;;;; Convolution segops
 ;;;;

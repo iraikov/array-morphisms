@@ -989,12 +989,14 @@
                                (list (make-red-result (out pool-idx) gemm-body spec #f)))))))))
 
 (define (standard-gemm sg)
-  "The GEMM that computes seg-red sg, as a list (A B out kind plan epilogue),
-   or #f when sg is not in the form lower-matmul-binding produces, combine
-   spec included.  kind is gemm or gemm-strided and plan the gemm-plan for
-   the operands; epilogue is #f, (unary . combiner),
-   (bias bias-operand . combiner) for a row bias read along the columns,
-   or (map operands . combiner) for any other inputs."
+  "The GEMM that computes seg-red sg, as a list
+   (A B out kind plan epilogue op), or #f when sg is not in the form
+   lower-matmul-binding produces, combine spec included.  kind is gemm or
+   gemm-strided and plan the gemm-plan for the operands; epilogue is #f,
+   (unary . combiner), (bias bias-operand . combiner) for a row bias read
+   along the columns, or (map operands . combiner) for any other inputs.
+   op is the op of an epilogue that applies one op to the product and its
+   other inputs, in that order, and #f otherwise."
   (cases segop sg
     (seg-red (space nred ins results map-outs fallback)
       (and
@@ -1033,7 +1035,9 @@
             (and epilogue kind
                  (let ((plan (prepare-gemm-plan kind A B)))
                    (and (combine-specs-equal? (red-result-combine res) (gemm-combine-spec plan dtype))
-                        (list A B out kind plan (if (eq? epilogue 'none) #f epilogue))))))))))
+                        (list A B out kind plan (if (eq? epilogue 'none) #f epilogue)
+                              (and fin (single-op-body-op (gemm-finalize->epilogue fin dtype)
+                                                          (- (length ins) 1))))))))))))
     (else #f)))
 
 ;; The executor that applies combiner in place to the GEMM product in the
@@ -1064,9 +1068,12 @@
                                      (map (lambda (k) (arg offs k)) (iota n))))))))))))
 
 ;; The registry routes GEMMs to the active BLAS backend through prepared
-;; gemm-plans; a fused epilogue then runs in place on the stored product,
-;; through the flat unary and bias kernels when it has one of those forms
-;; and through a strided loop on the host otherwise.
+;; gemm-plans; a fused epilogue then runs in place on the stored product.
+;; An epilogue that is one op on the product, or on the product and a row
+;; bias, runs as the unfused op would: through the active activation
+;; backend's unary or broadcast kernel for the op when it has one, and
+;; through the flat unary and bias loops otherwise.  Other epilogues run
+;; through a strided loop on the host.
 (define (registry-gemm-select sg)
   (let ((g (standard-gemm sg)))
     (and g
@@ -1075,6 +1082,7 @@
                 (out      (list-ref g 2))
                 (plan     (list-ref g 4))
                 (epilogue (list-ref g 5))
+                (op       (list-ref g 6))
                 (dtype    (segop-operand-dtype out))
                 (size     (shape-size (segop-operand-shape out)))
                 (gemm!    (lambda (deref buf)
@@ -1089,22 +1097,30 @@
                        (gemm! deref buf)
                        (host deref buf)))))
             ((eq? (car epilogue) 'unary)
-             (let ((combiner (cdr epilogue)))
+             (let ((combiner (cdr epilogue))
+                   (act-op   (and op (activation-op-registered? op) op)))
                (cons 'segop/gemm-epilogue
                      (lambda (deref buf)
                        (gemm! deref buf)
-                       (execute-flat-unary-compute-inplace! combiner buf size dtype)))))
+                       (if act-op
+                           (execute-activation-unary-compute act-op combiner buf dtype buf size dtype)
+                           (execute-flat-unary-compute combiner buf dtype buf size dtype))))))
             (else
              (let ((bias-ref (segop-operand-slot (cadr epilogue)))
                    (combiner (cddr epilogue))
+                   (plain-op (and (memq op '(add sub mul div)) op))
                    (N        (vector-ref (segop-operand-shape out) 1)))
                (cons 'segop/gemm-epilogue
                      (lambda (deref buf)
                        (gemm! deref buf)
-                       (cases array-morphism (deref bias-ref)
-                         (concrete-array (bias-data _ _ _ _ _ _)
-                           (execute-flat-bias-broadcast-inplace! combiner buf bias-data size N dtype))
-                         (else (error "gemm epilogue: bias not concrete"))))))))))))
+                       (with-array-data 'gemm-epilogue (deref bias-ref) (bias-data bias-dtype)
+                         (let ((kernel (and plain-op
+                                            (lookup-broadcast-kernel (active-activation-backend)
+                                                                     plain-op dtype))))
+                           (if (and kernel (> N 0) (> size 0))
+                               (kernel (quotient size N) N buf 0 bias-data 2 buf)
+                               (execute-flat-bias-broadcast-compute combiner buf bias-data buf
+                                                                    size N dtype)))))))))))))
 
 ;; True when fused output o is the product of a GEMM.
 (define (gemm-fused-out? o)
