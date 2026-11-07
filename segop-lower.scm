@@ -1412,8 +1412,8 @@
 ;;; conv-select recognizes these segops by reading the parameters back from
 ;;; their maps and rebuilding the maps from them, and runs them with the
 ;;; convolution executors of realization.scm.  The contractions take a
-;;; scratch buffer for the image columns from the plan's conv-scratch (see
-;;; current-conv-scratch).
+;;; scratch buffer for the image columns that the convolutions of the plan
+;;; share (see current-conv-scratch).
 
 (define-record conv-geom kind layout rank N C H W KH KW SH SW PH PW OH OW CO)
 
@@ -1702,26 +1702,13 @@
          (conv-geom-C g) (conv-geom-KH g) (conv-geom-KW g))
       0))
 
-;; The key of the scratch buffer convolution g of dtype dtype may share.
-;; conv-bwd-data computes its whole buffer with a GEMM, so all of them
-;; share one.  conv-fwd and conv-bwd-weights write the image columns, and a
-;; backend kernel may leave the padding positions as they are, which must
-;; be 0; such a buffer is shared only by convolutions of the same
-;; geometry, which write the same positions.
-(define (conv-scratch-key g dtype)
-  (if (eq? (conv-geom-kind g) 'conv-bwd-data)
-      (list dtype 'gemm)
-      (list dtype 'columns (conv-geom-layout g) (conv-geom-rank g)
-            (conv-geom-N g) (conv-geom-C g) (conv-geom-H g) (conv-geom-W g)
-            (conv-geom-KH g) (conv-geom-KW g) (conv-geom-SH g) (conv-geom-SW g)
-            (conv-geom-PH g) (conv-geom-PW g) (conv-geom-OH g) (conv-geom-OW g))))
-
-;; Scratch buffers that the convolutions of a plan share (see
-;; conv-scratch-key).  The convolutions ask for a size while the plan is
+;; Scratch buffers for the image columns that the convolutions of a plan
+;; share, one per dtype.  The convolutions ask for a size while the plan is
 ;; compiled; each buffer is allocated at the largest size asked for once
 ;; the plan is compiled, and looked up each time a convolution runs.  The
-;; instructions of a plan run one at a time, so they can share a buffer.
-;; entries is a list of mutable vectors #(key dtype size buffer).
+;; instructions of a plan run one at a time, and each convolution writes
+;; the whole buffer before reading it, so they can share it.  entries is a
+;; list of mutable vectors #(dtype size buffer).
 (define-record conv-scratch entries)
 
 (define (new-conv-scratch) (make-conv-scratch '()))
@@ -1730,32 +1717,30 @@
 ;; outside a plan gets a buffer of its own.
 (define current-conv-scratch (make-parameter #f))
 
-;; The entry of s for convolution g of dtype dtype, now at least n
-;; elements long.
-(define (conv-scratch-request! s g dtype n)
-  (let* ((key (conv-scratch-key g dtype))
-         (e   (or (find (lambda (e) (equal? (vector-ref e 0) key)) (conv-scratch-entries s))
-                  (let ((e (vector key dtype 0 #f)))
-                    (conv-scratch-entries-set! s (cons e (conv-scratch-entries s)))
-                    e))))
-    (vector-set! e 2 (max n (vector-ref e 2)))
+;; The entry of s for dtype, now at least n elements long.
+(define (conv-scratch-request! s dtype n)
+  (let ((e (or (find (lambda (e) (eq? (vector-ref e 0) dtype)) (conv-scratch-entries s))
+               (let ((e (vector dtype 0 #f)))
+                 (conv-scratch-entries-set! s (cons e (conv-scratch-entries s)))
+                 e))))
+    (vector-set! e 1 (max n (vector-ref e 1)))
     e))
 
 (define (conv-scratch-allocate! s)
-  (for-each (lambda (e) (vector-set! e 3 (allocate-typed-vector (vector-ref e 1) (vector-ref e 2))))
+  (for-each (lambda (e) (vector-set! e 2 (allocate-typed-vector (vector-ref e 0) (vector-ref e 1))))
             (conv-scratch-entries s)))
 
 (define (conv-scratch-bytes s)
-  (fold (lambda (e sum) (+ sum (* (if (eq? (vector-ref e 1) 'f32) 4 8) (vector-ref e 2))))
+  (fold (lambda (e sum) (+ sum (* (if (eq? (vector-ref e 0) 'f32) 4 8) (vector-ref e 1))))
         0 (conv-scratch-entries s)))
 
-;; A procedure of no arguments returning the scratch buffer of convolution
-;; g, of dtype dtype and at least n elements.
-(define (conv-scratch-getter g dtype n)
+;; A procedure of no arguments returning a scratch buffer of dtype with at
+;; least n elements.
+(define (conv-scratch-getter dtype n)
   (let ((s (current-conv-scratch)))
     (if s
-        (let ((e (conv-scratch-request! s g dtype n)))
-          (lambda () (vector-ref e 3)))
+        (let ((e (conv-scratch-request! s dtype n)))
+          (lambda () (vector-ref e 2)))
         (let ((buf (allocate-typed-vector dtype n)))
           (lambda () buf)))))
 
@@ -1775,7 +1760,7 @@
                 (data  (lambda (deref k) (concrete-data/row-major (deref (list-ref refs k)))))
                 (blas? (lambda () (and (blas-enabled?) (blas-available?))))
                 (scratch (and (> (conv-scratch-size g) 0)
-                              (conv-scratch-getter g dtype (conv-scratch-size g)))))
+                              (conv-scratch-getter dtype (conv-scratch-size g)))))
            (case (conv-geom-kind g)
              ((im2col)
               (let ((exec (cond ((= (conv-geom-rank g) 3)

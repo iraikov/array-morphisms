@@ -163,6 +163,8 @@
    conv-fwd-im2col-f32         ; (out bias col src weight M N K out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
    conv-bwd-data-im2col-f32    ; (dx col g wt M K N out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
    conv-bwd-weights-im2col-f32 ; (dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
+   ;; col is a scratch buffer of M * C*KH*KW elements that other calls also
+   ;; use, so a hook writes all of it before reading it, zeros included.
    ;; NHWC counterparts: identical signatures to the slots above, but the
    ;; im2col/col2im step reads/writes src/dx in NHWC layout [N,H,W,C]
    ;; instead of NCHW. The col/weight/output layouts are unchanged (always

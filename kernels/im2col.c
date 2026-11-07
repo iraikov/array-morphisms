@@ -40,7 +40,9 @@ void im2col_batched_mr_f32(float *col,
                     for (int kh = 0; kh < KH; ++kh) {
                         int ih = ih0 + kh;
                         if (ih < 0 || ih >= H) {
-                            col_idx += KW;
+                            /* A padding row: written as zeros, so that col
+                               needs no clearing beforehand. */
+                            for (int kw = 0; kw < KW; ++kw) row[col_idx++] = 0.0f;
                             continue;
                         }
                         const float *src_h = src_c + (long)ih * W;
@@ -82,7 +84,9 @@ void im2col_batched_nhwc_f32(float *col,
                     for (int kh = 0; kh < KH; ++kh) {
                         int ih = ih0 + kh;
                         if (ih < 0 || ih >= H) {
-                            col_idx += KW;
+                            /* A padding row: written as zeros, so that col
+                               needs no clearing beforehand. */
+                            for (int kw = 0; kw < KW; ++kw) row[col_idx++] = 0.0f;
                             continue;
                         }
                         const float *src_h = src_n + (long)ih * W_C;

@@ -3887,8 +3887,8 @@
     (test "a seg-map with another body is not" #f (conv-segop-geom neg)))
 
   ;; A two-layer conv program: replays agree, the plan runs every
-  ;; convolution on its executor, and the convolutions share scratch
-  ;; buffers by geometry.
+  ;; convolution on its executor, and the convolutions share one scratch
+  ;; buffer.
   (let* ((dtype 'f32) (N 2)
          (conv (lambda (x wt b C H)
                  (am:make-var
@@ -3924,8 +3924,8 @@
           (length (filter (lambda (t) (eq? t 'segop/conv-bwd-weights)) tags)))
         (test-assert "two conv layers: a data gradient"
           (memq 'segop/conv-bwd-data tags))
-        (test "two conv layers: one column buffer per layer and one for the data gradients"
-          (* 4 (+ s1 s2 s2))
+        (test "two conv layers: the convolutions share one column buffer"
+          (* 4 (max s1 s2))
           (cdr (assq 'conv-scratch-bytes (replay-plan-stats joint))))))))
 
 (test-end)

@@ -3141,7 +3141,7 @@
                                   (stack-push! reduce-specs (list i (cadr r) (caddr r) shape))))
                               (let ((g (conv-segop-geom sg)))
                                 (when (and g (> (conv-scratch-size g) 0))
-                                  (conv-scratch-request! scratch g dtype (conv-scratch-size g))))
+                                  (conv-scratch-request! scratch dtype (conv-scratch-size g))))
                               tag))))
                 (hash-table-set! counts tag
                                  (+ (hash-table-ref/default counts tag 0) 1))))
