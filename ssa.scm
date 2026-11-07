@@ -182,9 +182,11 @@
 ;;                   same, copied into buffer when strided; concrete-array = const-ref value
 ;;   fused?        : true once the fusion policy has been applied to the bindings
 ;;                   (by ssa-vjp, or by ssa-realize/ctx at the first trace)
+;;   plan-notes    : alist of statistics returned by the plan finalizers of the
+;;                   compiled replay plan (see segop-plan-add-finalizer!)
 (define-record-type ssa-program
   (%make-ssa-program constants morph-to-val bindings outputs n-params
-                     replay-plan trace-info output-specs fused?)
+                     replay-plan trace-info output-specs fused? plan-notes)
   ssa-program?
   (constants    ssa-program-constants)
   (morph-to-val ssa-program-morph-to-val)
@@ -194,12 +196,13 @@
   (replay-plan  ssa-program-replay-plan ssa-program-replay-plan-set!)
   (trace-info   ssa-program-trace-info ssa-program-trace-info-set!)
   (output-specs ssa-program-output-specs ssa-program-output-specs-set!)
-  (fused?       ssa-program-fused? ssa-program-fused?-set!))
+  (fused?       ssa-program-fused? ssa-program-fused?-set!)
+  (plan-notes   ssa-program-plan-notes ssa-program-plan-notes-set!))
 
 (define (make-ssa-program constants morph-to-val bindings outputs n-params
                           replay-plan trace-info output-specs #!optional (fused? #f))
   (%make-ssa-program constants morph-to-val bindings outputs n-params
-                     replay-plan trace-info output-specs fused?))
+                     replay-plan trace-info output-specs fused? '()))
 
 
 ;;; ============================================================
@@ -2770,8 +2773,8 @@
                                              j (cdr (fused-binding-outs (car bs))))
                                        j))))
                          eb))
-         (scratch     (new-conv-scratch)))
-    (parameterize ((current-conv-scratch scratch))
+         (plan-ctx    (make-segop-plan-context)))
+    (parameterize ((segop-plan-context plan-ctx))
      (let loop ((bs bindings) (i 0))
       (unless (null? bs)
         (let* ((b     (car bs))
@@ -2804,7 +2807,9 @@
                                            extra-outs))))
           (vector-set! plan-vec i instr)
           (loop (cdr bs) (+ i 1))))))
-    (conv-scratch-allocate! scratch)
+    ;; Every instruction is compiled; the plan finalizers complete what the
+    ;; backends left for the whole plan (see segop-plan-add-finalizer!).
+    (ssa-program-plan-notes-set! prog (segop-plan-finalize! plan-ctx))
 
     ;; Pre-compute output specs to eliminate name->idx hash-table rebuild per replay step.
     ;; Each spec is one of
@@ -3120,7 +3125,9 @@
           functions and the interpreter
        (ri-reduce-specs . list-of-(i axes keepdims? shape)), the reductions
        (conv-scratch-bytes . n), the size of the image-column buffers the
-          plan's convolutions share"
+          plan's convolutions share
+     followed by the entries the plan finalizers returned (see
+     segop-plan-add-finalizer!)"
     (let ((plan (ssa-program-replay-plan prog)))
       (if (not plan)
           '()
@@ -3149,7 +3156,8 @@
               (ri-index-shapes . ,(reverse (stack->list index-shapes)))
               (ri-reduce-specs . ,(reverse (stack->list reduce-specs)))
               (fused . ,(fused-placement plan (ssa-program-bindings prog)))
-              (conv-scratch-bytes . ,(conv-scratch-bytes scratch))))))
+              (conv-scratch-bytes . ,(conv-scratch-bytes scratch))
+              ,@(or (ssa-program-plan-notes prog) '())))))
 
     )
 

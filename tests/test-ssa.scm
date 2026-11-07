@@ -3821,6 +3821,55 @@
    '(f32 f64)))
 
 ;;;; ============================================================
+;;;; Plan finalizers and deferred executors
+;;;; ============================================================
+;;;; A backend may select an executor cell while a plan is compiled and
+;;;; fill it in a plan finalizer, as the code generator of the crunch egg
+;;;; does.  The mock backend below takes the element-wise seg-maps, holds
+;;;; the executor of the backends after it in the cell, and replaces it in
+;;;; its finalizer by one that counts its calls.
+
+(test-group "plan finalizers"
+  (let* ((finalized 0) (calls 0) (selected 0)
+         (select (lambda (sg)
+                   (and (eq? (segop-kind sg) 'seg-map)
+                        (segop-plan-context)
+                        (let* ((host  (select-segop-executor sg 'test-deferred))
+                               (cell  (make-segop-executor-cell (cdr host)))
+                               ;; one list of cells per plan, filled by its finalizer
+                               (cells (or (segop-plan-property 'test-cells)
+                                          (let ((cells (list '())))
+                                            (segop-plan-property-set! 'test-cells cells)
+                                            (segop-plan-add-finalizer!
+                                             (lambda ()
+                                               (set! finalized (+ finalized 1))
+                                               (for-each
+                                                (lambda (c)
+                                                  (let ((e (segop-executor-cell-ref c)))
+                                                    (segop-executor-cell-set!
+                                                     c (lambda (deref buf #!optional (extra '()))
+                                                         (set! calls (+ calls 1))
+                                                         (if (null? extra) (e deref buf) (e deref buf extra))))))
+                                                (car cells))
+                                               `((test-deferred . ,(length (car cells))))))
+                                            cells))))
+                          (set! selected (+ selected 1))
+                          (set-car! cells (cons cell (car cells)))
+                          (cons 'segop/test-deferred (segop-executor-cell-executor cell))))))
+         (be (make-segop-backend 'test-deferred select))
+         (make (lambda () (morph+ (s2-src 'f64 '(3 4) s2-val) (s2-src 'f64 '(4) s2-val))))
+         (plain (s2-run make))
+         (r (parameterize ((segop-backends (segop-backends)))
+              (register-segop-backend! be 'first)
+              (s2-run make))))
+    (test-assert "the deferred executors are selected" (memq 'segop/test-deferred (s2-tags (car r))))
+    (test "the finalizer runs once per plan" 1 finalized)
+    (test-assert "the cells' executors run after the finalizer" (> calls 0))
+    (test "the replays agree with the plan without the backend" (caddr plain) (caddr r))
+    (test "the finalizer's notes are in the plan statistics" selected
+      (cdr (assq 'test-deferred (replay-plan-stats (car r)))))))
+
+;;;; ============================================================
 ;;;; Convolution segops
 ;;;;
 ;;;; The convolution bindings lower to seg-maps and seg-reds read through

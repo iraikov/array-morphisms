@@ -1720,18 +1720,25 @@
 
 ;; Scratch buffers for the image columns that the convolutions of a plan
 ;; share, one per dtype.  The convolutions ask for a size while the plan is
-;; compiled; each buffer is allocated at the largest size asked for once
-;; the plan is compiled, and looked up each time a convolution runs.  The
-;; instructions of a plan run one at a time, and each convolution writes
-;; the whole buffer before reading it, so they can share it.  entries is a
-;; list of mutable vectors #(dtype size buffer).
+;; compiled; a plan finalizer allocates each buffer at the largest size
+;; asked for, and the buffer is looked up each time a convolution runs.
+;; The instructions of a plan run one at a time, and each convolution
+;; writes the whole buffer before reading it, so they can share it.
+;; entries is a list of mutable vectors #(dtype size buffer).
 (define-record conv-scratch entries)
 
 (define (new-conv-scratch) (make-conv-scratch '()))
 
-;; The scratch of the plan being compiled, or #f.  A convolution compiled
+;; The scratch of the plan being compiled, made with its finalizer at the
+;; first request, or #f outside plan compilation.  A convolution compiled
 ;; outside a plan gets a buffer of its own.
-(define current-conv-scratch (make-parameter #f))
+(define (current-conv-scratch)
+  (and (segop-plan-context)
+       (or (segop-plan-property 'conv-scratch)
+           (let ((s (new-conv-scratch)))
+             (segop-plan-property-set! 'conv-scratch s)
+             (segop-plan-add-finalizer! (lambda () (conv-scratch-allocate! s) #f))
+             s))))
 
 ;; The entry of s for dtype, now at least n elements long.
 (define (conv-scratch-request! s dtype n)

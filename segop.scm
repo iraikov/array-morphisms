@@ -133,7 +133,21 @@
    register-segop-backend!
    unregister-segop-backend!
    segop-backends
-   select-segop-executor)
+   select-segop-executor
+
+   ;; Plan compilation
+   make-segop-plan-context
+   segop-plan-context?
+   segop-plan-context
+   segop-plan-add-finalizer!
+   segop-plan-property
+   segop-plan-property-set!
+   segop-plan-finalize!
+   make-segop-executor-cell
+   segop-executor-cell?
+   segop-executor-cell-ref
+   segop-executor-cell-set!
+   segop-executor-cell-executor)
 
   (import scheme (chicken base) (chicken format)
           (only (scheme base) exact-integer? vector-map vector-copy vector-append make-parameter)
@@ -1411,19 +1425,31 @@
   (make-parameter '() (lambda (bs) (check-backend-list 'segop-backends bs))))
 
 (define (register-segop-backend! b #!optional (position 'first))
-  "Add backend b to the current value of the segop-backends parameter,
-   before the other backends (position 'first) or after them ('last).  A
-   backend of the same name is replaced.  Inside a parameterize of
-   segop-backends the change lasts only until the parameterize exits."
+  "Add backend b to the current value of the segop-backends parameter.
+   position is first (before the other backends), last (after them),
+   (before name) or (after name), next to the backend called name, which
+   must be present.  A backend of the same name as b is replaced.  Inside a
+   parameterize of segop-backends the change lasts only until the
+   parameterize exits."
   (unless (segop-backend? b)
     (error 'register-segop-backend! "not a segop backend" b))
   (let ((others (filter (lambda (x) (not (eq? (segop-backend-name x) (segop-backend-name b))))
                         (segop-backends))))
+    (define (insert-next-to name after?)
+      (let ((k (list-index (lambda (x) (eq? (segop-backend-name x) name)) others)))
+        (unless k
+          (error 'register-segop-backend! "no backend of that name" name))
+        (let ((k (if after? (+ k 1) k)))
+          (append (list-head others k) (list b) (list-tail others k)))))
     (segop-backends
-     (case position
-       ((first) (cons b others))
-       ((last) (append others (list b)))
-       (else (error 'register-segop-backend! "position must be first or last" position))))))
+     (cond ((eq? position 'first) (cons b others))
+           ((eq? position 'last) (append others (list b)))
+           ((and (pair? position) (memq (car position) '(before after))
+                 (pair? (cdr position)) (symbol? (cadr position)))
+            (insert-next-to (cadr position) (eq? (car position) 'after)))
+           (else (error 'register-segop-backend!
+                        "position must be first, last, (before name) or (after name)"
+                        position))))))
 
 (define (unregister-segop-backend! name)
   "Remove the backend called name from the current value of the
@@ -1431,12 +1457,113 @@
   (segop-backends
    (filter (lambda (x) (not (eq? (segop-backend-name x) name))) (segop-backends))))
 
-(define (select-segop-executor s)
+(define (select-segop-executor s #!optional (after #f))
   "The (tag . executor) pair of the first backend in (segop-backends) that
-   accepts segop s, or #f when none does."
-  (let loop ((bs (segop-backends)))
+   accepts segop s, or #f when none does.  When after names a backend, only
+   the backends that follow it are asked; a backend uses this to find the
+   executor that would run s in its place."
+  (let loop ((bs (if after
+                     (let skip ((bs (segop-backends)))
+                       (cond ((null? bs) '())
+                             ((eq? (segop-backend-name (car bs)) after) (cdr bs))
+                             (else (skip (cdr bs)))))
+                     (segop-backends))))
     (cond ((null? bs) #f)
           (((segop-backend-select (car bs)) s) => (lambda (r) r))
           (else (loop (cdr bs))))))
+
+;;;; ============================================================
+;;;; Plan compilation
+;;;; ============================================================
+;;;
+;;; While a replay plan is compiled, the parameter segop-plan-context holds
+;;; a plan context: a place where backends keep what the plan's segops
+;;; share, and a list of finalizers.  A finalizer is a procedure of no
+;;; arguments that the plan compiler calls once, after the last
+;;; instruction is compiled and before the plan first runs.  It lets a
+;;; backend do work for all of a plan's segops at once, such as allocating
+;;; a buffer they share or compiling their kernels together.  A finalizer
+;;; returns #f, or an alist of entries that the plan's statistics report.
+;;;
+;;; An executor cell holds an executor that may be replaced after it is
+;;; selected.  A backend whose kernels are made by a finalizer returns the
+;;; cell's executor, which calls whatever the cell holds when it runs: an
+;;; executor of another backend until the finalizer installs the kernel.
+
+(define-record-type segop-plan-context
+  (%make-segop-plan-context finalizers properties)
+  segop-plan-context?
+  (finalizers segop-plan-context-finalizers segop-plan-context-finalizers-set!)
+  (properties segop-plan-context-properties segop-plan-context-properties-set!))
+
+(define (make-segop-plan-context)
+  "A new plan context with no finalizers and no properties."
+  (%make-segop-plan-context '() '()))
+
+;; The context of the plan being compiled, or #f outside plan compilation.
+(define segop-plan-context
+  (make-parameter #f (lambda (x)
+                       (unless (or (not x) (segop-plan-context? x))
+                         (error 'segop-plan-context "not a plan context" x))
+                       x)))
+
+(define (segop-plan-add-finalizer! thunk)
+  "Add finalizer thunk to the plan being compiled, after those added
+   before it.  Returns #t, or #f when no plan is being compiled (thunk is
+   then not called)."
+  (let ((ctx (segop-plan-context)))
+    (and ctx
+         (begin
+           (segop-plan-context-finalizers-set!
+            ctx (cons thunk (segop-plan-context-finalizers ctx)))
+           #t))))
+
+(define (segop-plan-property key #!optional (default #f))
+  "The value stored under key in the plan being compiled, or default when
+   there is none or no plan is being compiled."
+  (let* ((ctx (segop-plan-context))
+         (p   (and ctx (assq key (segop-plan-context-properties ctx)))))
+    (if p (cdr p) default)))
+
+(define (segop-plan-property-set! key value)
+  "Store value under key in the plan being compiled; an error outside plan
+   compilation."
+  (let ((ctx (segop-plan-context)))
+    (unless ctx
+      (error 'segop-plan-property-set! "no plan is being compiled" key))
+    (let ((p (assq key (segop-plan-context-properties ctx))))
+      (if p
+          (set-cdr! p value)
+          (segop-plan-context-properties-set!
+           ctx (cons (cons key value) (segop-plan-context-properties ctx)))))))
+
+(define (segop-plan-finalize! ctx)
+  "Call the finalizers of plan context ctx in the order they were added,
+   and return the concatenation of the alists they return."
+  (let loop ((fs (reverse (segop-plan-context-finalizers ctx))) (notes '()))
+    (if (null? fs)
+        notes
+        (let ((r ((car fs))))
+          (loop (cdr fs) (if (pair? r) (append notes r) notes))))))
+
+(define-record-type segop-executor-cell
+  (%make-segop-executor-cell executor)
+  segop-executor-cell?
+  (executor segop-executor-cell-ref segop-executor-cell-set!))
+
+(define (make-segop-executor-cell executor)
+  "A cell holding executor."
+  (unless (procedure? executor)
+    (error 'make-segop-executor-cell "not a procedure" executor))
+  (%make-segop-executor-cell executor))
+
+(define (segop-executor-cell-executor cell)
+  "An executor that calls the executor cell holds at the time it runs,
+   with the same arguments."
+  (lambda (deref buf #!optional (extra-bufs '()))
+    (let ((e (segop-executor-cell-ref cell)))
+      (if (null? extra-bufs)
+          (e deref buf)
+          (e deref buf extra-bufs)))))
 
 ) ;; end module array-morphisms-segop

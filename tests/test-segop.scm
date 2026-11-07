@@ -12,6 +12,7 @@
 ;;;   Group 5 - seg-red interpretation
 ;;;   Group 6 - Construction checks
 ;;;   Group 7 - Backend registry
+;;;   Plan contexts and executor cells
 
 (import scheme (chicken base) (chicken format) test
         (only srfi-1 every iota fold make-list filter)
@@ -600,7 +601,56 @@
                (register-segop-backend! b2))
              (not (memq b2 (segop-backends)))))
     (test "with no backends nothing is selected" #f
-      (parameterize ((segop-backends '())) (select-segop-executor sm)))))
+      (parameterize ((segop-backends '())) (select-segop-executor sm)))
+    (parameterize ((segop-backends (list b1 none)))
+      (register-segop-backend! b2 '(before test-none))
+      (test "a backend can be placed before a named one" '(test-a test-b test-none)
+        (map segop-backend-name (segop-backends)))
+      (register-segop-backend! b2 '(after test-none))
+      (test "a backend can be placed after a named one" '(test-a test-none test-b)
+        (map segop-backend-name (segop-backends)))
+      (test-error "placing next to a missing backend is an error"
+        (register-segop-backend! b2 '(before test-missing)))
+      (test-error "an unknown position is an error" (register-segop-backend! b2 'middle))
+      (test "only the backends after a named one are asked" 'tag-b
+        (car (select-segop-executor sm 'test-a)))
+      (test "nothing follows the last backend" #f (select-segop-executor sm 'test-b)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Plan contexts and executor cells
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(test-group "plan contexts"
+  (test "outside a plan there is no context" #f (segop-plan-context))
+  (test "outside a plan a finalizer is not added" #f (segop-plan-add-finalizer! (lambda () #f)))
+  (test "outside a plan a property has its default" 'd (segop-plan-property 'k 'd))
+  (test-error "outside a plan a property cannot be set" (segop-plan-property-set! 'k 1))
+  (let* ((ctx (make-segop-plan-context))
+         (trail (list)))
+    (parameterize ((segop-plan-context ctx))
+      (test-assert "inside a plan a finalizer is added"
+        (segop-plan-add-finalizer! (lambda () (set! trail (cons 'first trail)) '((a . 1)))))
+      (segop-plan-add-finalizer! (lambda () (set! trail (cons 'second trail)) #f))
+      (segop-plan-add-finalizer! (lambda () (set! trail (cons 'third trail)) '((b . 2) (c . 3))))
+      (segop-plan-property-set! 'k 1)
+      (segop-plan-property-set! 'k 2)
+      (test "a property keeps the last value set" 2 (segop-plan-property 'k)))
+    (test "finalizers have not run before the plan is finalized" 0 (length trail))
+    (test "finalizers run in order and their notes are joined" '((a . 1) (b . 2) (c . 3))
+      (segop-plan-finalize! ctx))
+    (test "every finalizer ran once" '(first second third) (reverse trail)))
+  (test-error "the context parameter accepts only plan contexts"
+    (parameterize ((segop-plan-context 'x)) #f)))
+
+(test-group "executor cells"
+  (let* ((cell (make-segop-executor-cell (lambda (deref buf) (list 'host buf))))
+         (exec (segop-executor-cell-executor cell)))
+    (test "the executor calls what the cell holds" '(host 1) (exec #f 1))
+    (segop-executor-cell-set! cell (lambda (deref buf #!optional (extra '()))
+                                     (list 'kernel buf extra)))
+    (test "a replaced executor is called by the same executor" '(kernel 2 ()) (exec #f 2))
+    (test "extra output buffers are passed on" '(kernel 3 (4 5)) (exec #f 3 '(4 5)))
+    (test-error "a cell holds a procedure" (make-segop-executor-cell 'x))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Body compiler
