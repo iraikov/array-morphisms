@@ -3715,6 +3715,13 @@
          (let-values (((fused stats same?) (rd-check m)))
            (test (name "under all it is fused") 1 (length (ge-epilogues fused)))
            (test (name "and runs on the host") '(segop/gemm-epilogue-host) (ge-gemm-tags fused))
+           (test (name "which the registry leaves to the backends after it") #f
+             (let ((sg (cdr (car (filter (lambda (ts) (eq? (car ts) 'segop/gemm-epilogue-host))
+                                         (plan-segops fused))))))
+               (parameterize ((segop-backends
+                               (filter (lambda (b) (eq? (segop-backend-name b) 'registry))
+                                       (segop-backends))))
+                 (select-segop-executor sg))))
            (test-assert (name "with the values of the unfused program") same?)))
        ;; The product as the second operand of the map.
        (let-values (((fused stats same?) (rd-check (morph- y (morph-matmul x W)))))

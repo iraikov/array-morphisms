@@ -3111,7 +3111,8 @@
             ((fused-binding? (car bs))
              (if (cases replay-instruction (vector-ref plan i)
                    (ri-segop (_ _ _ _ _ _ tag _)
-                     (memq tag '(segop/fused-kernel segop/colsum-kernel segop/gemm-epilogue)))
+                     (memq tag '(segop/fused-kernel segop/colsum-kernel segop/gemm-epilogue
+                                 segop/codegen-map segop/codegen-red segop/codegen-epilogue)))
                    (else #f))
                  (loop (cdr bs) (+ i 1) (+ native 1) host)
                  (loop (cdr bs) (+ i 1) native (+ host 1))))

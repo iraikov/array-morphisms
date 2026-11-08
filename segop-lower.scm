@@ -1072,8 +1072,10 @@
 ;; An epilogue that is one op on the product, or on the product and a row
 ;; bias, runs as the unfused op would: through the active activation
 ;; backend's unary or broadcast kernel for the op when it has one, and
-;; through the flat unary and bias loops otherwise.  Other epilogues run
-;; through a strided loop on the host.
+;; through the flat unary and bias loops otherwise.  Other epilogues are
+;; left to the backends after the registry: the scheme backend runs them
+;; through a strided loop on the host (scheme-gemm-select), and a backend
+;; placed between the two may run them as compiled code.
 (define (registry-gemm-select sg)
   (let ((g (standard-gemm sg)))
     (and g
@@ -1090,12 +1092,7 @@
            (cond
             ((not epilogue)
              (cons (if (eq? (list-ref g 3) 'gemm) 'segop/gemm 'segop/gemm-strided) gemm!))
-            ((eq? (car epilogue) 'map)
-             (let ((host (gemm-map-epilogue-executor out (cadr epilogue) (cddr epilogue))))
-               (cons 'segop/gemm-epilogue-host
-                     (lambda (deref buf)
-                       (gemm! deref buf)
-                       (host deref buf)))))
+            ((eq? (car epilogue) 'map) #f)
             ((eq? (car epilogue) 'unary)
              (let ((combiner (cdr epilogue))
                    (act-op   (and op (activation-op-registered? op) op)))
@@ -1121,6 +1118,25 @@
                                (kernel (quotient size N) N buf 0 bias-data 2 buf)
                                (execute-flat-bias-broadcast-compute combiner buf bias-data buf
                                                                     size N dtype)))))))))))))
+
+;; The scheme backend runs a GEMM whose epilogue is not one of the
+;; registry's forms through the prepared gemm-plan, and then the epilogue
+;; in place over the product, in a strided loop on the host.
+(define (scheme-gemm-select sg)
+  (let ((g (standard-gemm sg)))
+    (and g
+         (let ((epilogue (list-ref g 5)))
+           (and epilogue
+                (eq? (car epilogue) 'map)
+                (let* ((A-ref (segop-operand-slot (list-ref g 0)))
+                       (B-ref (segop-operand-slot (list-ref g 1)))
+                       (out   (list-ref g 2))
+                       (plan  (list-ref g 4))
+                       (host  (gemm-map-epilogue-executor out (cadr epilogue) (cddr epilogue))))
+                  (cons 'segop/gemm-epilogue-host
+                        (lambda (deref buf)
+                          (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
+                          (host deref buf)))))))))
 
 ;; True when fused output o is the product of a GEMM.
 (define (gemm-fused-out? o)
@@ -1849,7 +1865,8 @@
       (registry-gather-select sg)))
 
 (define (scheme-select sg)
-  (or (conv-select sg)
+  (or (scheme-gemm-select sg)
+      (conv-select sg)
       (scheme-elementwise-select sg)
       (select-standard-reduction sg '(1d axis0 axis1 general))
       (strided-select sg)
