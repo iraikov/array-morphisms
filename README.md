@@ -372,14 +372,16 @@ parameter `segop-fusion` (`array-morphisms-ssa`):
   compiled Scheme closures, which was measured to be slower than the
   separate bindings' specialized loops and backend kernels. So the default
   fuses a pair only when the active activation backend holds a *fused
-  kernel* for the body the fusion would make (see below). With no such
-  backend, it fuses nothing.
+  kernel* for the body the fusion would make (see below), or when a code
+  generator such as the one of `array-morphisms-crunch` will compile it.
+  With no such backend, it fuses nothing.
 - `'all` fuses every legal pair.
 - `#f` runs no fusion pass.
 
 Segop backends say what they can run natively. Each one has a kind: `host`
 (Scheme executors only), `catalogue` (a fixed set of compiled kernels) or
-`codegen` (backends that compile any body; none exist yet). Each may also
+`codegen` (backends that generate a kernel for each body, such as
+`array-morphisms-crunch-codegen`). Each may also
 answer a native-capability query, `native?`, on a layout-free segop
 template (`make-segop-template`). The fusion pass asks this query, through
 `segop-native?`, before it fuses, and predicts each input's layout: the
@@ -390,6 +392,14 @@ backend, which are keyed by the body's canonical form
 (`canonical-scalar-body`): commutative operands in a fixed order, inputs
 numbered by first occurrence. It runs a matching segop as
 `segop/fused-kernel` when every input is flat and of the output's dtype.
+
+A template made for a fusion also names its *fusion class*, the kind of
+fusion that would make it: `map` (a map into a map), `kept` (a map into
+one of its readers, kept as an output for the others), `horizontal` (two
+maps over a common input), `redomap` (a map into a reduction), `epilogue`
+(a map after a reduction) or `gemm-epilogue` (a map after a matrix
+product). A backend can answer differently for each class, so that the
+default policy makes only the kinds of fusion that it runs faster.
 
 An activation backend holds fused kernels through
 `activation-backend-add-fused-kernel!`. The crunch backends of
@@ -402,8 +412,9 @@ over the rows in one pass; the crunch backends currently hold none.
 native kernel and how many on the host.
 `ssa-fusion-pass-stats` lists the fused bodies the pass formed
 (`candidates`, and `red-candidates` for reductions), counts the fusions
-with several outputs (`kept`, `horizontal`, `dead-outputs`), and counts the
-pairs it left unfused, by reason (`missed`). Run under `'all`, it shows which fused
+with several outputs (`kept`, `horizontal`, `dead-outputs`), counts the
+fusions made in each class (`classes`), and counts the pairs it left
+unfused, by reason (`missed`). Run under `'all`, it shows which fused
 kernels would be worth adding.
 
 Fusion does not change results. A fused binding rounds each intermediate
@@ -512,6 +523,7 @@ value of the parameter `segop-backends`:
 (import array-morphisms-segop)
 (segop-backends)                      ; the backends, in the order tried
 (register-segop-backend! b)           ; try b before the others
+(register-segop-backend! b '(after registry)) ; or at a given place
 (parameterize ((segop-backends (list b)))
   ...)                                ; use only b within this extent
 ```
@@ -523,6 +535,19 @@ row-major matrix, and strided copy), and `scheme` handles the rest with
 Scheme loops; as a last resort it evaluates a segop with the reference
 interpreter. Replay results are the same as those of the instructions they
 replaced, bit for bit.
+
+A backend added in between can still fall back on the ones after it:
+`(select-segop-executor s name)` asks only the backends that follow the
+backend called `name`. While a plan is compiled, backends can also share
+work across its segops. `segop-plan-property` and
+`segop-plan-property-set!` keep values for the plan being compiled, and
+`segop-plan-add-finalizer!` adds a procedure that runs once, after the
+last segop. An executor can be given as an *executor cell*
+(`make-segop-executor-cell`, `segop-executor-cell-executor`), whose
+content a finalizer may replace. The code generator uses these to compile
+all the kernels of a plan at once, and the convolutions use them to
+allocate their shared image-column buffers. A finalizer may return
+statistics, which `replay-plan-stats` reports with the plan's own.
 
 The computed values of a replay live in the context's pool buffers, and
 an output that the trace produced as a strided view is copied into a
@@ -546,7 +571,9 @@ each segop instruction by its pattern:
 - convolutions: `segop/im2col`, `segop/col2im`, `segop/conv-fwd`,
   `segop/conv-bwd-data` and `segop/conv-bwd-weights`;
 - `segop/gather` for materialized views, `segop/host-index-fn` for index
-  functions run on the host, and `segop/interpreted`.
+  functions run on the host, and `segop/interpreted`;
+- generated kernels, with the code generator of `array-morphisms-crunch`:
+  `segop/codegen-map`, `segop/codegen-red` and `segop/codegen-epilogue`.
 
 `replay-plan-stats` also reports `conv-scratch-bytes`, the size of the
 image-column buffers that the plan's convolutions share.
