@@ -863,6 +863,9 @@
       (make-segop-backend 'x (lambda (sg) #f) kind: 'gpu)))
   (test "a template without nred describes a seg-map" 0
     (segop-template-nred (make-segop-template #(2) '() '())))
+  (test "a template has no fusion class unless given one" '(#f redomap)
+    (list (segop-template-class (make-segop-template #(2) '() '()))
+          (segop-template-class (make-segop-template #(2) '() '() 1 'redomap))))
   (test "an output without a combine spec is a map output" '(#f #f #f)
     (let ((o (make-template-output 'f32 '(in 0))))
       (list (template-output-combine o) (template-output-finalize o) (template-output-map o))))

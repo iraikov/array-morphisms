@@ -347,7 +347,8 @@
    last round still fused and the round bound stopped the pass); kept,
    horizontal and dead-outputs (the fusions that kept a producer as a
    second output, the horizontal fusions, and the outputs removed for
-   having no uses); candidates, the bodies of the fused seg-maps made, each a list
+   having no uses); classes, an alist from fusion class (see segop
+   templates) to the number of fusions of that class made; candidates, the bodies of the fused seg-maps made, each a list
    (canonical-body dtype count elements): how many bindings have that
    body and dtype, and their total number of elements; red-candidates,
    the fused seg-reds made, each a list (canonical-body combine-op path
@@ -595,11 +596,12 @@
                 (ssa-binding-inputs f))
          (<= (scalar-body-size (cdr (assq 'body (ssa-binding-meta f)))) fusion-max-body-size))))
 
-(define (fused-binding-query f vtab flat?)
+(define (fused-binding-query f vtab flat? #!optional (class #f))
   "The segop template of fused binding f: its space, the dtype, logical
    map and predicted layout of each input (flat? tells whether an input
-   value is expected to be stored flat), and the dtype and body of each
-   output."
+   value is expected to be stored flat), the dtype and body of each
+   output, and the class of the fusion that makes f (see segop
+   templates)."
   (let ((tpl (fused-binding-template f)))
     (make-segop-template
      (fusion-template-space tpl)
@@ -611,16 +613,18 @@
               (make-template-output (fused-out-dtype o) (fused-out-body o)
                                     (and red (car red)) (and red (cdr red)) (fused-out-map o))))
           (fusion-template-outs tpl))
-     (fusion-template-nred tpl))))
+     (fusion-template-nred tpl)
+     class)))
 
-(define (fusion-profitable? f vtab flat?)
-  "True when making fused binding f should be done under the current
-   policy: always under all; under the default policy when some segop
-   backend would run f natively (see segop-native?).  A fused segop that
-   no backend runs natively would run on the host executors, which are
-   slower than the separate bindings' (see above)."
+(define (fusion-profitable? f vtab flat? class)
+  "True when making fused binding f, a fusion of the given class (see
+   segop templates), should be done under the current policy: always
+   under all; under the default policy when some segop backend would run
+   f natively (see segop-native?).  A fused segop that no backend runs
+   natively would run on the host executors, which are slower than the
+   separate bindings' (see above)."
   (or (eq? (segop-fusion) 'all)
-      (and (segop-native? (fused-binding-query f vtab flat?)) #t)))
+      (and (segop-native? (fused-binding-query f vtab flat? class)) #t)))
 
 ;; ins without repeated values, in order of first occurrence.
 (define (distinct-values ins)
@@ -1071,7 +1075,7 @@
       (cond ((can-fuse? uses p c k)
              (let ((f (fuse-into p c k vtab)))
                (cond ((not (fused-result-legal? f vtab)) (miss! 'size-cap))
-                     ((fusion-profitable? f vtab flat?))
+                     ((fusion-profitable? f vtab flat? 'map))
                      ((every (lambda (v) (equal? (car (hash-table-ref vtab (ssa-value-id v)))
                                                  (ssa-binding-shape f)))
                              (ssa-binding-inputs f))
@@ -1092,6 +1096,11 @@
     ;; and of the outputs removed.
     (define kept-count 0)
     (define horizontal-count 0)
+    ;; class -> number of fusions made, over all rounds
+    (define class-counts '())
+    (define (count-class! class)
+      (let ((p (assq class class-counts)))
+        (if p (set-cdr! p (+ 1 (cdr p))) (set! class-counts (cons (cons class 1) class-counts)))))
     (define dead-count 0)
 
     ;; The position of the binding that computes value v, or #f for a
@@ -1131,9 +1140,10 @@
                    (begin (miss! 'placement) #f)
                    (let ((f (fuse-into p c k vtab #t)))
                      (cond ((not (fused-result-legal? f vtab)) (miss! 'size-cap) #f)
-                           ((not (fusion-profitable? f vtab flat?)) (miss! 'not-native) #f)
+                           ((not (fusion-profitable? f vtab flat? 'kept)) (miss! 'not-native) #f)
                            (else (commit-at! (list p c) f at)
                                  (set! kept-count (+ kept-count 1))
+                                 (count-class! 'kept)
                                  #t))))))))
 
     ;; Fuses one producer into the binding at position i; true if it did.
@@ -1146,8 +1156,8 @@
                           (or (and (can-fuse? uses p c k)
                                    (let ((f (fuse-into p c k vtab)))
                                      (and (fused-result-legal? f vtab)
-                                          (fusion-profitable? f vtab flat?)
-                                          (begin (commit! p c f) #t))))
+                                          (fusion-profitable? f vtab flat? 'map)
+                                          (begin (commit! p c f) (count-class! 'map) #t))))
                               (begin (note-missed! p c k) #f))))
                    (loop (cdr vs) (+ k 1)))))))
 
@@ -1215,9 +1225,10 @@
                                 (let ((f (fuse-siblings s1 s2 vtab)))
                                   (cond ((> (length (ssa-binding-inputs f)) fusion-max-inputs)
                                          (miss! 'size-cap) #f)
-                                        ((not (fusion-profitable? f vtab flat?)) (miss! 'not-native) #f)
+                                        ((not (fusion-profitable? f vtab flat? 'horizontal)) (miss! 'not-native) #f)
                                         (else (commit-at! (list s1 s2) f at)
                                               (set! horizontal-count (+ horizontal-count 1))
+                                              (count-class! 'horizontal)
                                               #t)))))))
                    (loop (- j 1)))))))
 
@@ -1240,10 +1251,16 @@
 
     ;; Puts fused binding f in place of olds at position at, if it is legal
     ;; and profitable; otherwise records why not.
-    (define (try-commit! olds f at)
+    (define (try-commit! olds f at class)
+      (let ((class (if (and (eq? class 'epilogue)
+                            (gemm-fused-out? (car (fusion-template-outs (fused-binding-template f)))))
+                       'gemm-epilogue
+                       class)))
+        (try-commit-class! olds f at class)))
+    (define (try-commit-class! olds f at class)
       (cond ((not (fused-reduction-legal? f)) (miss! 'size-cap) #f)
-            ((not (fusion-profitable? f vtab flat?)) (miss! 'not-native) #f)
-            (else (commit-at! olds f at) #t)))
+            ((not (fusion-profitable? f vtab flat? class)) (miss! 'not-native) #f)
+            (else (commit-at! olds f at) (count-class! class) #t)))
 
     ;; Fuses a map producer into the reduction at position i; true if it
     ;; did.  A producer with other uses is kept as a map output, which only
@@ -1282,7 +1299,8 @@
                                                  vtab)))
                                          (try-commit! (list p c) f
                                                       (hash-table-ref pos-of-binding
-                                                                      (if kept p-name (ssa-binding-name c)))))))))))))
+                                                                      (if kept p-name (ssa-binding-name c)))
+                                                      'redomap))))))))))
                    (loop (cdr vs) (+ k 1)))))))
 
     ;; Fuses map binding c at position i into the reduction whose result
@@ -1343,7 +1361,8 @@
                                                   (fuse-epilogue parts c k
                                                                  (append (binding-members r) (binding-members c))
                                                                  vtab)
-                                                  at)))))))))))))
+                                                  at
+                                                  'epilogue)))))))))))))
                    (loop (cdr vs) (+ k 1)))))))
 
     ;; Tries rule on each binding that satisfies pred, from last to first,
@@ -1387,6 +1406,7 @@
             (set! *fusion-pass-stats*
                   `((rounds . ,r) (fusions . ,total) (bound-reached? . ,(> fused 0))
                     (kept . ,kept-count) (horizontal . ,horizontal-count) (dead-outputs . ,dead-count)
+                    (classes . ,(reverse class-counts))
                     (candidates . ,(fusion-candidates (filter (lambda (b) b) (vector->list bv))))
                     (red-candidates . ,(fusion-red-candidates (filter (lambda (b) b) (vector->list bv))))
                     (missed . ,(reverse missed))))

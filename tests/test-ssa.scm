@@ -3828,6 +3828,33 @@
    '(f32 f64)))
 
 ;;;; ============================================================
+;;;; Fusion classes
+;;;; ============================================================
+;;;; The fusion pass names the class of each fusion in the templates it
+;;;; asks the backends about, and counts the fusions made per class.
+
+(test-group "fusion classes"
+  (let* ((a (morph-from-list (map (lambda (i) (* 0.1 i)) (iota 12)) #(3 4) 'f64))
+         (b (morph-from-list (map (lambda (i) (- 1.0 (* 0.05 i))) (iota 12)) #(3 4) 'f64))
+         (make (lambda () (morph-reduce 'sum (morph-exp (morph* a b)) '(1))))
+         (classes-of (lambda (policy backends)
+                       (parameterize ((segop-fusion policy) (segop-backends backends))
+                         (ssa-segop-fusion-pass (morphism-to-ssa (am:make-var (make) #f)))
+                         (cdr (assq 'classes (ssa-fusion-pass-stats))))))
+         (asked '())
+         (only-maps (make-segop-backend
+                     'test-maps (lambda (sg) #f)
+                     native?: (lambda (tpl)
+                                (set! asked (cons (segop-template-class tpl) asked))
+                                (eq? (segop-template-class tpl) 'map)))))
+    (test "under all, a map fusion and a fusion into the reduction" '((map . 1) (redomap . 1))
+      (classes-of 'all (segop-backends)))
+    (test "a backend native for maps only gets the map fusion" '((map . 1))
+      (classes-of #t (cons only-maps (segop-backends))))
+    (test-assert "the backend was asked about both classes"
+      (and (memq 'map asked) (memq 'redomap asked) #t))))
+
+;;;; ============================================================
 ;;;; Plan finalizers and deferred executors
 ;;;; ============================================================
 ;;;; A backend may select an executor cell while a plan is compiled and

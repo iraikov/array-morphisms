@@ -114,6 +114,7 @@
    make-segop-template
    segop-template?
    segop-template-space segop-template-ins segop-template-outs segop-template-nred
+   segop-template-class
    make-template-input
    template-input?
    template-input-dtype template-input-map template-input-flat?
@@ -1336,17 +1337,27 @@
 ;; template-output per output: its dtype and body, and for a reduced
 ;; result its combine spec and finalize body.  map, when not #f, takes the
 ;; space to the output's index.  nred is the number of trailing dimensions
-;; of the space that are reduced, 0 for a seg-map.
+;; of the space that are reduced, 0 for a seg-map.  class, when not #f,
+;; names the kind of fusion that would make the segop, so that a backend
+;; can run some kinds natively and not others:
+;;
+;;   map            a map fused into the map that reads it
+;;   kept           the same, with the producer's value also stored
+;;   horizontal     two maps of one shape that read a common input
+;;   redomap        a map fused into the reduction that reads it
+;;   epilogue       a map fused into the reduction whose result it reads
+;;   gemm-epilogue  the same for a matrix product
 (define-record-type segop-template
-  (%make-segop-template space ins outs nred)
+  (%make-segop-template space ins outs nred class)
   segop-template?
   (space segop-template-space)
   (ins   segop-template-ins)
   (outs  segop-template-outs)
-  (nred  segop-template-nred))
+  (nred  segop-template-nred)
+  (class segop-template-class))
 
-(define (make-segop-template space ins outs #!optional (nred 0))
-  (%make-segop-template space ins outs nred))
+(define (make-segop-template space ins outs #!optional (nred 0) (class #f))
+  (%make-segop-template space ins outs nred class))
 
 (define-record template-input dtype map flat?)
 
