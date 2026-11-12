@@ -10,12 +10,11 @@
 ;;;   Batch axis is always dimension 0 by default.  Every batched morphism
 ;;;   carries batch-axis >= 0 in its internal field.
 ;;;
-;;; BLAS compatibility:
+;;; Batched matrix multiply:
 ;;;
-;;;   morph-batch-matmul decomposes into N calls to morph-matmul (2-D
-;;;   slices), which the realization engine automatically routes to
-;;;   BLAS.  The realization engine also ensures that trace/replay
-;;;   contexts benefit from BLAS for any matmul in the tree.
+;;;   morph-batch-matmul, from array-morphisms-blas-exec and exported here
+;;;   as well, builds one batch-matmul morphism whose cells the realization
+;;;   engine multiplies with the BLAS backend.
 
 (module array-morphisms-batch-ops
 
@@ -42,7 +41,7 @@
    morph*/batch
    morph-div/batch
 
-   ;; Batched matrix multiply (BLAS-compatible)
+   ;; Batched matrix multiply (from array-morphisms-blas-exec)
    morph-batch-matmul)
 
   (import scheme (chicken base))
@@ -364,61 +363,5 @@
   (define morph-/batch    (make-batch-aware-binop morph-))
   (define morph*/batch    (make-batch-aware-binop morph*))
   (define morph-div/batch (make-batch-aware-binop morph/))
-
-  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  ;;; Batched Matrix Multiply
-  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-  (define (morph-batch-matmul A B)
-    "Batched matrix multiply.
-
-    Supported shapes:
-      A (M, K), B (K, P)       -- non-batched: plain morph-matmul
-      A (N, M, K), B (K, P)    -- shared weight: batch-map morph-matmul over A
-      A (N, M, K), B (N, K, P) -- per-batch weight: batch-zip morph-matmul
-
-    In all batched cases, each slice is a 2-D matrix multiply routed through
-    morph-matmul, which the realization engine dispatches to BLAS (when
-    available) via execute-blas-operation.
-
-    Args:
-      A: matrix or batched-matrix morphism
-      B: matrix or batched-matrix morphism
-
-    Returns:
-      Matrix or batched-matrix morphism of appropriate shape."
-    (let* ((A-shape (get-morphism-shape A))
-           (B-shape (get-morphism-shape B))
-           (A-rank  (vector-length A-shape))
-           (B-rank  (vector-length B-shape)))
-      (cond
-        ;; Both non-batched: delegate directly.
-        ((and (= A-rank 2) (= B-rank 2))
-         (morph-matmul A B))
-
-        ;; A rank-3 (N,M,K), B rank-2 (K,P): map matmul over N.
-        ;; A may carry batch-axis=-1 when built from morph-from-list.
-        ((and (= A-rank 3) (= B-rank 2))
-         (let ((K-a (vector-ref A-shape 2))
-               (K-b (vector-ref B-shape 0)))
-           (unless (= K-a K-b)
-             (error "morph-batch-matmul: inner dimensions must match" K-a K-b)))
-         (batch-map (lambda (a) (morph-matmul a B)) A 0))
-
-        ;; A rank-3 (N,M,K), B rank-3 (N,K,P): per-element weight.
-        ((and (= A-rank 3) (= B-rank 3))
-         (let ((N-a (vector-ref A-shape 0))
-               (N-b (vector-ref B-shape 0)))
-           (unless (= N-a N-b)
-             (error "morph-batch-matmul: batch size mismatch" N-a N-b)))
-         (let ((K-a (vector-ref A-shape 2))
-               (K-b (vector-ref B-shape 1)))
-           (unless (= K-a K-b)
-             (error "morph-batch-matmul: inner dimensions must match" K-a K-b)))
-         (batch-zip morph-matmul A B))
-
-        (else
-         (error "morph-batch-matmul: unsupported shape combination"
-                A-shape B-shape)))))
 
 ) ;; end module array-morphisms-batch-ops

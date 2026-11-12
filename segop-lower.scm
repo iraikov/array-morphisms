@@ -1138,6 +1138,112 @@
                           (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
                           (host deref buf)))))))))
 
+;;; ------------------------------------------------------------
+;;; Batched contractions
+;;; ------------------------------------------------------------
+;;;
+;;; A batched matmul with frame F (rank f) becomes a seg-red over the space
+;;; F ++ (M N K) with K reduced.  A framed operand is read through the frame
+;;; dimensions followed by the 2-D GEMM map, (dim f) (dim f+2) for A and
+;;; (dim f+2) (dim f+1) for B; an operand shared by every cell is read
+;;; through the 2-D map alone.  The body is (mul (in 0) (in 1)), the output
+;;; is the row-major pool buffer, and the combine spec follows the gemm-plan
+;;; of one cell, as for a 2-D matmul.
+
+;; The index expressions of the batched GEMM operands for frame rank f.
+(define (frame-dim-exprs f) (map (lambda (i) `(dim ,i)) (iota f)))
+(define (batched-A-exprs f shared?)
+  (list->vector (append (if shared? '() (frame-dim-exprs f)) `((dim ,f) (dim ,(+ f 2))))))
+(define (batched-B-exprs f shared?)
+  (list->vector (append (if shared? '() (frame-dim-exprs f)) `((dim ,(+ f 2)) (dim ,(+ f 1))))))
+(define (batched-out-exprs f)
+  (list->vector (frame-dim-exprs (+ f 2))))
+
+(define (lower-batch-matmul-binding A-tr B-tr A-ref B-ref pool-idx shape strides dtype)
+  "The seg-red of the batched matmul of the trace-time arrays A-tr and B-tr,
+   found at A-ref and B-ref, writing pool slot pool-idx of the given shape,
+   strides and dtype; #f when blas-exec cannot multiply them."
+  (and (batch-matmul-concrete? A-tr B-tr)
+       (eq? (get-morphism-dtype A-tr) dtype)
+       (let* ((ra (vector-length (get-morphism-shape A-tr)))
+              (rb (vector-length (get-morphism-shape B-tr)))
+              (f  (- (vector-length shape) 2))
+              (operand
+               (lambda (tr ref exprs)
+                 (cases array-morphism tr
+                   (concrete-array (_ s st off dt _ _)
+                     (make-segop-operand ref dt s st off (make-index-map exprs #f 0.0 #f)))
+                   (else (error "lower-batch-matmul-binding: operand not concrete" tr)))))
+              (A    (operand A-tr A-ref (batched-A-exprs f (= ra 2))))
+              (B    (operand B-tr B-ref (batched-B-exprs f (= rb 2))))
+              (plan (prepare-batched-gemm (operand-layout-array A) (operand-layout-array B)))
+              (sA   (get-morphism-shape A-tr))
+              (space (list->vector
+                      (append (vector->list (subvector shape 0 f))
+                              (list (vector-ref sA (- ra 2))
+                                    (vector-ref shape (+ f 1))
+                                    (vector-ref sA (- ra 1))))))
+              (out  (make-segop-operand pool-idx dtype shape strides 0
+                                        (make-index-map (batched-out-exprs f) #f 0.0 #f))))
+         (and plan
+              (make-seg-red space 1 (list A B)
+                            (list (make-red-result out gemm-body
+                                                   (gemm-combine-spec (batched-gemm-plan-cell plan)
+                                                                      dtype)
+                                                   #f)))))))
+
+(define (standard-batched-gemm sg)
+  "The batched GEMM that computes seg-red sg, as a list (A B out plan),
+   or #f when sg is not in the form lower-batch-matmul-binding produces,
+   combine spec included.  plan is the batched-gemm-plan for the operands."
+  (cases segop sg
+    (seg-red (space nred ins results map-outs fallback)
+      (and
+       (>= (vector-length space) 4) (= nred 1) (= (length results) 1) (null? map-outs)
+       (= (length ins) 2)
+       (let* ((f     (- (vector-length space) 3))
+              (A     (car ins))
+              (B     (cadr ins))
+              (res   (car results))
+              (out   (red-result-out res))
+              (dtype (segop-operand-dtype out))
+              (frame (vector->list (subvector space 0 f)))
+              (M     (vector-ref space f))
+              (N     (vector-ref space (+ f 1)))
+              (K     (vector-ref space (+ f 2)))
+              (a-shared? (= (vector-length (segop-operand-shape A)) 2))
+              (b-shared? (= (vector-length (segop-operand-shape B)) 2)))
+         (and
+          (not (red-result-finalize res))
+          (not (and a-shared? b-shared?))
+          (equal? (red-result-body res) gemm-body)
+          (operand-exprs-are? A (batched-A-exprs f a-shared?))
+          (equal? (segop-operand-shape A)
+                  (list->vector (append (if a-shared? '() frame) (list M K))))
+          (operand-exprs-are? B (batched-B-exprs f b-shared?))
+          (equal? (segop-operand-shape B)
+                  (list->vector (append (if b-shared? '() frame) (list K N))))
+          (operand-exprs-are? out (batched-out-exprs f))
+          (operand-flat? out (list->vector (append frame (list M N))))
+          (eq? (segop-operand-dtype A) dtype)
+          (let ((plan (prepare-batched-gemm (operand-layout-array A) (operand-layout-array B))))
+            (and plan
+                 (combine-specs-equal? (red-result-combine res)
+                                       (gemm-combine-spec (batched-gemm-plan-cell plan) dtype))
+                 (list A B out plan)))))))
+    (else #f)))
+
+;; Batched GEMMs run every cell through one prepared batched-gemm-plan.
+(define (batched-gemm-select sg)
+  (let ((g (standard-batched-gemm sg)))
+    (and g
+         (let ((A-ref (segop-operand-slot (car g)))
+               (B-ref (segop-operand-slot (cadr g)))
+               (plan  (cadddr g)))
+           (cons 'segop/gemm-batched
+                 (lambda (deref buf)
+                   (execute-batched-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)))))))
+
 ;; True when fused output o is the product of a GEMM.
 (define (gemm-fused-out? o)
   (let ((red (fused-out-red o))) (and red (eq? (car red) 'gemm))))
@@ -1857,6 +1963,7 @@
 
 (define (registry-select sg)
   (or (registry-gemm-select sg)
+      (batched-gemm-select sg)
       (conv-select sg)
       (registry-fused-select sg)
       (registry-colsum-select sg)
@@ -1866,6 +1973,7 @@
 
 (define (scheme-select sg)
   (or (scheme-gemm-select sg)
+      (batched-gemm-select sg)
       (conv-select sg)
       (scheme-elementwise-select sg)
       (select-standard-reduction sg '(1d axis0 axis1 general))
@@ -1924,6 +2032,13 @@
    #f when the matmul cannot be lowered or no backend accepts its segop."
   (segop-instruction
    (lower-matmul-binding A-tr B-tr A-ref B-ref pool-idx shape strides dtype epilogue)
+   pool-idx shape strides dtype))
+
+(define (compile-batch-matmul-segop A-tr B-tr A-ref B-ref pool-idx shape strides dtype)
+  "The ri-segop instruction of a batch-matmul binding; #f when the product
+   cannot be lowered or no backend accepts its segop."
+  (segop-instruction
+   (lower-batch-matmul-binding A-tr B-tr A-ref B-ref pool-idx shape strides dtype)
    pool-idx shape strides dtype))
 
 (define (compile-conv-segop op meta in-traces in-refs pool-idx shape strides dtype)

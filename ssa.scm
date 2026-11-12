@@ -426,7 +426,7 @@
 ;; Ops that never take part in a fusion: contractions, views and the
 ;; convolution family read their operands in their own patterns.
 (define fusion-barrier-ops
-  '(matmul reshape transpose broadcast-expand slice
+  '(matmul batch-matmul reshape transpose broadcast-expand slice
     im2col col2im conv2d-fwd conv2d-bwd-data conv2d-bwd-weights attention))
 
 ;; The largest number of nodes in a fused body, and of its inputs.
@@ -1614,7 +1614,7 @@
       (let ((in-dtypes (map val-dtype inputs)))
         (cond
          ((not (every values in-dtypes)) dtype)
-         ((memq op '(add sub mul div pow matmul conv2d-bwd-data conv2d-bwd-weights))
+         ((memq op '(add sub mul div pow matmul batch-matmul conv2d-bwd-data conv2d-bwd-weights))
           (fold promote-types (car in-dtypes) (cdr in-dtypes)))
          ((and (pair? op) (eq? (car op) 'reduce))
           (infer-reduction-dtype (cadr op) (car in-dtypes)))
@@ -2012,6 +2012,33 @@
                   (accumulate-input-adjoint! a-val da-val)
                   (accumulate-input-adjoint! b-val db-val)))
 
+               ;; batch-matmul(A, B) -- dA = g @ B^T; dB = A^T @ g, cell by
+               ;; cell; the gradient of an operand shared by every cell is
+               ;; summed over the frame.
+               ((eq? op 'batch-matmul)
+                (let* ((a-val    (list-ref inputs 0))
+                       (b-val    (list-ref inputs 1))
+                       (a-shape  (val-shape a-val))
+                       (b-shape  (val-shape b-val))
+                       (perm-a   (transpose-perm (vector-length a-shape)))
+                       (perm-b   (transpose-perm (vector-length b-shape)))
+                       (at-shape (permute-shape a-shape perm-a))
+                       (bt-shape (permute-shape b-shape perm-b))
+                       (bt-val   (emit! 'transpose (list b-val) bt-shape dtype
+                                        (list (cons 'perm perm-b))))
+                       (at-val   (emit! 'transpose (list a-val) at-shape dtype
+                                        (list (cons 'perm perm-a))))
+                       (da-shape (batch-matmul-shape g-shape bt-shape))
+                       (db-shape (batch-matmul-shape at-shape g-shape))
+                       (da-val   (emit! 'batch-matmul (list g-val bt-val) da-shape dtype
+                                        (batch-matmul-meta g-shape bt-shape)))
+                       (db-val   (emit! 'batch-matmul (list at-val g-val) db-shape dtype
+                                        (batch-matmul-meta at-shape g-shape))))
+                  (accumulate-input-adjoint!
+                   a-val (emit-reduce-sum-to! da-val da-shape a-shape dtype))
+                  (accumulate-input-adjoint!
+                   b-val (emit-reduce-sum-to! db-val db-shape b-shape dtype))))
+
                ;; transpose(x, perm) -- dx = transpose(g, inv-perm)
                ((eq? op 'transpose)
                 (let* ((x-val    (list-ref inputs 0))
@@ -2201,6 +2228,26 @@
 
 ;;; Helper: build the transpose permutation for a rank-r tensor
 ;;; For rank 2: (1 0).  For rank 3: (0 2 1) (transpose last two axes).
+;;; The frame of a batched product of operands of shapes sa and sb: the
+;;; leading dimensions of the operand of rank 3 or more (of A when both are).
+(define (batch-matmul-frame sa sb)
+  (let ((ra (vector-length sa)) (rb (vector-length sb)))
+    (if (> ra 2) (subvector sa 0 (- ra 2)) (subvector sb 0 (- rb 2)))))
+
+;;; The shape of the batched product of operands of shapes sa and sb.
+(define (batch-matmul-shape sa sb)
+  (let ((ra (vector-length sa)) (rb (vector-length sb)))
+    (list->vector (append (vector->list (batch-matmul-frame sa sb))
+                          (list (vector-ref sa (- ra 2)) (vector-ref sb (- rb 1)))))))
+
+;;; The metadata morph-batch-matmul gives the product of operands of shapes
+;;; sa and sb.
+(define (batch-matmul-meta sa sb)
+  (let ((ra (vector-length sa)) (rb (vector-length sb)))
+    `((k-dim . ,(vector-ref sa (- ra 1)))
+      (frame . ,(batch-matmul-frame sa sb))
+      (frame-form . ,(cond ((= rb 2) 'a) ((= ra 2) 'b) (else 'both))))))
+
 (define (transpose-perm rank)
   (if (= rank 2)
       '(1 0)
@@ -2248,6 +2295,8 @@
          (morph-reduce 'prod (car inputs) axes keepdims?)))
       ((eq? op 'matmul)
        (morph-matmul (car inputs) (cadr inputs)))
+      ((eq? op 'batch-matmul)
+       (morph-batch-matmul (car inputs) (cadr inputs)))
       ((eq? op 'transpose)
        (let ((perm (cdr (assq 'perm meta))))
          (morph-transpose (car inputs) perm)))
@@ -2720,6 +2769,15 @@
       ;; matmul: a seg-red over (M N K), routed to the BLAS backend through
       ;; a gemm-plan prepared from the trace-time operand layouts (see
       ;; lower-matmul-binding in segop-lower.scm).
+      ;; batch-matmul: a seg-red over the frame and (M N K), with one
+      ;; gemm-plan for every cell (see lower-batch-matmul-binding).
+      ((eq? op 'batch-matmul)
+       (or (compile-batch-matmul-segop (trace-arr-of (car  (ssa-binding-inputs b)))
+                                       (trace-arr-of (cadr (ssa-binding-inputs b)))
+                                       (car in-refs) (cadr in-refs) pool-idx shape strides dtype)
+           (error "compile-one-instruction: batch-matmul not BLAS-compatible"
+                  (ssa-binding-name b))))
+
       ((eq? op 'matmul)
        (or (compile-matmul-segop (trace-arr-of (car  (ssa-binding-inputs b)))
                                  (trace-arr-of (cadr (ssa-binding-inputs b)))

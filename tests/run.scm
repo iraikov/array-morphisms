@@ -16,6 +16,7 @@
 (include-relative "test-segop.scm")
 (include-relative "test-basic-ops.scm")
 (include-relative "test-batch-ops.scm")
+(include-relative "test-batch-matmul.scm")
 (include-relative "test-blas.scm")
 (include-relative "test-microblas.scm")
 (include-relative "test-structural-ops.scm")

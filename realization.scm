@@ -564,8 +564,8 @@
 
   (define (linalg-op? op)
     "True for the ops whose morphisms carry an identity-fn placeholder and
-    must be executed by a GEMM, GEMV or DOT kernel."
-    (memq op '(matmul matvec dot)))
+    must be executed by GEMM, GEMV or DOT kernels."
+    (memq op '(matmul batch-matmul matvec dot)))
 
   (define (unsupported-linalg-error op operands dtype)
     "Signal that a matmul, matvec or dot cannot be executed on operands."
@@ -635,13 +635,19 @@
                      ;; Operands of mixed dtype are promoted to the
                      ;; expression dtype; input-ids above still refer to
                      ;; the unconverted operands.
+                     (batched?  (eq? op 'batch-matmul))
                      (blas-info
-                      (blas-compatible-operation?
-                       (morphism-expr morph-id op
-                                      (promote-blas-operands
-                                       op realized-operands dtype)
-                                      index-fn shape dtype metadata
-                                      batch-axis))))
+                      (if batched?
+                          (let ((ops (promote-blas-operands op realized-operands dtype)))
+                            (and (execute-blas-batch-matmul/into!
+                                  (car ops) (cadr ops) result-data)
+                                 '(batch-matmul)))
+                          (blas-compatible-operation?
+                           (morphism-expr morph-id op
+                                          (promote-blas-operands
+                                           op realized-operands dtype)
+                                          index-fn shape dtype metadata
+                                          batch-axis)))))
                 (when (and (not blas-info) (linalg-op? op))
                   (unsupported-linalg-error op realized-operands dtype))
                 ;; Fill result-data via BLAS/into! or the generic index kernel.
@@ -649,6 +655,8 @@
                     (let ((blas-op  (car blas-info))
                           (blas-ops (cdr blas-info)))
                       (case blas-op
+                        ;; A batched product has already been written.
+                        ((batch-matmul) (void))
                         ((gemm)
                          (execute-blas-gemm/into!
                           (car blas-ops) (cadr blas-ops) result-data))

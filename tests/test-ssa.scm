@@ -4075,4 +4075,138 @@
           (* 4 (max s1 s2))
           (cdr (assq 'conv-scratch-bytes (replay-plan-stats joint))))))))
 
+;;;; Batched GEMM as seg-red
+;;;;
+;;;; A batch-matmul is one seg-red over the frame and (M N K), run cell by
+;;;; cell through one batched gemm-plan.  Forward values are compared, bit
+;;;; for bit, with realize.  Gradients of framed operands are compared bit
+;;;; for bit with the 2-D products of their cells.  The gradient of an
+;;;; operand shared by every cell is a sum over the frame, which ssa-vjp
+;;;; computes as one reduction; it is compared within a tolerance with the
+;;;; cell products summed in frame order.
+;;;; ============================================================
+
+;; A framed (frame a list, possibly empty) operand of cell shape
+;; (rows cols), stored transposed when t?.
+(define (bs-operand dt frame rows cols t? seed)
+  (let* ((stored (if t? (list cols rows) (list rows cols)))
+         (vals   (map (lambda (v) (gm-round dt v))
+                      (gm-vals (apply * (append frame stored)) seed)))
+         (m      (morph-from-list vals (list->vector (append frame stored)) dt))
+         (r      (+ 2 (length frame))))
+    (if t? (morph-transpose m (append (iota (- r 2)) (list (- r 1) (- r 2)))) m)))
+
+;; Cell c of the realized array m of rank 3, copied into an array of its
+;; own with the same in-cell layout.
+(define (bs-cell m c)
+  (cases array-morphism (realize m)
+    (concrete-array (data shape strides offset dtype _ _)
+      (let* ((rows (vector-ref shape 1)) (cols (vector-ref shape 2))
+             (s1 (vector-ref strides 1)) (s2 (vector-ref strides 2))
+             (t? (and (= s1 1) (> rows 1))))
+        (let* ((ref (lambda (i j) (typed-vector-ref data dtype
+                                                    (+ offset (* c (vector-ref strides 0))
+                                                       (* i s1) (* j s2)))))
+               (vals (if t?
+                         (append-map* (lambda (j) (map (lambda (i) (ref i j)) (iota rows)))
+                                      (iota cols))
+                         (append-map* (lambda (i) (map (lambda (j) (ref i j)) (iota cols)))
+                                      (iota rows)))))
+          (if t?
+              (morph-transpose (morph-from-list vals (vector cols rows) dtype) '(1 0))
+              (morph-from-list vals (vector rows cols) dtype)))))
+    (else (error "bs-cell: not concrete"))))
+
+(define (bs-tags prog)
+  (filter (lambda (t) (eq? t 'segop/gemm-batched)) (s2-tags prog)))
+
+(test-group "batched GEMM as seg-red"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (form)
+        (for-each
+         (lambda (mkn)
+           (for-each
+            (lambda (tB?)
+              (let* ((M (car mkn)) (K (cadr mkn)) (N (caddr mkn))
+                     (A (bs-operand dt (if (eq? form 'b) '() '(3)) M K #f 0.3))
+                     (B (bs-operand dt (if (eq? form 'a) '() '(3)) K N tB? 1.1))
+                     (name (sprintf "~A ~A ~Ax~Ax~A~A" dt form M K N (if tB? " B^T" "")))
+                     (r (s2-run (lambda () (morph-batch-matmul A B)))))
+                (test (string-append name ": one batched GEMM segop") 1
+                      (length (bs-tags (car r))))
+                (test (string-append name ": executors agree with the interpreter") 0
+                      (list-ref r 4))
+                (test-assert (string-append name ": replay reproduces the trace")
+                  (s2-same-lists? (cadr r) (caddr r)))
+                (test-assert (string-append name ": values equal realize")
+                  (s2-same-lists? (cadr r) (s2-values (realize (morph-batch-matmul A B)))))))
+            '(#f #t)))
+         '((3 4 5) (9 8 10))))
+      '(both a b)))
+   '(f32 f64))
+
+  ;; gradients of loss = sum(bmm(A, B) * C)
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (form)
+        (let* ((F 4) (M 9) (K 8) (N 10)
+               (A0 (bs-operand dt (if (eq? form 'b) '() (list F)) M K #f 0.3))
+               (B0 (bs-operand dt (if (eq? form 'a) '() (list F)) K N #f 1.1))
+               (C0 (bs-operand dt (list F) M N #f 2.3))
+               (make (lambda ()
+                       (let* ((A (am:make-var A0 #t)) (B (am:make-var B0 #t))
+                              (C (am:make-var C0 #f)))
+                         (values (am:var-sum (am:var* (am:var-matmul A B) C)) (list A B)))))
+               (name (sprintf "~A ~A" dt form))
+               (tol (if (eq? dt 'f32) 1e-5 1e-12)))
+          (let-values (((joint trace replay) (ssa-results make)))
+            (let* ((cell (lambda (m c) (if (= (vector-length (get-morphism-shape m)) 2)
+                                           m (bs-cell m c))))
+                   (t2   (lambda (m) (morph-transpose m '(1 0))))
+                   (dA-cells (map (lambda (c) (concrete->list
+                                               (morph-matmul (cell C0 c) (t2 (cell B0 c)))))
+                                  (iota F)))
+                   (dB-cells (map (lambda (c) (concrete->list
+                                               (morph-matmul (t2 (cell A0 c)) (cell C0 c))))
+                                  (iota F)))
+                   (frame-sum (lambda (cells)
+                                (fold (lambda (cl acc) (map + acc cl)) (car cells) (cdr cells)))))
+              (test-assert (string-append name ": replay reproduces the trace")
+                (every s2-same-lists? trace replay))
+              (test-assert (string-append name ": dA")
+                (if (eq? form 'b)
+                    (results-close? (list (cadr trace)) (list (frame-sum dA-cells)) tol)
+                    (s2-same-lists? (cadr trace) (apply append dA-cells))))
+              (test-assert (string-append name ": dB")
+                (if (eq? form 'a)
+                    (results-close? (list (caddr trace)) (list (frame-sum dB-cells)) tol)
+                    (s2-same-lists? (caddr trace) (apply append dB-cells))))))))
+      '(both a b)))
+   '(f32 f64))
+
+  ;; fusion policies give the same loss and gradients (relu(bmm + bias))
+  (for-each
+   (lambda (dt)
+     (let* ((A0 (bs-operand dt '(3) 9 8 #f 0.3))
+            (B0 (bs-operand dt '() 8 10 #f 1.1))
+            (b0 (morph-from-list (map (lambda (i) (gm-round dt (* 0.1 (- i 5)))) (iota 10))
+                                 #(10) dt))
+            (make (lambda ()
+                    (let* ((A (am:make-var A0 #t)) (B (am:make-var B0 #t))
+                           (b (am:make-var b0 #t))
+                           (h (am:var-relu (am:var+ (am:var-matmul A B) b))))
+                      (values (am:var-mean (am:var* h h)) (list A B b)))))
+            (run (lambda (policy)
+                   (parameterize ((segop-fusion policy))
+                     (let-values (((joint trace replay) (ssa-results make))) trace))))
+            (off (run #f)))
+       (test-assert (sprintf "~A: fusion on equals fusion off" dt)
+         (every s2-same-lists? off (run #t)))
+       (test-assert (sprintf "~A: fusion 'all equals fusion off" dt)
+         (every s2-same-lists? off (run 'all)))))
+   '(f32 f64)))
+
 (test-end)

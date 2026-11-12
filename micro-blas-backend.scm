@@ -128,6 +128,41 @@
                 data-B ldb-B (%trans->int transb) beta data-C)))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Offset GEMM kernels
+  ;;; Normalized signature:
+  ;;;   (M N K alpha data-A off-A lda-A transa data-B off-B ldb-B transb
+  ;;;    beta data-C off-C) -> void
+  ;;; The strided kernels above, on matrices that start at element offsets
+  ;;; into their vectors.
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define %c-sgemm-offset
+    (foreign-lambda* int ((int M) (int N) (int K) (float alpha)
+                          (f32vector A) (int offa) (int lda) (int ta)
+                          (f32vector B) (int offb) (int ldb) (int tb)
+                          (float beta) (f32vector C) (int offc))
+      "C_return(mb_sgemm(M, N, K, alpha, A + offa, lda, ta, B + offb, ldb, tb, beta, C + offc));"))
+
+  (define %c-dgemm-offset
+    (foreign-lambda* int ((int M) (int N) (int K) (double alpha)
+                          (f64vector A) (int offa) (int lda) (int ta)
+                          (f64vector B) (int offb) (int ldb) (int tb)
+                          (double beta) (f64vector C) (int offc))
+      "C_return(mb_dgemm(M, N, K, alpha, A + offa, lda, ta, B + offb, ldb, tb, beta, C + offc));"))
+
+  (define (%mb-sgemm-offset M N K alpha data-A off-A lda-A transa data-B off-B ldb-B transb
+                            beta data-C off-C)
+    (%check-mb-error! "gemm-offset-f32"
+      (%c-sgemm-offset M N K alpha data-A off-A lda-A (%trans->int transa)
+                       data-B off-B ldb-B (%trans->int transb) beta data-C off-C)))
+
+  (define (%mb-dgemm-offset M N K alpha data-A off-A lda-A transa data-B off-B ldb-B transb
+                            beta data-C off-C)
+    (%check-mb-error! "gemm-offset-f64"
+      (%c-dgemm-offset M N K alpha data-A off-A lda-A (%trans->int transa)
+                       data-B off-B ldb-B (%trans->int transb) beta data-C off-C)))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; GEMV kernels
   ;;; Normalized signature: (M N alpha data-A data-x beta data-y) -> void
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -243,6 +278,7 @@
      %mb-conv-bwd-weights-im2col-f32
      %mb-conv-fwd-nhwc-im2col-f32
      %mb-conv-bwd-data-nhwc-im2col-f32
-     %mb-conv-bwd-weights-nhwc-im2col-f32))
+     %mb-conv-bwd-weights-nhwc-im2col-f32
+     %mb-dgemm-offset   %mb-sgemm-offset))  ; gemm-offset-f64   gemm-offset-f32
 
 ) ;; end module array-morphisms-micro-blas-backend
