@@ -69,6 +69,8 @@
    blas-backend-conv-bwd-weights-nhwc-im2col-f32
    blas-backend-gemm-offset-f64
    blas-backend-gemm-offset-f32
+   blas-backend-dot-offset-f64
+   blas-backend-dot-offset-f32
 
    ;; Backend registration and inspection
    register-blas-backend!
@@ -161,14 +163,15 @@
   ;; this interface.  This means blas-exec.scm carries no direct dependency
   ;; on the 'blas' egg, CUDA bindings, or chicken-crunch.
   ;;
-  ;; Two optional fields hold GEMM kernels that read and write their
-  ;; matrices at element offsets into the vectors:
+  ;; Four optional fields hold GEMM and DOT kernels that read and write
+  ;; their operands at element offsets into the vectors:
   ;;   gemm-offset-f64/f32 :
   ;;     (M N K alpha data-A off-A lda transa data-B off-B ldb transb beta
   ;;      data-C off-C) -> void
-  ;; They compute what the strided kernel computes for matrices stored from
-  ;; those offsets; C is row-major with leading dimension N.  A backend
-  ;; without them leaves the fields #f.
+  ;;   dot-offset-f64/f32 : (N data-x off-x data-y off-y) -> number
+  ;; They compute what the strided GEMM kernel and the DOT kernel compute
+  ;; for operands stored from those offsets; C is row-major with leading
+  ;; dimension N.  A backend without them leaves the fields #f.
   (define-record-type blas-backend
     (%make-blas-backend name
                         gemm-f64 gemm-f32 gemm-strided-f64 gemm-strided-f32
@@ -177,7 +180,8 @@
                         conv-bwd-weights-im2col-f32
                         conv-fwd-nhwc-im2col-f32 conv-bwd-data-nhwc-im2col-f32
                         conv-bwd-weights-nhwc-im2col-f32
-                        gemm-offset-f64 gemm-offset-f32)
+                        gemm-offset-f64 gemm-offset-f32
+                        dot-offset-f64 dot-offset-f32)
     blas-backend?
     (name              blas-backend-name)     ; symbol: backend identity
     (gemm-f64          blas-backend-gemm-f64) ; (M N K alpha data-A data-B beta data-C) -> void, or #f
@@ -207,7 +211,9 @@
     (conv-bwd-data-nhwc-im2col-f32    blas-backend-conv-bwd-data-nhwc-im2col-f32)
     (conv-bwd-weights-nhwc-im2col-f32 blas-backend-conv-bwd-weights-nhwc-im2col-f32)
     (gemm-offset-f64   blas-backend-gemm-offset-f64)
-    (gemm-offset-f32   blas-backend-gemm-offset-f32))
+    (gemm-offset-f32   blas-backend-gemm-offset-f32)
+    (dot-offset-f64    blas-backend-dot-offset-f64)
+    (dot-offset-f32    blas-backend-dot-offset-f32))
 
   (define (make-blas-backend name
                              gemm-f64 gemm-f32 gemm-strided-f64 gemm-strided-f32
@@ -216,9 +222,10 @@
                              conv-bwd-weights-im2col-f32
                              conv-fwd-nhwc-im2col-f32 conv-bwd-data-nhwc-im2col-f32
                              conv-bwd-weights-nhwc-im2col-f32
-                             #!optional (gemm-offset-f64 #f) (gemm-offset-f32 #f))
+                             #!optional (gemm-offset-f64 #f) (gemm-offset-f32 #f)
+                             (dot-offset-f64 #f) (dot-offset-f32 #f))
     "Make a blas-backend record from its kernels, in the order of the fields
-    above; each is a procedure or #f.  The two offset GEMM kernels are
+    above; each is a procedure or #f.  The offset GEMM and DOT kernels are
     optional."
     (%make-blas-backend name
                         gemm-f64 gemm-f32 gemm-strided-f64 gemm-strided-f32
@@ -227,7 +234,8 @@
                         conv-bwd-weights-im2col-f32
                         conv-fwd-nhwc-im2col-f32 conv-bwd-data-nhwc-im2col-f32
                         conv-bwd-weights-nhwc-im2col-f32
-                        gemm-offset-f64 gemm-offset-f32))
+                        gemm-offset-f64 gemm-offset-f32
+                        dot-offset-f64 dot-offset-f32))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Configuration

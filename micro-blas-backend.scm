@@ -163,6 +163,20 @@
                        data-B off-B ldb-B (%trans->int transb) beta data-C off-C)))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Offset DOT kernels
+  ;;; Normalized signature: (N data-x off-x data-y off-y) -> number
+  ;;; The DOT kernels on vectors that start at element offsets.
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define %mb-sdot-offset
+    (foreign-lambda* float ((int N) (f32vector x) (int offx) (f32vector y) (int offy))
+      "C_return(mb_sdot(N, x + offx, y + offy));"))
+
+  (define %mb-ddot-offset
+    (foreign-lambda* double ((int N) (f64vector x) (int offx) (f64vector y) (int offy))
+      "C_return(mb_ddot(N, x + offx, y + offy));"))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; GEMV kernels
   ;;; Normalized signature: (M N alpha data-A data-x beta data-y) -> void
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -279,6 +293,7 @@
      %mb-conv-fwd-nhwc-im2col-f32
      %mb-conv-bwd-data-nhwc-im2col-f32
      %mb-conv-bwd-weights-nhwc-im2col-f32
-     %mb-dgemm-offset   %mb-sgemm-offset))  ; gemm-offset-f64   gemm-offset-f32
+     %mb-dgemm-offset   %mb-sgemm-offset    ; gemm-offset-f64   gemm-offset-f32
+     %mb-ddot-offset    %mb-sdot-offset))   ; dot-offset-f64    dot-offset-f32
 
 ) ;; end module array-morphisms-micro-blas-backend

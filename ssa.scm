@@ -827,7 +827,7 @@
                                                              (iota rank)))
                                           #f 0.0 #f)
                           (identity-index-map (length par))))
-             (path  (reduction-path rop s (compute-strides s) 0 sdt red))
+             (path  (framed-path rop s (compute-strides s) 0 sdt red (binding-frame-rank meta)))
              (spec  (reduction-combine-spec rop path sdt (ssa-binding-dtype r)))
              (count (fold (lambda (k acc) (* acc (vector-ref s k))) 1 red)))
         (cond ((eq? (combine-spec-order spec) 'unspecified) (values #f 'reduction-order))
@@ -1505,10 +1505,13 @@
 
             (reduction-morphism (morph-id rop operand reduce-axes index-fn shape dtype batch-axis)
               (let* ((src-val (visit operand))
-                     (meta    (list (cons 'axes reduce-axes)
-                                    (cons 'index-fn index-fn)
-                                    (cons 'src-shape (morph-shape operand))
-                                    (cons 'keepdims? (reduction-index-fn-keepdims? index-fn))))
+                     (frame-rank (reduction-index-fn-frame-rank index-fn))
+                     (meta    (append
+                               (list (cons 'axes reduce-axes)
+                                     (cons 'index-fn index-fn)
+                                     (cons 'src-shape (morph-shape operand))
+                                     (cons 'keepdims? (reduction-index-fn-keepdims? index-fn)))
+                               (if (> frame-rank 0) (list (cons 'frame-rank frame-rank)) '())))
                      (v       (emit-binding! (list 'reduce rop) (list src-val) shape dtype meta)))
                 (env-builder-extend! visited-eb (morph-stable-id m) v)
                 v)))))
@@ -2267,6 +2270,11 @@
 ;;; inputs, construct a lazy morphism to pass to realize.
 ;;; ============================================================
 
+;;; The frame rank of a reduction binding's meta (see morph-reduce): 0
+;;; unless the meta has a frame-rank entry.
+(define (binding-frame-rank meta)
+  (let ((p (assq 'frame-rank meta))) (if p (cdr p) 0)))
+
 (define (rebuild-morphism b inputs)
   "Reconstruct a lazy morphism from an SSA binding and concrete inputs."
   (let ((op   (ssa-binding-op b))
@@ -2276,23 +2284,23 @@
       ((equal? op '(reduce mean))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
-         (morph-reduce 'mean (car inputs) axes keepdims?)))
+         (morph-reduce 'mean (car inputs) axes keepdims? (binding-frame-rank meta))))
       ((equal? op '(reduce sum))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
-         (morph-reduce 'sum (car inputs) axes keepdims?)))
+         (morph-reduce 'sum (car inputs) axes keepdims? (binding-frame-rank meta))))
       ((equal? op '(reduce max))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
-         (morph-reduce 'max (car inputs) axes keepdims?)))
+         (morph-reduce 'max (car inputs) axes keepdims? (binding-frame-rank meta))))
       ((equal? op '(reduce min))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
-         (morph-reduce 'min (car inputs) axes keepdims?)))
+         (morph-reduce 'min (car inputs) axes keepdims? (binding-frame-rank meta))))
       ((equal? op '(reduce prod))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
-         (morph-reduce 'prod (car inputs) axes keepdims?)))
+         (morph-reduce 'prod (car inputs) axes keepdims? (binding-frame-rank meta))))
       ((eq? op 'matmul)
        (morph-matmul (car inputs) (cadr inputs)))
       ((eq? op 'batch-matmul)
@@ -2792,7 +2800,8 @@
                                 (cdr (assq 'axes meta))
                                 (cdr (assq 'keepdims? meta))
                                 (trace-arr-of (car (ssa-binding-inputs b)))
-                                (car in-refs) pool-idx shape strides dtype))
+                                (car in-refs) pool-idx shape strides dtype
+                                (binding-frame-rank meta)))
 
       ;; The convolution family: segops read through guarded maps, run by
       ;; the convolution executors (see Convolutions in segop-lower.scm).

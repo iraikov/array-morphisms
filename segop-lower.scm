@@ -399,7 +399,7 @@
 (define (reduction-combine-spec rop path src-dtype out-dtype)
   (let ((sum? (memq rop '(sum mean))))
     (case path
-      ((1d)
+      ((1d rows-1d)
        (if sum?
            (make-combine-spec 'add 0.0 'f64 'unspecified)
            (make-combine-spec rop (reduction-neutral rop 'f64) 'f64)))
@@ -407,7 +407,7 @@
        (if sum?
            (make-combine-spec 'add 0.0 src-dtype)
            (make-combine-spec rop (reduction-neutral rop src-dtype) src-dtype)))
-      ((axis1)
+      ((axis1 rows)
        (if sum?
            (make-combine-spec 'add 0.0 'f64)
            (make-combine-spec rop (reduction-neutral rop 'f64) 'f64)))
@@ -419,20 +419,40 @@
                           (reduction-neutral rop out-dtype)
                           out-dtype)))))
 
+;; The path whose combine spec describes a reduction with frame rank
+;; frame-rank: the path of reduction-path when the reduction runs as an
+;; unframed one, rows when its rows run as the axis1 rows of one array, and
+;; rows-1d when each row runs the 1d code.
+(define (framed-path rop shape strides offset dtype red frame-rank)
+  (let ((plan (framed-reduction-plan rop shape strides dtype red frame-rank)))
+    (if (eq? plan 'direct)
+        (reduction-path rop shape strides offset dtype red)
+        (car plan))))
+
 (define (combine-specs-equal? a b)
   (and (equal? (combine-spec-op a) (combine-spec-op b))
        (eqv? (combine-spec-neutral a) (combine-spec-neutral b))
        (eq? (combine-spec-acc-dtype a) (combine-spec-acc-dtype b))
        (eq? (combine-spec-order a) (combine-spec-order b))))
 
-(define (lower-reduction-binding rop axes keepdims? src-tr in-ref pool-idx shape strides dtype)
+(define (lower-reduction-binding rop axes keepdims? src-tr in-ref pool-idx shape strides dtype
+                                 #!optional (frame-rank 0))
   "The seg-red of reduction rop over axes (with keepdims?) of the trace-time
    source array src-tr, found at in-ref at replay, writing pool slot
    pool-idx of the given shape, strides and dtype.  The space lists the
    kept axes, then the reduced axes in increasing order.  Its combine spec
-   is the one of the loop execute-reduction-morphism takes for this layout."
+   is the one of the loop execute-framed-reduction takes for this layout
+   and frame rank.  A framed reduction whose rows run as the rows of one
+   array, over a row-major source, is lowered as the axis-1 reduction of
+   the source viewed as that [R, N] array."
   (cases array-morphism src-tr
-    (concrete-array (_ s st off sdt _ _)
+    (concrete-array (data s st off sdt _ _)
+     (let ((plan (framed-reduction-plan rop s st sdt (sort-axes axes) frame-rank)))
+      (if (and (pair? plan) (eq? (car plan) 'rows) (= off 0) (equal? st (compute-strides s)))
+          (let ((R (cadr plan)) (N (caddr plan)))
+            (lower-reduction-binding rop '(1) #f
+                                     (concrete-array data (vector R N) (vector N 1) 0 sdt -1 -1)
+                                     in-ref pool-idx (vector R) (vector 1) dtype))
       (let* ((rank  (vector-length s))
              (red   (filter (lambda (k) (memv k axes)) (iota rank)))
              (par   (filter (lambda (k) (not (memv k axes))) (iota rank)))
@@ -447,15 +467,19 @@
                                           #f 0.0 #f)
                           (identity-index-map (length par))))
              (count (fold (lambda (k acc) (* acc (vector-ref s k))) 1 red))
-             (path  (reduction-path rop s st off sdt red)))
+             (path  (framed-path rop s st off sdt red frame-rank)))
         (make-seg-red space (length red)
                       (list (make-segop-operand in-ref sdt s st off in-map))
                       (list (make-red-result
                              (make-segop-operand pool-idx dtype shape strides 0 out-map)
                              '(in 0)
                              (reduction-combine-spec rop path sdt dtype)
-                             (and (eq? rop 'mean) `(/ (reduced) ,count)))))))
+                             (and (eq? rop 'mean) `(/ (reduced) ,count)))))))))
     (else (error "lower-reduction-binding: source not concrete" src-tr))))
+
+;; The axes in increasing order.
+(define (sort-axes axes)
+  (filter (lambda (k) (memv k axes)) (iota (+ 1 (fold max -1 axes)))))
 
 (define (standard-reduction sg)
   "The parameters of execute-reduction-morphism that compute seg-red sg, as
@@ -507,24 +531,50 @@
                              (else #f))))
             (and (not (eq? keepdims? 'no))
                  rop
-                 (let ((path (reduction-path rop (segop-operand-shape src) (segop-operand-strides src)
-                                             (segop-operand-offset src) (segop-operand-dtype src) red)))
-                   (and (combine-specs-equal?
-                         spec (reduction-combine-spec rop path (segop-operand-dtype src)
-                                                      (segop-operand-dtype out)))
-                        (list rop red keepdims? (get-reduction-function rop) src path)))))))))
+                 (let* ((sdt  (segop-operand-dtype src))
+                        (odt  (segop-operand-dtype out))
+                        (path (reduction-path rop (segop-operand-shape src) (segop-operand-strides src)
+                                              (segop-operand-offset src) sdt red))
+                        (spec-of (lambda (p) (reduction-combine-spec rop p sdt odt)))
+                        (rows? (and (= nred 1) (= (car red) (- rank 1)) (> rank 1)
+                                    (memq sdt '(f32 f64)) (eq? sdt odt)
+                                    (operand-row-major? src))))
+                   (cond
+                    ((combine-specs-equal? spec (spec-of path))
+                     (list rop red keepdims? (get-reduction-function rop) src path))
+                    ((and rows? (memq rop '(sum mean))
+                          (combine-specs-equal? spec (spec-of 'rows-1d)))
+                     (list rop red keepdims? (get-reduction-function rop) src 'rows-1d))
+                    (else #f)))))))))
     (else #f)))
 
+;; The executor of a standard reduction.  The source's layout is the one
+;; of the segop operand, which describes the replayed array or a view of
+;; it with another shape.
 (define (reduction-executor rop axes keepdims? reducer src out)
   (let ((in-ref    (segop-operand-slot src))
         (src-dtype (segop-operand-dtype src))
+        (s         (segop-operand-shape src))
+        (st        (segop-operand-strides src))
+        (off       (segop-operand-offset src))
         (out-shape (segop-operand-shape out))
         (out-dtype (segop-operand-dtype out)))
     (lambda (deref buf)
       (cases array-morphism (deref in-ref)
-        (concrete-array (data s st off _ _ _)
+        (concrete-array (data _ _ _ _ _ _)
           (execute-reduction-morphism rop buf out-shape data s st off
                                       axes reducer keepdims? out-dtype src-dtype))
+        (else (error "reduction: source not concrete"))))))
+
+;; The executor of a reduction over the rows of src (path rows or rows-1d).
+(define (rows-reduction-executor kind rop reducer src out)
+  (let ((in-ref    (segop-operand-slot src))
+        (src-dtype (segop-operand-dtype src))
+        (out-dtype (segop-operand-dtype out)))
+    (lambda (deref buf)
+      (cases array-morphism (deref in-ref)
+        (concrete-array (data s st off _ _ _)
+          (execute-rows-reduction kind rop buf data s st off reducer out-dtype src-dtype))
         (else (error "reduction: source not concrete"))))))
 
 ;; (tag . executor) for a standard reduction whose path is one of paths.
@@ -535,12 +585,18 @@
          (let ((out (red-result-out (car (cases segop sg
                                             (seg-red (space nred ins results map-outs fallback) results)
                                             (else '()))))))
-           (cons (case (list-ref r 5)
-                   ((1d) 'segop/reduce-1d)
-                   ((axis0) 'segop/reduce-axis0)
-                   ((axis1) 'segop/reduce-axis1)
-                   (else 'segop/reduce-general))
-                 (reduction-executor (car r) (cadr r) (caddr r) (cadddr r) (list-ref r 4) out))))))
+           (case (list-ref r 5)
+             ((rows-1d)
+              (cons 'segop/reduce-rows-1d
+                    (rows-reduction-executor 'rows-1d (car r) (cadddr r) (list-ref r 4) out)))
+             (else
+              (cons (case (list-ref r 5)
+                      ((1d) 'segop/reduce-1d)
+                      ((axis0) 'segop/reduce-axis0)
+                      ((axis1) 'segop/reduce-axis1)
+                      (else 'segop/reduce-general))
+                    (reduction-executor (car r) (cadr r) (caddr r) (cadddr r) (list-ref r 4)
+                                        out))))))))
 
 ;;; ------------------------------------------------------------
 ;;; Affine gathers and host index functions
@@ -1976,7 +2032,7 @@
       (batched-gemm-select sg)
       (conv-select sg)
       (scheme-elementwise-select sg)
-      (select-standard-reduction sg '(1d axis0 axis1 general))
+      (select-standard-reduction sg '(1d axis0 axis1 general rows-1d))
       (strided-select sg)
       (strided-multi-select sg)
       (strided-red-select sg)
@@ -2013,10 +2069,13 @@
    (lower-elementwise-binding b combiner in-traces in-refs pool-idx shape strides dtype)
    pool-idx shape strides dtype))
 
-(define (compile-reduction-segop rop axes keepdims? src-tr in-ref pool-idx shape strides dtype)
-  "The ri-segop instruction of a reduction binding."
+(define (compile-reduction-segop rop axes keepdims? src-tr in-ref pool-idx shape strides dtype
+                                 #!optional (frame-rank 0))
+  "The ri-segop instruction of a reduction binding with frame rank
+   frame-rank (see morph-reduce)."
   (or (segop-instruction
-       (lower-reduction-binding rop axes keepdims? src-tr in-ref pool-idx shape strides dtype)
+       (lower-reduction-binding rop axes keepdims? src-tr in-ref pool-idx shape strides dtype
+                                frame-rank)
        pool-idx shape strides dtype)
       (error "compile-reduction-segop: no backend accepts the reduction" rop axes)))
 

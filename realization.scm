@@ -19,6 +19,9 @@
    execute-compute-morphism
    execute-window-morphism
    execute-reduction-morphism
+   execute-framed-reduction
+   execute-rows-reduction
+   framed-reduction-plan
    reduction-path
    reduction-neutral
    execute-routing-morphism
@@ -92,6 +95,7 @@
   (import scheme (scheme base) (chicken base) (chicken module)
           (only (chicken fixnum) fx+ fx* fx= fx/)
           (only (chicken flonum) fp+ fp- fp* fp/ fpexp fpsqrt)
+          (only (chicken memory) move-memory!)
           (only srfi-1 make-list fold iota every zip drop-right take last drop append-map filter-map filter count fold-right find)
           (only srfi-4 f32vector f64vector s32vector s64vector u32vector u64vector
                 f32vector-length f64vector-length s32vector-length
@@ -714,22 +718,24 @@
                 (case mode
                   ((trace)
                    (let ((result-data (allocate-typed-vector dtype size)))
-                     (execute-reduction-morphism
+                     (execute-framed-reduction
                       op result-data shape
                       src-data src-shape src-strides src-offset
                       reduce-axes (reduction-index-fn-reducer index-fn)
-                      (reduction-index-fn-keepdims? index-fn) dtype src-dtype)
+                      (reduction-index-fn-keepdims? index-fn) dtype src-dtype
+                      (reduction-index-fn-frame-rank index-fn))
                      (record! alloc-id dtype size shape (list input-id))
                      (concrete-array result-data shape
                                      (compute-strides shape) 0 dtype
                                      alloc-id batch-axis)))
                   ((replay)
                    (let ((result-data (get-buf! alloc-id dtype size)))
-                     (execute-reduction-morphism
+                     (execute-framed-reduction
                       op result-data shape
                       src-data src-shape src-strides src-offset
                       reduce-axes (reduction-index-fn-reducer index-fn)
-                      (reduction-index-fn-keepdims? index-fn) dtype src-dtype)
+                      (reduction-index-fn-keepdims? index-fn) dtype src-dtype
+                      (reduction-index-fn-frame-rank index-fn))
                      (concrete-array result-data shape
                                      (compute-strides shape) 0 dtype
                                      alloc-id batch-axis)))
@@ -2777,11 +2783,12 @@
                      (src-size (shape-size src-shape)))
                 
                 ;; Execute reduction
-                (execute-reduction-morphism op result-data shape
-                                            src-data src-shape
-                                            src-strides src-offset
-                                            reduce-axes reducer 
-                                            keepdims? dtype src-dtype)
+                (execute-framed-reduction op result-data shape
+                                          src-data src-shape
+                                          src-strides src-offset
+                                          reduce-axes reducer
+                                          keepdims? dtype src-dtype
+                                          (reduction-index-fn-frame-rank index-fn))
                 
                 (concrete-array result-data shape 
                               (compute-strides shape) 0 dtype -1
@@ -3140,6 +3147,155 @@
          ))
       ))
 
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Framed Reductions
+  ;;;
+  ;;; A reduction with frame rank f reduces each cell of the frame (the
+  ;;; array of the axes after the first f at one frame position) as the
+  ;;; same reduction of that cell stored in an array of its own would: the
+  ;;; cell's path is the one reduction-path picks for the cell's shape and
+  ;;; strides at offset 0.  Most cells already get the same accumulation
+  ;;; from the loop the whole source takes.  Two paths need more:
+  ;;;   axis1  the cells' rows are reduced as rows of one [R, N] array,
+  ;;;          R the number of rows in all cells;
+  ;;;   1d     a sum or mean of each contiguous row runs the 1d code on
+  ;;;          that row, through the backend's offset DOT kernel when it
+  ;;;          has one; a max or min of the rows is the axis1 loop.
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (framed-reduction-plan op src-shape src-strides src-dtype reduce-axes frame-rank)
+    "How a reduction with frame rank frame-rank runs: direct (the
+    unframed loop), (rows R N) or (rows-1d R N), with R rows of N
+    elements."
+    (if (= frame-rank 0)
+        'direct
+        (let* ((rank  (vector-length src-shape))
+               (cs    (subvector src-shape frame-rank rank))
+               (cst   (subvector src-strides frame-rank rank))
+               (cells (fold * 1 (vector->list (subvector src-shape 0 frame-rank))))
+               (path  (reduction-path op cs cst 0 src-dtype
+                                      (map (lambda (ax) (- ax frame-rank)) reduce-axes))))
+          (case path
+            ((axis1) (list 'rows (* cells (vector-ref cs 0)) (vector-ref cs 1)))
+            ((1d)    (list (if (memq op '(sum mean)) 'rows-1d 'rows) cells (vector-ref cs 0)))
+            (else    'direct)))))
+
+  ;; The offsets of the rows of a source of shape and strides whose last
+  ;; axis holds the row elements, in row-major order of the other axes.
+  (define (row-offsets shape strides offset)
+    (let* ((r    (- (vector-length shape) 1))
+           (n    (fold * 1 (vector->list (subvector shape 0 r))))
+           (offs (make-vector n 0))
+           (idx  (make-vector r 0)))
+      (do ((c 0 (+ c 1)))
+          ((= c n) offs)
+        (let loop ((i 0) (o offset))
+          (if (= i r)
+              (vector-set! offs c o)
+              (loop (+ i 1) (+ o (* (vector-ref idx i) (vector-ref strides i))))))
+        (let carry ((i (- r 1)))
+          (when (>= i 0)
+            (let ((v (+ 1 (vector-ref idx i))))
+              (if (< v (vector-ref shape i))
+                  (vector-set! idx i v)
+                  (begin (vector-set! idx i 0) (carry (- i 1))))))))))
+
+  ;; True when the source is row-major and starts at element 0.
+  (define (source-row-major? shape strides offset)
+    (and (= offset 0) (equal? strides (compute-strides shape))))
+
+  ;; A row-major copy of a source with the given layout.
+  (define (row-major-copy data shape strides offset dtype)
+    (let* ((rank (vector-length shape))
+           (n    (shape-size shape))
+           (out  (allocate-typed-vector dtype n))
+           (offs (row-offsets shape strides offset))
+           (len  (if (= rank 0) 1 (vector-ref shape (- rank 1))))
+           (st   (if (= rank 0) 0 (vector-ref strides (- rank 1)))))
+      (do ((r 0 (+ r 1)))
+          ((= r (vector-length offs)) out)
+        (let ((base (vector-ref offs r)))
+          (do ((j 0 (+ j 1)))
+              ((= j len))
+            (typed-vector-set! out dtype (+ (* r len) j)
+                               (typed-vector-ref data dtype (+ base (* j st)))))))))
+
+  ;; The sum or mean of each row of a source whose rows are contiguous, as
+  ;; the 1d path of execute-reduction-morphism computes it for a row stored
+  ;; on its own.
+  (define (reduce-rows-1d! op output-buffer dtype src-data src-shape src-strides src-offset)
+    (let* ((rank  (vector-length src-shape))
+           (N     (vector-ref src-shape (- rank 1)))
+           (offs  (row-offsets src-shape src-strides src-offset))
+           (dot   (and *active-backend*
+                       (if (eq? dtype 'f32)
+                           (blas-backend-dot-f32 *active-backend*)
+                           (blas-backend-dot-f64 *active-backend*))))
+           (dot-off (and dot
+                         (if (eq? dtype 'f32)
+                             (blas-backend-dot-offset-f32 *active-backend*)
+                             (blas-backend-dot-offset-f64 *active-backend*))))
+           (ones  (and dot
+                       (let ((v (allocate-typed-vector dtype N)))
+                         (do ((i 0 (+ i 1))) ((= i N) v) (typed-vector-set! v dtype i 1.0)))))
+           (row   (and dot (not dot-off) (allocate-typed-vector dtype N)))
+           (bytes (if (eq? dtype 'f32) 4 8)))
+      (do ((r 0 (+ r 1)))
+          ((= r (vector-length offs)))
+        (let* ((off (vector-ref offs r))
+               (val (cond
+                     (dot-off (dot-off N src-data off ones 0))
+                     (dot (move-memory! src-data row (* N bytes) (* off bytes) 0)
+                          (dot N row ones))
+                     (else
+                      (let loop ((i 0) (acc 0.0))
+                        (if (= i N)
+                            acc
+                            (loop (+ i 1) (+ acc (typed-vector-ref src-data dtype (+ off i))))))))))
+          (typed-vector-set! output-buffer dtype r (if (eq? op 'mean) (/ val N) val))))))
+
+  (define (execute-framed-reduction op output-buffer out-shape
+                                    src-data src-shape src-strides src-offset
+                                    reduce-axes reducer keepdims? out-dtype src-dtype
+                                    frame-rank)
+    "Execute a reduction with frame rank frame-rank (see morph-reduce):
+    each cell of the frame is reduced as it would be if it were stored in
+    an array of its own.  The other arguments are those of
+    execute-reduction-morphism; with frame rank 0 this is
+    execute-reduction-morphism."
+    (let ((plan (framed-reduction-plan op src-shape src-strides src-dtype reduce-axes
+                                       frame-rank)))
+      (if (eq? plan 'direct)
+          (execute-reduction-morphism op output-buffer out-shape
+                                      src-data src-shape src-strides src-offset
+                                      reduce-axes reducer keepdims? out-dtype src-dtype)
+          (execute-rows-reduction (car plan) op output-buffer
+                                  src-data src-shape src-strides src-offset
+                                  reducer out-dtype src-dtype))))
+
+  (define (execute-rows-reduction kind op output-buffer
+                                  src-data src-shape src-strides src-offset
+                                  reducer out-dtype src-dtype)
+    "Reduce op over the last axis of a source, row by row, into
+    output-buffer in row-major order of the other axes.  kind rows reduces
+    the rows as the rows of one row-major [R, N] array (the axis1 path);
+    kind rows-1d reduces each row, which must be contiguous, as the 1d path
+    reduces a vector stored on its own (sum and mean only)."
+    (case kind
+      ((rows)
+       (let* ((rank (vector-length src-shape))
+              (N    (vector-ref src-shape (- rank 1)))
+              (R    (fold * 1 (vector->list (subvector src-shape 0 (- rank 1)))))
+              (data (if (source-row-major? src-shape src-strides src-offset)
+                        src-data
+                        (row-major-copy src-data src-shape src-strides src-offset src-dtype))))
+         (execute-reduction-morphism op output-buffer (vector R)
+                                     data (vector R N) (vector N 1) 0
+                                     '(1) reducer #f out-dtype src-dtype)))
+      ((rows-1d)
+       (reduce-rows-1d! op output-buffer src-dtype src-data src-shape src-strides src-offset))
+      (else (error "execute-rows-reduction: unknown kind" kind))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Composed Index Function Execution

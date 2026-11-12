@@ -71,6 +71,7 @@
    reduction-index-fn-reduce-axes
    reduction-index-fn-reducer
    reduction-index-fn-keepdims?
+   reduction-index-fn-frame-rank
    
    ;; Batch map index functions (per-batch-element operations)
    batch-map-index-fn?
@@ -337,7 +338,8 @@
   source-fn     ; Input index function
   reduce-axes   ; Axes to reduce (list)
   reducer       ; Reduction operation (procedure)
-  keepdims?)    ; Keep reduced dimensions?
+  keepdims?     ; Keep reduced dimensions?
+  frame-rank)   ; Number of leading frame axes (0 for an ordinary reduction)
 
 ;; Batch operations
 (define-record batch-map-index-fn

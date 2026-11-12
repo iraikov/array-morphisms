@@ -4209,4 +4209,69 @@
          (every s2-same-lists? off (run 'all)))))
    '(f32 f64)))
 
+;;;; Framed reductions
+;;;;
+;;;; A reduction with a frame rank lowers to the combine spec of its cell's
+;;;; path.  Rows of axis-1 cells (and the max or min of vector cells) run as
+;;;; the axis-1 reduction of the rows of one array (segop/reduce-axis1);
+;;;; sums of contiguous vector cells run the 1d code row by row
+;;;; (segop/reduce-rows-1d).  Replayed values equal realize, and every
+;;;; fusion policy gives the values of fusion off.  An f32 1d sum takes the
+;;;; order of the backend's dot product, so its rounded result may differ
+;;;; by one unit from the interpreter's sequential sum; the comparison with
+;;;; the interpreter is left out there.
+;;;; ============================================================
+
+(define (frd-val i) (case (modulo i 11) ((3) +nan.0) ((5) -0.0) (else (* 0.9 (sin (* 1.37 i))))))
+
+(test-group "framed reductions"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (spec)
+        (let* ((shape (car spec)) (axes (cadr spec)) (f (caddr spec)) (op (cadddr spec))
+               (tag (list-ref spec 4))
+               (make (lambda () (morph-reduce op (s2-src dt shape frd-val) axes #f f)))
+               (r (s2-run make))
+               (name (sprintf "~A ~A ~A axes ~A frame rank ~A" dt op shape axes f)))
+          (test-assert (string-append name ": " (symbol->string tag))
+            (memq tag (s2-tags (car r))))
+          (unless (and (eq? dt 'f32) (eq? tag 'segop/reduce-rows-1d))
+            (test (string-append name ": executors agree with the interpreter") 0
+                  (list-ref r 4)))
+          (test-assert (string-append name ": replay reproduces the trace")
+            (s2-same-lists? (cadr r) (caddr r)))
+          (test-assert (string-append name ": values equal realize")
+            (s2-same-lists? (cadr r) (s2-values (realize (make)))))))
+      '(((4 5 9) (2) 1 sum segop/reduce-axis1)
+        ((4 5 9) (2) 1 max segop/reduce-axis1)
+        ((2 3 5 9) (3) 2 mean segop/reduce-axis1)
+        ((2 3 9) (2) 2 mean segop/reduce-rows-1d)
+        ((2 3 64) (2) 2 sum segop/reduce-rows-1d)
+        ((4 64) (1) 1 mean segop/reduce-rows-1d)
+        ((4 64) (1) 1 min segop/reduce-axis1)
+        ((4 5 9) (1) 1 sum segop/reduce-general))))
+   '(f32 f64))
+
+  ;; a framed softmax over the last axis, under each fusion policy
+  (for-each
+   (lambda (dt)
+     (let* ((make (lambda ()
+                    (let* ((x (s2-src dt '(4 5 9) (lambda (i) (* 0.7 (sin (* 1.37 i))))))
+                           (m (morph-reduce 'max x '(2) #t 1))
+                           (e (morph-exp (morph- x m)))
+                           (z (morph-reduce 'sum e '(2) #t 1)))
+                      (morph/ e z))))
+            (run (lambda (policy)
+                   (parameterize ((segop-fusion policy)) (s2-run make))))
+            (off (run #f)))
+       (test-assert (sprintf "~A softmax: fusion off equals realize" dt)
+         (s2-same-lists? (cadr off) (s2-values (realize (make)))))
+       (test-assert (sprintf "~A softmax: fusion on equals fusion off" dt)
+         (s2-same-lists? (cadr off) (cadr (run #t))))
+       (test-assert (sprintf "~A softmax: fusion 'all equals fusion off" dt)
+         (let ((r (run 'all)))
+           (and (s2-same-lists? (cadr off) (cadr r)) (= 0 (list-ref r 4)))))))
+   '(f32 f64)))
+
 (test-end)

@@ -528,14 +528,20 @@
     ((min)      min)
     (else (error "Unknown reduction operation" op))))
 
-(define (morph-reduce op m #!optional (axes '()) (keepdims? #f))
+(define (morph-reduce op m #!optional (axes '()) (keepdims? #f) (frame-rank 0))
   "Reduce morphism along specified axes
    
    Args:
      op: Reduction operation (sum, mean, max, min, prod)
      m: Input morphism
-     axes: List of axes to reduce (empty = all axes)
+     axes: List of axes to reduce (empty = all axes, or all cell axes
+           when frame-rank is above 0)
      keepdims?: Keep reduced dimensions with size 1?
+     frame-rank: Number of leading axes of m that form a frame.  Each cell
+           of the frame (the array of the remaining axes at one frame
+           position) is then reduced as the same reduction of that cell,
+           stored in an array of its own, would be.  Reduced axes must be
+           cell axes.
    
    Returns:
      reduction-morphism
@@ -550,15 +556,20 @@
   
   (let* ((shape (get-morphism-shape m))
          (rank (vector-length shape))
+         (_ (unless (and (integer? frame-rank) (exact? frame-rank) (<= 0 frame-rank rank))
+              (error "morph-reduce: frame rank out of range" frame-rank rank)))
          
          ;; Normalize axes (handle negative indices), in increasing order
          ;; and without repetitions, so that every executor sees one form
          (normalized-axes 
           (if (null? axes)
-              (iota rank)  ; Reduce all axes
+              (iota (- rank frame-rank) frame-rank)  ; Reduce all (cell) axes
               (filter (lambda (i)
                         (member i (map (lambda (ax) (normalize-axis ax rank)) axes)))
                       (iota rank))))
+         (_ (unless (every (lambda (ax) (>= ax frame-rank)) normalized-axes)
+              (error "morph-reduce: reduced axes must follow the frame axes"
+                     normalized-axes frame-rank)))
          
          ;; Compute result shape
          (result-shape 
@@ -591,7 +602,7 @@
          
          ;; Create reduction index function
          (index-fn (make-reduction-index-fn source-fn normalized-axes
-                                            reducer keepdims?))
+                                            reducer keepdims? frame-rank))
          
          ;; Compute result batch axis
          (batch-axis (get-morphism-batch-axis m))
