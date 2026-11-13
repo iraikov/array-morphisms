@@ -13,7 +13,7 @@
 ;;;        - Multi-step replay stability
 ;;;
 
-(import scheme (chicken base) (chicken format)
+(import scheme (chicken base) (chicken format) (chicken condition)
         test
         (only srfi-1 iota every any map filter filter-map take drop fold delete-duplicates list-index
               append-map)
@@ -4298,5 +4298,151 @@
        (test-assert (sprintf "~A lifted matmul and softmax: fusion 'all equals fusion off" dt)
          (s2-same-lists? (cadr off) (cadr (run 'all))))))
    '(f32 f64)))
+
+;;;; Lifted training
+;;;;
+;;;; A layer lifted with var-lift over a frame of F cells, trained through
+;;;; ssa-vjp as am-training-step/ssa trains a model: the joint program is
+;;;; traced once and replayed, the parameters updated in place between
+;;;; replays.  The reference trains F per-cell programs and applies, at
+;;;; each step, the sum of their gradients in frame order.  W and b are
+;;;; shared by every cell, so the lifted program sums their gradient over
+;;;; the frame with one reduction; the two sums are in different orders and
+;;;; are compared within a tolerance (relative 1e-5 for f32, 1e-12 for f64).
+;;;; Every fusion policy gives the lifted program the same values, bit for
+;;;; bit.
+;;;; ============================================================
+
+(define (lt-vals n seed) (map (lambda (i) (* 0.5 (sin (+ (* 0.71 i) seed)))) (iota n)))
+
+(define (lt-elements m)
+  (cases array-morphism m
+    (concrete-array (data shape strides offset dtype _ _)
+      (map (lambda (i) (typed-vector-ref data dtype
+                                         (multi-to-linear-index (linear-to-multi-index i shape)
+                                                                strides offset)))
+           (iota (shape-size shape))))
+    (else (error "lt-elements: not concrete"))))
+
+;; Subtract lr * g from the elements of parameter array p, in place.
+(define (lt-update! p g lr)
+  (cases array-morphism p
+    (concrete-array (data shape strides offset dtype _ _)
+      (for-each (lambda (i gi)
+                  (typed-vector-set! data dtype i (- (typed-vector-ref data dtype i) (* lr gi))))
+                (iota (shape-size shape)) g))
+    (else (error "lt-update!: not concrete"))))
+
+;; A compiled joint program for loss variable loss and parameter arrays ps:
+;; (list ctx joint).
+(define (lt-compile loss ps)
+  (let* ((fwd  (morphism-to-ssa loss))
+         (pv   (map (lambda (p) (ssa-constant-id fwd p)) ps)))
+    (list (make-morphism-context) (ssa-vjp fwd pv (ssa-loss-binding-val fwd)))))
+
+;; One run of compiled program cj: (cons loss gradient-lists).
+(define (lt-run! cj)
+  (let* ((ctx (car cj)) (joint (cadr cj))
+         (res (ssa-realize/ctx ctx joint))
+         (out (cons (car (lt-elements (car res))) (map lt-elements (cdr res)))))
+    (unless (eq? (context-mode ctx) 'replay) (finalize-context! ctx))
+    (reset-context! ctx)
+    out))
+
+;; The model: input x [F B D], parameters W [D H] and b [H], weights c
+;; [F B H]; each cell computes tanh(x W + b) and the loss is sum(y * c).
+(define (lt-data dt F B D H)
+  (list (morph-from-list (lt-vals (* F B D) 0.1) (vector F B D) dt)
+        (morph-from-list (lt-vals (* D H) 0.7) (vector D H) dt)
+        (morph-from-list (lt-vals H 1.3) (vector H) dt)
+        (morph-from-list (lt-vals (* F B H) 2.1) (vector F B H) dt)))
+
+(define (lt-body W b) (lambda (xc) (morph-tanh-am (morph+ (morph-matmul xc W) b))))
+
+;; Trains the lifted model for steps steps; returns (losses step1-grads W b).
+(define (lt-train-lifted dt F B D H steps lr)
+  (let* ((d (lt-data dt F B D H))
+         (x (car d)) (W (cadr d)) (b (caddr d)) (c (cadddr d))
+         (y (am:var-lift (lt-body W b) 2 (am:make-var x #f)))
+         (loss (am:var-sum (am:var* y (am:make-var c #f))))
+         (cj (lt-compile loss (list W b))))
+    (let loop ((k 0) (losses '()) (g1 #f))
+      (if (= k steps)
+          (list (reverse losses) g1 (lt-elements W) (lt-elements b) (cadr cj))
+          (let ((r (lt-run! cj)))
+            (lt-update! W (cadr r) lr)
+            (lt-update! b (caddr r) lr)
+            (loop (+ k 1) (cons (car r) losses) (or g1 (cdr r))))))))
+
+;; Trains F per-cell programs together; returns (losses step1-grads W b).
+(define (lt-train-cells dt F B D H steps lr)
+  (let* ((d (lt-data dt F B D H))
+         (x (car d)) (W (cadr d)) (b (caddr d)) (c (cadddr d))
+         (cell (lambda (m f n) (morph-from-list (take (drop (lt-elements m) (* f n)) n)
+                                                (list->vector (cdr (vector->list (get-morphism-shape m))))
+                                                dt)))
+         (cjs (map (lambda (f)
+                     (let* ((xf (cell x f (* B D))) (cf (cell c f (* B H)))
+                            (y (am:make-var ((lt-body W b) xf) #f)))
+                       (lt-compile (am:var-sum (am:var* y (am:make-var cf #f))) (list W b))))
+                   (iota F))))
+    (let loop ((k 0) (losses '()) (g1 #f))
+      (if (= k steps)
+          (list (reverse losses) g1 (lt-elements W) (lt-elements b))
+          (let* ((rs (map lt-run! cjs))
+                 (sum-lists (lambda (ls) (fold (lambda (l acc) (map + acc l)) (car ls) (cdr ls))))
+                 (gW (sum-lists (map cadr rs)))
+                 (gb (sum-lists (map caddr rs)))
+                 (l  (fold + 0.0 (map car rs))))
+            (lt-update! W gW lr)
+            (lt-update! b gb lr)
+            (loop (+ k 1) (cons l losses) (or g1 (list gW gb))))))))
+
+(define (lt-close? xs ys tol)
+  (and (= (length xs) (length ys))
+       (every (lambda (x y) (<= (abs (- x y)) (* tol (max 1.0 (abs y))))) xs ys)))
+
+(define (lt-contains? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (and (<= (+ i m) n)
+           (or (string=? (substring s i (+ i m)) sub) (loop (+ i 1)))))))
+
+(test-group "lifted training"
+  (for-each
+   (lambda (dt)
+     (let* ((tol (if (eq? dt 'f32) 1e-5 1e-12))
+            (lifted (lt-train-lifted dt 4 3 5 6 5 0.05))
+            (cells  (lt-train-cells  dt 4 3 5 6 5 0.05)))
+       (test-assert (sprintf "~A: the forward GEMM is one batched GEMM" dt)
+         (memq 'segop/gemm-batched (s2-tags (list-ref lifted 4))))
+       (test-assert (sprintf "~A: step-1 gradient of W equals the summed cell gradients" dt)
+         (lt-close? (car (cadr lifted)) (car (cadr cells)) tol))
+       (test-assert (sprintf "~A: step-1 gradient of b equals the summed cell gradients" dt)
+         (lt-close? (cadr (cadr lifted)) (cadr (cadr cells)) tol))
+       (test-assert (sprintf "~A: losses over 5 steps" dt)
+         (lt-close? (car lifted) (car cells) tol))
+       (test-assert (sprintf "~A: parameters after 5 steps" dt)
+         (and (lt-close? (caddr lifted) (caddr cells) tol)
+              (lt-close? (cadddr lifted) (cadddr cells) tol)))
+       (let ((run (lambda (policy)
+                    (parameterize ((segop-fusion policy)) (lt-train-lifted dt 4 3 5 6 5 0.05))))
+             (same (lambda (a b) (and (s2-same-lists? (car a) (car b))
+                                      (s2-same-lists? (caddr a) (caddr b))
+                                      (s2-same-lists? (cadddr a) (cadddr b))))))
+         (let ((off (run #f)))
+           (test-assert (sprintf "~A: fusion on equals fusion off" dt) (same off (run #t)))
+           (test-assert (sprintf "~A: fusion 'all equals fusion off" dt) (same off (run 'all)))))))
+   '(f32 f64))
+  (let* ((d (lt-data 'f64 4 3 5 6))
+         (y (am:var-lift (lt-body (cadr d) (caddr d)) 2 (am:make-var (car d) #f)))
+         (loss (am:var-sum y)))
+    (test-assert "backward! through var-lift names am-training-step/ssa"
+      (condition-case (begin (am:backward! loss) #f)
+        (e (exn) (lt-contains? ((condition-property-accessor 'exn 'message) e)
+                               "am-training-step/ssa"))))
+    (test-assert "var-lift without a frame gives fn's value"
+      (s2-same-lists? (lt-elements (realize (am:var-value (am:var-lift morph-exp 2 (am:make-var (cadr d) #f)))))
+                      (lt-elements (realize (morph-exp (cadr d))))))))
 
 (test-end)

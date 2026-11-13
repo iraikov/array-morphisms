@@ -52,7 +52,8 @@
                         (component-dependencies array-morphisms-core array-morphisms-basic-ops
                                                 array-morphisms-structural-ops
                                                 array-morphisms-blas-exec))
-             (extension array-morphisms-grad        (source "grad.scm")        (csc-options "-O2" "-d1"))
+             (extension array-morphisms-grad        (source "grad.scm")        (csc-options "-O2" "-d1")
+                        (component-dependencies array-morphisms-lift))
              (extension array-morphisms-grad-check  (source "grad-check.scm")  (csc-options "-O2" "-d1"))
              (extension array-morphisms-ssa         (source "ssa.scm")         (csc-options "-O3" "-d1")
                         (source-dependencies "segop-lower.scm")

@@ -76,6 +76,7 @@
    var-reshape
    var-transpose
    var-matmul
+   var-lift
 
    ;; Backward pass
    backward!
@@ -100,6 +101,7 @@
   (import array-morphisms-basic-ops)
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-exec)
+  (import array-morphisms-lift)
 
 
 ;;;; ============================================================
@@ -732,6 +734,29 @@
             (hash-table-set! visited (var-name v) #t)
             (cons v (fold visit order (morph-variable-parents v))))))
     (visit root '())))
+
+;;;; ============================================================
+;;;; var-lift
+;;;; ============================================================
+
+(define (var-lift fn cell-ranks . vs)
+  "Gradient-tracking frame lifting: a variable whose value is
+   (morph-lift fn cell-ranks (var-value v) ...).
+
+   fn maps cell morphisms to a morphism, as for morph-lift; weights it
+   uses are taken from their variables with var-value.  The gradients of
+   a lifted computation are derived from the morphism by ssa-vjp, which
+   am-training-step/ssa uses.  backward! does not differentiate through
+   it: the variable always requires grad, and its backward closure
+   signals an error, so that a weight fn captures cannot silently miss
+   its gradient."
+  (let ((out (make-var (apply morph-lift fn cell-ranks (map var-value vs)) #t)))
+    (morph-variable-parents-set! out (filter var-requires-grad? vs))
+    (morph-variable-grad-fn-set!
+     out
+     (lambda (g)
+       (error "var-lift: backward! cannot differentiate a lifted computation; train it with am-training-step/ssa (ssa-vjp)")))
+    out))
 
 (define (backward! var #!optional seed)
   "Run reverse-mode automatic differentiation from var.
