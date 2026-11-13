@@ -2,17 +2,18 @@
 
 [![Chicken Scheme](https://img.shields.io/badge/Chicken-Scheme-orange.svg)](https://call-cc.org/)
 
-A unified backend for numerical computing in Chicken Scheme, combining fusion-based lazy evaluation, Mathematics of Arrays (MoA) index transformations, and automatic memory reuse.
+A CHICKEN Scheme library for numerical arrays. Operations build expressions that are computed only when their result is needed. Reshapes, transposes and slices are views that copy nothing; they are described by the index functions of the Mathematics of Arrays (MoA). Computations that run many times reuse their buffers.
 
 ## Features
 
-- **Lazy Evaluation**: Operations build expression trees that are materialized on demand
-- **Zero-Copy Views**: Structural operations (reshape, transpose, slice) via MoA affine index functions
-- **Memory Reuse**: Automatic buffer planning with graph coloring for optimal allocation
-- **BLAS Integration**: Transparent dispatch to optimized linear algebra kernels
-- **Element-wise Kernel Backends**: Pluggable whole-array kernels for activations, binary arithmetic, reductions and copies, with results identical to the Scheme code they replace
-- **Type Safety**: Multiple element types (f64, f32, s64, s32, u32, u64)
-- **Category-Theoretic Foundation**: Array morphisms as structure-preserving transformations
+- **Lazy evaluation**: operations build expression trees, which are computed when you call `realize`.
+- **Views without copies**: reshape, transpose and slice change how an array is read, not its data.
+- **Buffer reuse**: a computation that runs many times plans its buffers once and reuses them.
+- **BLAS**: matrix products and convolutions run on a pluggable BLAS backend.
+- **Kernel backends**: pluggable whole-array kernels for activations, arithmetic, reductions and copies, which give the same results as the Scheme loops they replace.
+- **Frame lifting**: apply a function to every cell of a frame (every example of a batch, or every attention head) as one computation; each cell gets exactly the values it would get on its own.
+- **Element types**: f64, f32, s64 and s32.
+- **Category-theoretic model**: array computations as morphisms, maps that preserve the structure of arrays.
 
 ## Installation
 
@@ -37,51 +38,54 @@ chicken-install .
         array-morphisms-structural-ops
         array-morphisms-realization)
 
-;; Create concrete arrays
-(define x (morph-from-list '(1.0 2.0 3.0 4.0 5.0) '(5) 'f64))
-(define y (morph-from-list '(2.0 4.0 6.0 8.0 10.0) '(5) 'f64))
+;; Arrays with data
+(define x (morph-from-list '(1.0 2.0 3.0 4.0 5.0 6.0) '(6) 'f64))
+(define y (morph-from-list '(2.0 4.0 6.0 8.0 10.0 12.0) '(6) 'f64))
 
-;; Build lazy computation (no allocation yet!)
+;; An expression: nothing is computed or allocated yet
 (define z (morph+ (morph-map (lambda (a) (* a a)) x) y))
 
-;; Materialize when needed
-(define result (realize z))  ; Returns concrete array
-(morph->list result)          ; Convert to Scheme list
+;; Compute it
+(define result (realize z))   ; an array with data
+(morph->list result)          ; => (3.0 8.0 15.0 24.0 35.0 48.0)
 
-;; Chain structural operations (all zero-copy views)
-(define matrix (morph-reshape x #(2 3)))   ; Reshape to 2x3
-(define transposed (morph-transpose matrix)) ; Transpose
-(define slice (morph-slice transposed '(0 0) '(2 2))) ; Extract submatrix
+;; Views: none of these copies data
+(define matrix (morph-reshape x #(2 3)))                ; 2 x 3
+(define transposed (morph-transpose matrix))            ; 3 x 2
+(define corner (morph-slice transposed '(0 0) '(2 2)))  ; top-left 2 x 2
 ```
 
 ## Core Concepts
 
 ### Morphisms vs Arrays
 
-In array-morphisms, computation is represented as **morphisms** - structure-preserving transformations between arrays. There are two types:
+Every value is a **morphism**. It is one of two kinds:
 
-- **Concrete Arrays**: Materialized data with shape, dtype, and strides
-- **Abstract Morphisms**: Deferred computations represented as expression trees
+- a **concrete array**, which holds data, with a shape, a dtype and strides;
+- an **expression**, a computation not yet done, held as a tree of operations.
+
+`realize` turns an expression into a concrete array.
 
 ```scheme
-;; Concrete array - data is stored
+;; A concrete array: the data is stored
 (define concrete (morph-from-list '(1.0 2.0 3.0) '(3) 'f64))
 
-;; Abstract morphism - represents computation
-(define abstract (morph+ concrete concrete))
+;; An expression: the sum is not computed yet
+(define expr (morph+ concrete concrete))
 
-;; Realization materializes the morphism
-(define result (realize abstract))  ; Now concrete
+;; realize computes it
+(define result (realize expr))  ; a concrete array
 ```
 
 ### Index Functions
 
-Array morphisms use **index functions** to describe transformations algebraically:
+Each expression has an **index function**, which says how an element of
+the result is found from its operands:
 
-- **Affine Index Functions**: Pure transformations (reshape, transpose, slice)
-- **Compute Index Functions**: Element-wise arithmetic operations
-- **Window Index Functions**: Convolution and pooling operations
-- **Reduction Index Functions**: Aggregate operations (sum, mean, max)
+- **affine** index functions rearrange elements (reshape, transpose, slice);
+- **compute** index functions compute elements (arithmetic);
+- **window** index functions read windows of elements (convolution, pooling);
+- **reduction** index functions combine elements (sum, mean, max).
 
 ```scheme
 ;; Affine: stride-2 slice
@@ -96,7 +100,8 @@ Array morphisms use **index functions** to describe transformations algebraicall
 
 ### Zero-Copy Structural Operations
 
-Structural operations manipulate array views without copying data:
+Structural operations make views, which read the same data in another
+order:
 
 ```scheme
 (define x (morph-from-list '(0.0 1.0 2.0 3.0 4.0 5.0 6.0 7.0) '(8) 'f64))
@@ -104,7 +109,7 @@ Structural operations manipulate array views without copying data:
 ;; Non-contiguous slice (stride 2)
 (define strided (morph-slice x '(0) '(8) 2))  ; (0.0 2.0 4.0 6.0)
 
-;; Reshape works even on non-contiguous views
+;; Reshape works on views that skip elements, too
 (define as-2x2 (morph-reshape strided #(2 2)))  ; ((0.0 2.0) (4.0 6.0))
 
 ;; Transpose
@@ -116,8 +121,8 @@ Structural operations manipulate array views without copying data:
 ### Array Creation
 
 ```scheme
-(morph-from-list '(1.0 2.0 3.0) '(3) 'f64)  ; From list
-(make-morphism data-vector shape 'f64)        ; From typed vector
+(morph-from-list '(1.0 2.0 3.0) '(3) 'f64)  ; from a list
+(make-morphism data-vector #(3) 'f64)       ; from an SRFI-4 vector (f64vector, ...)
 ```
 
 ### Arithmetic
@@ -135,116 +140,128 @@ Structural operations manipulate array views without copying data:
 
 ```scheme
 (morph> a b)  (morph< a b)  (morph= a b)  (morph>= a b)  (morph<= a b)
-;; Returns 1.0 for true, 0.0 for false
+;; The result is f64: 1.0 where true, 0.0 where false
 ```
 
 ### Structural Operations
 
 ```scheme
-;; Reshape (supports -1 for automatic dimension inference)
-(morph-reshape m #(2 3))      ; Reshape to 2x3
-(morph-reshape m '(2 -1))     ; Infer second dimension
+;; Reshape (-1 stands for the size that makes the total match)
+(morph-reshape m #(2 3))      ; to 2 x 3
+(morph-reshape m '(2 -1))     ; to 2 x whatever fits
 
 ;; Transpose
-(morph-transpose m)           ; Reverse all axes
-(morph-transpose m '(1 0))    ; 2D transpose
-(morph-transpose m '(0 2 1))  ; Swap last two axes
+(morph-transpose m)           ; reverse all axes
+(morph-transpose m '(1 0))    ; 2-D transpose
+(morph-transpose m '(0 2 1))  ; swap the last two axes
 
 ;; Slice
-(morph-slice m '(0) '(10))      ; Elements 0 to 9
-(morph-slice m '(0) '(10) 2)    ; Every other element
+(morph-slice m '(0) '(10))      ; elements 0 to 9
+(morph-slice m '(0) '(10) 2)    ; every other element
 
-;; Stack/Concat
-(morph-stack (list m1 m2 m3) 0)   ; Stack along new axis
-(morph-concat (list m1 m2) 0)      ; Concatenate along existing axis
+;; Stack and concatenate
+(morph-stack (list m1 m2 m3) 0)   ; along a new axis 0
+(morph-concat (list m1 m2) 0)     ; along the existing axis 0
 ```
 
 ### Functional Operations
 
 ```scheme
-;; Map applies function element-wise
+;; Map applies a function to each element
 (morph-map (lambda (x) (* x x)) arr)
 
-;; Reduce aggregates over specified axes
-(morph-reduce 'sum arr)           ; Sum all elements
-(morph-reduce 'mean arr '(0))     ; Mean along axis 0
-(morph-reduce 'max arr '(1 2))    ; Max along axes 1 and 2
+;; Reduce combines elements over the given axes
+(morph-reduce 'sum arr)           ; sum of all elements
+(morph-reduce 'mean arr '(0))     ; mean over axis 0
+(morph-reduce 'max arr '(1 2))    ; maximum over axes 1 and 2
 
-;; Fold and scan (batch operations)
+;; With a frame rank (the fifth argument), the leading axes form a frame,
+;; and each cell is reduced exactly as it would be on its own (see Frame
+;; Lifting)
+(morph-reduce 'sum arr '(2) #f 1) ; [F M N] -> [F M]: the row sums of each [M N] cell
+
+;; Fold and scan over the batch axis
 (batch-fold fn init batched-m)
 (batch-scan fn init batched-m)
 ```
 
 ## Memory Reuse with Execution Context
 
-For repeated computations, use execution contexts to enable buffer reuse:
+A computation that runs many times can reuse its buffers through an
+execution context. The first run records the buffers it allocates; the
+context then plans one set of buffers, and later runs use them:
 
 ```scheme
 (import array-morphisms-context)
 
-;; Create context for memory planning
 (define ctx (make-morphism-context))
 
-;; Trace phase: record allocations
+;; First run: record the allocations, then plan the buffers
 (realize/ctx ctx morphism)
 (finalize-context! ctx)
 
-;; Replay phase: reuse buffers
+;; Later runs: reset, then compute into the planned buffers
 (reset-context! ctx)
-(realize/ctx ctx morphism)  ; Uses pre-allocated buffers
+(realize/ctx ctx morphism)
 ```
+
+A later run overwrites the buffers of the run before it, so copy a result
+you want to keep.
 
 ## Type System
 
-| Type    | Description           | Size     |
-|---------|-----------------------|----------|
-| `'f64`  | Double float          | 64-bit   |
-| `'f32`  | Single float          | 32-bit   |
-| `'s64`  | 64-bit signed int     | 64-bit   |
-| `'s32`  | 32-bit signed int     | 32-bit   |
-| `'u64`  | 64-bit unsigned int   | 64-bit   |
-| `'u32`  | 32-bit unsigned int   | 32-bit   |
+Arrays hold one of four element types (dtypes):
 
-Type promotion rules:
-- Mixed operations promote to the higher precision type
-- Transcendental functions promote integers to floating point
-- Reductions preserve dtype (mean promotes to float)
+| dtype   | Elements                      |
+|---------|-------------------------------|
+| `'f64`  | double-precision floats       |
+| `'f32`  | single-precision floats       |
+| `'s64`  | 64-bit signed integers        |
+| `'s32`  | 32-bit signed integers        |
 
-`(morph-cast m dtype)` converts an array to another dtype element by
-element: a conversion to `'f32` rounds to single precision, and a
-conversion to an integer dtype truncates.
+How results get their dtype:
+- an operation on two dtypes gives the one that comes first in the order
+  f64, f32, s64, s32 (so s64 with f32 gives f32);
+- transcendental functions and activations (exp, log, sin, relu, ...) of
+  integers give f64;
+- reductions keep the dtype, except that a mean of integers gives f64.
+
+`(morph-cast m dtype)` converts each element to another dtype: to `'f32`
+it rounds to single precision, and to an integer dtype it truncates.
 
 In a compiled SSA training graph, each parameter's gradient has the
 parameter's dtype. When an `'f32` parameter meets `'f64` values, the
-backward pass computes in `'f64` as promotion requires, and the gradient
-is cast back to `'f32` at the end.
+backward pass computes in `'f64`, as the rules above require, and casts
+the gradient to `'f32` at the end.
 
 `ssa-vjp` returns one gradient per parameter, in the order of the
 parameters. A parameter that no gradient reaches gets zeros of its shape
-and dtype; this includes a parameter reached only through a max reduction,
-whose derivative is not computed. A `morph-map` traces and replays like any
-element-wise op, but its procedure has no derivative: `ssa-vjp` raises an
-error when the input of a map depends on a trainable parameter.
+and dtype. This includes a parameter reached only through a max reduction,
+whose derivative is not computed. A `morph-map` runs like any element-wise
+op, but its procedure has no derivative: `ssa-vjp` raises an error when
+the input of a map depends on a trainable parameter.
 
 ## Performance Tips
 
-1. **Laziness is your friend** - Build expression trees, materialize once
-2. **Zero-copy views** - Structural operations are essentially free
-3. **Use contexts** - For repeated computations, enable buffer reuse
-4. **Batch operations** - Process multiple arrays together efficiently
+1. **Realize once.** Build the whole expression, then call `realize` on
+   the result, not on each step.
+2. **Use views.** Reshape, transpose and slice cost almost nothing.
+3. **Use a context** for a computation that runs many times.
+4. **Batch.** Process many arrays as one (see Frame Lifting).
 
 ```scheme
-;; Good: Chain operations, materialize once
+;; Good: one expression, realized once
 (define result (realize (morph-sqrt (morph+ (morph* a b) c))))
 
-;; Good: Use contexts for repeated inference
+;; Good: a context for repeated inference
 (define ctx (make-morphism-context))
-(realize/ctx ctx model-output)  ; First run traces
+(realize/ctx ctx model-output)  ; first run: records the buffers
 (finalize-context! ctx)
 ;; ... later ...
-(realize/ctx ctx model-output)  ; Reuses buffers
+(reset-context! ctx)
+(realize/ctx ctx model-output)  ; reuses the buffers
 
-;; Bad: Materializing intermediate results
+;; Slower: realizing every step stores every intermediate array
 (define temp1 (realize (morph* a b)))
 (define temp2 (realize (morph+ temp1 c)))
 (define result (realize (morph-sqrt temp2)))
@@ -252,8 +269,8 @@ error when the input of a map depends on a trainable parameter.
 
 ## BLAS Backends
 
-Matmul, matvec, dot, axpy, and conv2d are dispatched through a pluggable `blas-backend`
-(`array-morphisms-blas-exec`). Four tiers are available:
+Matrix products (matmul, matvec, dot, axpy) and convolutions run on a
+pluggable BLAS backend (`array-morphisms-blas-exec`). There are four tiers:
 
 | Tier | Package | Dependencies | Default? |
 |---|---|---|---|
@@ -262,26 +279,64 @@ Matmul, matvec, dot, axpy, and conv2d are dispatched through a pluggable `blas-b
 | System BLAS | separate egg: [`array-morphisms-blas`](https://github.com/iraikov/array-morphisms-blas) | the `blas` egg + a system BLAS library | opt-in |
 | crunch | separate egg: `array-morphisms-crunch` (`make-crunch-blas-backend`) | the `crunch` egg (CHICKEN 6) | opt-in |
 
-The dependency-free microBLAS backend is registered automatically at load time if nothing else
-has registered a backend first, so `array-morphisms` alone never requires a system BLAS library.
-For maximum performance, install the companion `array-morphisms-blas` egg and register it
-explicitly (it overrides the default):
+The microBLAS backend needs no other library. It is registered when the
+library loads, unless another backend was registered first, so
+`array-morphisms` never needs a system BLAS library. For more speed,
+install the `array-morphisms-blas` egg and register its backend, which
+replaces the default:
 
 ```scheme
 (import array-morphisms-blas-egg-backend)
 (register-blas-backend! (make-blas-egg-backend))
 ```
 
-The crunch tier compiles its GEMM and convolution kernels from Scheme to C
-with CHICKEN 6's crunch compiler and splits large GEMMs across threads. It
-needs no C library beyond libm and pthreads.
+The crunch tier compiles its matrix and convolution kernels from Scheme to
+C with CHICKEN 6's crunch compiler, and splits large products across
+threads. It needs no C library beyond libm and pthreads.
+
+### Batched matrix multiply
+
+`morph-matmul` multiplies batches as well as matrices. When an operand has
+rank 3 or more, its leading axes are a *frame* and its last two axes are
+the matrices (the *cells*):
+
+```scheme
+(morph-matmul A B)   ; A [F.. M K], B [F.. K N] -> [F.. M N]
+(morph-matmul A W)   ; A [F.. M K], W [K N]     -> [F.. M N]  (W shared by every cell)
+(morph-matmul W B)   ; W [M K],     B [F.. K N] -> [F.. M N]
+```
+
+Two matrices give the plain `matmul` node. Batches give one `batch-matmul`
+node, which `morph-batch-matmul` also builds. Both operands must have the
+same frame, unless one of them is a plain matrix shared by every cell.
+
+Each cell of the result has exactly the values that the 2-D product of
+that cell would have, because it runs the same GEMM kernel. When the rows
+of a cell lie further apart than its width, as when frame axes come
+between the cell's axes, the cell counts as the same matrix stored
+contiguously.
+
+To read a cell in place, the backend needs GEMM kernels that take an
+offset into a vector. `make-blas-backend` takes these, and DOT kernels
+with offsets, as four optional arguments after its 20 required ones:
+
+```scheme
+(make-blas-backend name gemm-f64 gemm-f32 ...   ; the 20 required kernels
+                   gemm-offset-f64 gemm-offset-f32 dot-offset-f64 dot-offset-f32)
+;;   gemm-offset: (M N K alpha A off-A lda transa B off-B ldb transb beta C off-C)
+;;   dot-offset:  (N x off-x y off-y) -> number
+```
+
+microBLAS, the system-BLAS egg and the crunch egg supply them. A backend
+without them still works: each cell is copied into a scratch buffer
+first, which gives the same values more slowly.
 
 ### Prepared GEMM
 
-`execute-blas-gemm/into!` and `execute-blas-gemm-strided/into!` check their
-operands (dtype, rank, layout, size threshold) on every call. Code that
-multiplies arrays of the same shapes, strides and dtype many times can do
-those checks once:
+`execute-blas-gemm/into!` and `execute-blas-gemm-strided/into!` check
+their operands (dtype, rank, layout, size) on every call. Code that
+multiplies arrays of the same shapes, strides and dtype many times can
+check them once:
 
 ```scheme
 (define plan (prepare-blas-gemm/into A B))   ; or prepare-blas-gemm-strided/into
@@ -289,18 +344,18 @@ those checks once:
 ```
 
 A plan records the backend kernel to call and its arguments. It is used
-only while BLAS is enabled and the backend it was made for is still
-registered; otherwise `execute-gemm-plan/into!` falls back to the
-corresponding `execute-blas-*` procedure. `gemm-plan-uses-kernel?` tells
-whether a plan calls a backend kernel. Compiled SSA replay plans prepare
-their GEMM segops this way when they are compiled.
+only while BLAS is enabled and the backend it was made for is still the
+registered one; otherwise `execute-gemm-plan/into!` calls the matching
+`execute-blas-*` procedure. `gemm-plan-uses-kernel?` tells whether a plan
+calls a backend kernel. SSA replay plans prepare their matrix products
+this way when they are compiled.
 
 ## Element-wise Kernel Backends
 
-Element-wise operations, reductions and strided copies can be handed to a
+Element-wise operations, reductions and strided copies can run on a
 pluggable *activation backend* (`array-morphisms-activation-exec`), which
-is registered separately from the BLAS backend. A backend holds whole-array
-kernels, one per op and dtype (f32 or f64), for:
+is registered apart from the BLAS backend. It holds whole-array kernels,
+one per op and dtype (f32 or f64), for:
 
 - the activations `relu`, `sigmoid` and `tanh`, and the derivative ops
   `relu-deriv`, `sigmoid-deriv` and `tanh-deriv` that the backward pass emits;
@@ -315,12 +370,14 @@ or `segop/activation-binary` executor, which uses the backend's kernel for
 its op and dtype at execution time.
 
 Reductions and strided copies use their kernels wherever arrays are
-realized, not only during replay. When no backend is registered, no kernel
-exists for that op and dtype, or the operand and output dtypes differ, the
-same Scheme code runs as before.
+realized, not only during replay. When no backend is registered, when it
+has no kernel for that op and dtype, or when the operand and output
+dtypes differ, the Scheme loops run instead.
 
-The kernels compute exactly what that Scheme code computes, so registering
+The kernels compute exactly what the Scheme loops compute, so registering
 a backend changes speed, not results.
+
+### Fusion
 
 `ssa-vjp` runs a fusion pass on the program it builds. A forward program
 from `morphism-to-ssa` is fused by `ssa-realize/ctx` at its first trace, in
@@ -369,12 +426,12 @@ parameter `segop-fusion` (`array-morphisms-ssa`):
 
 - `#t` (the default) fuses only what some segop backend can run natively,
   as one compiled kernel. On the host, a fused segop runs its body as
-  compiled Scheme closures, which was measured to be slower than the
-  separate bindings' specialized loops and backend kernels. So the default
-  fuses a pair only when the active activation backend holds a *fused
-  kernel* for the body the fusion would make (see below), or when a code
-  generator such as the one of `array-morphisms-crunch` will compile it.
-  With no such backend, it fuses nothing.
+  compiled Scheme closures, which are slower than the separate bindings'
+  loops and kernels. So the default fuses a pair only when the active
+  activation backend holds a *fused kernel* for the body the fusion would
+  make (see below), or when a code generator, such as the one of
+  `array-morphisms-crunch`, will compile it. With no such backend, it
+  fuses nothing.
 - `'all` fuses every legal pair.
 - `#f` runs no fusion pass.
 
@@ -462,11 +519,11 @@ represented as *segmented operations* (segops,
 There are three kinds: `seg-map` (element-wise maps, possibly with several
 outputs), `seg-red` (reductions, with a combine spec giving the operator,
 neutral element, accumulator precision and summation order) and `seg-lib`
-(named library operations, such as an index function run on the host). Index maps cover
-identities, broadcasts, transposes, slices, reshapes (with `floordiv` and
-`mod`) and padded reads (with a guard and a fill value). Because bodies and
-maps are data, a code generator can read them, which the Scheme functions
-inside the older instructions did not allow.
+(named library operations, such as an index function run on the host).
+Index maps cover identities, broadcasts, transposes, slices, reshapes
+(with `floordiv` and `mod`) and padded reads (with a guard and a fill
+value). Bodies and maps are data, so a code generator can read them and
+compile a kernel.
 
 The segop abstractions are inspired by and follow the design of the
 Futhark compiler [1, 2]. Futhark's internal representation expresses
@@ -515,9 +572,10 @@ lowered to a segop:
   plan share these buffers;
 - the remaining index functions run on the host through a `seg-lib`.
 
-Each segop is offered to the segop backends in turn; the first that accepts
-it supplies an executor, and the binding becomes an `ri-segop` instruction. The backends in use are the
-value of the parameter `segop-backends`:
+Each segop is offered to the segop backends in turn. The first one that
+accepts it supplies an executor, and the binding becomes an `ri-segop`
+instruction. The backends in use are the value of the parameter
+`segop-backends`:
 
 ```scheme
 (import array-morphisms-segop)
@@ -528,13 +586,13 @@ value of the parameter `segop-backends`:
   ...)                                ; use only b within this extent
 ```
 
-Two backends are always present. `registry` handles the patterns that use
-the BLAS backend (matrix products, through prepared GEMM plans) and the
-activation backend's kernels (element-wise, reduction over axis 0 or 1 of a
-row-major matrix, and strided copy), and `scheme` handles the rest with
-Scheme loops; as a last resort it evaluates a segop with the reference
-interpreter. Replay results are the same as those of the instructions they
-replaced, bit for bit.
+Two backends are always present. `registry` runs the patterns that have
+kernels: matrix products on the BLAS backend, through prepared GEMM plans,
+and element-wise ops, reductions over axis 0 or 1 of a row-major matrix
+and strided copies on the activation backend. `scheme` runs the rest with
+Scheme loops, and as a last resort evaluates a segop with the reference
+interpreter. Every replay gives the same values, bit for bit, as the
+first (traced) run.
 
 A backend added in between can still fall back on the ones after it:
 `(select-segop-executor s name)` asks only the backends that follow the
@@ -549,11 +607,11 @@ all the kernels of a plan at once, and the convolutions use them to
 allocate their shared image-column buffers. A finalizer may return
 statistics, which `replay-plan-stats` reports with the plan's own.
 
-The computed values of a replay live in the context's pool buffers, and
-an output that the trace produced as a strided view is copied into a
-buffer that the plan owns. The next replay of the program overwrites
-these buffers, so a caller that keeps an output across replays copies it.
-Once the plan is compiled, the arrays of the trace run are released.
+The values a replay computes live in the context's buffers. An output that
+the traced run produced as a strided view is copied into a buffer that the
+plan owns. The next replay overwrites these buffers, so copy an output
+that you want to keep across replays. Once the plan is compiled, the
+arrays of the traced run are released.
 
 The timing profile (`replay-timing-results`) and `replay-plan-stats` name
 each segop instruction by its pattern:
@@ -562,12 +620,15 @@ each segop instruction by its pattern:
   `segop/flat-unary`, `segop/flat-binary`, `segop/bias-broadcast`,
   `segop/flat-ternary`, `segop/flat-broadcast`, and `segop/strided-map` for
   any other layout;
-- reductions: `segop/reduce-1d`, `segop/reduce-axis0`, `segop/reduce-axis1`
-  and `segop/reduce-general`;
+- reductions: `segop/reduce-1d`, `segop/reduce-axis0`, `segop/reduce-axis1`,
+  `segop/reduce-rows-1d` (the vector sums of a reduction with a frame, one
+  per row) and `segop/reduce-general`. A sum or mean over the leading axes
+  of a row-major array of rank 3 or more runs as `segop/reduce-axis0`: it
+  adds in the same order and precision as the general loop;
 - matrix products: `segop/gemm` (row-major operands), `segop/gemm-strided`
   (transposed or strided operands), `segop/gemm-epilogue` (with an
-  epilogue run as a flat kernel) and `segop/gemm-epilogue-host` (with an
-  epilogue run on the host);
+  epilogue run as a flat kernel), `segop/gemm-epilogue-host` (with an
+  epilogue run on the host) and `segop/gemm-batched` (a batched product);
 - convolutions: `segop/im2col`, `segop/col2im`, `segop/conv-fwd`,
   `segop/conv-bwd-data` and `segop/conv-bwd-weights`;
 - `segop/gather` for materialized views, `segop/host-index-fn` for index
@@ -577,6 +638,92 @@ each segop instruction by its pattern:
 
 `replay-plan-stats` also reports `conv-scratch-bytes`, the size of the
 image-column buffers that the plan's convolutions share.
+
+## Frame Lifting
+
+`array-morphisms-lift` applies a function to every cell of a frame as one
+computation:
+
+```scheme
+(import array-morphisms-lift)
+
+;; x [F B D]: each cell is a [B D] matrix; W and b are shared by every cell
+(define y (morph-lift (lambda (xc) (morph-tanh-am (morph+ (morph-matmul xc W) b)))
+                      2 x))   ; cell rank 2 -> y [F B D]
+```
+
+`(morph-lift fn cell-ranks arg ...)` takes the rank of the cells that
+`fn` expects, one per argument or one for all. The leading axes of an
+argument, beyond its cell rank, are its frame. The longest frame becomes
+the result's frame, and every other frame must be a prefix of it. An
+argument with a shorter frame is reused along the frame axes it lacks.
+
+`morph-lift` calls `fn` once, on placeholder arrays with the cell shapes,
+and widens the expression `fn` builds by the frame:
+
+- element-wise operations stay one element-wise node;
+- a reduction becomes one reduction with a frame rank;
+- a matrix product becomes one batched matrix product;
+- transposes, reshapes, slices, padding, stacks and concatenations keep
+  the frame axes in front;
+- attention takes the frame as leading axes (up to rank 4 in all), and
+  `im2col` and `col2im` fold it into the image axis.
+
+Parts of the expression that use no argument, such as `W` above, are kept
+as they are and computed once. So the expression has as many nodes for a
+frame of 4 cells as for 64.
+
+Every cell of the result has exactly the values that `fn` gives for that
+cell stored in an array of its own: elements, reductions and products are
+computed in the same order and precision.
+
+`fn` must only build expressions from the placeholders; it must not read
+their values. When `fn` uses an operation that has no widening rule (such
+as `morph-matvec`), `morph-lift` signals a condition. `lift-unsupported?`
+recognizes it, and `lift-unsupported-op` gives the operation's name.
+
+`batch-map` and `batch-zip` (`array-morphisms-batch-ops`) use
+`morph-lift`. When it cannot lift their function, they fall back to
+`batch-map/slices` and `batch-zip/slices`, which apply the function to
+each element slice and stack the results.
+
+### Training lifted computations
+
+`var-lift` (`array-morphisms-grad`) is the gradient-tracking form:
+
+```scheme
+(define y (var-lift (lambda (xc) (morph-tanh-am (morph+ (morph-matmul xc (var-value W))
+                                                        (var-value b))))
+                    2 x-var))
+```
+
+`ssa-vjp` derives the gradients of lifted computations; nanograd's
+`am-training-step/ssa` uses it. Each cell of a framed value gets exactly
+the gradient that the cell's own program would give.
+
+An array shared by every cell, such as `W`, gets the sum of the cells'
+gradients. The lifted program adds them in a different order than adding
+up per-cell gradients would, so the two results agree only up to
+rounding.
+
+`backward!` does not differentiate through `var-lift`. It signals an error
+that names `am-training-step/ssa`.
+
+### Performance
+
+Measured in f32, a lifted layer `tanh(x W + b)` with frames of 8 to 64
+cells:
+
+- **Forward pass:** 6 to 17 times faster than slice-and-stack.
+- **Training step on the SSA path:** faster than one program per cell by
+  1.7 to 3 times on microBLAS, 2.4 to 4.7 times on system BLAS and 17 to
+  37 times on crunch.
+
+For the attention of the transformer benchmark, lifting over the heads
+beats the per-head loop when the code generator of `array-morphisms-crunch`
+is on: 16 against 26 ms per step. Without the code generator it is slower
+(154 against 83 ms), because the copies that regroup the heads then run in
+host loops.
 
 ## Examples
 
@@ -607,8 +754,7 @@ image-column buffers that the plan's convolutions share.
   ;; Polyphase downsampling via composed slices
   (let* ((even (morph-slice signal '(0) (get-morphism-shape signal) 2))
          (quarter (morph-slice even '(0) (get-morphism-shape even) 2)))
-    ;; Both slices are zero-copy views
-    ;; Final realization computes in single pass
+    ;; Both slices are views; realize computes the result in one pass
     (realize quarter)))
 ```
 
@@ -617,15 +763,18 @@ image-column buffers that the plan's convolutions share.
 ```scheme
 (import array-morphisms-batch-ops)
 
-;; Stack matrices into batch
+;; Stack matrices into a batch
 (define batch (morph-stack (list m1 m2 m3) 0))
 
-;; Apply operation to each batch element
-(define doubled (batch-map 
+;; Apply an operation to every batch element, as one computation
+(define doubled (batch-map
                    (lambda (m) (morph-map (lambda (x) (* x 2)) m))
                    batch))
 
-;; Reduce across batch dimension
+;; One batched product: each [M K] element times a shared [K N] matrix
+(define products (morph-matmul batch W))
+
+;; Sum over the batch axis
 (define summed (batch-reduce 'sum batch))
 ```
 
@@ -651,6 +800,7 @@ Key modules:
 - `array-morphisms-realization` - Materialization and execution
 - `array-morphisms-context` - Memory reuse contexts
 - `array-morphisms-batch-ops` - Batch operations and combinators
+- `array-morphisms-lift` - Frame lifting (`morph-lift`)
 - `array-morphisms-blas-exec` - BLAS backend records, registration and dispatch
 - `array-morphisms-micro-blas-backend` - Default dependency-free BLAS backend
 - `array-morphisms-activation-exec` - Element-wise kernel backend records and registration
@@ -668,8 +818,8 @@ LGPL-3
 - Segmented operations and map-reduce fusion modeled on the Futhark
   compiler (https://futhark-lang.org), by Troels Henriksen, Cosmin Oancea
   and colleagues at DIKU, University of Copenhagen
-- Category-theoretic foundation from functional programming research
-- Memory reuse patterns from stream fusion and buffer optimization literature.
+- Category-theoretic model from functional programming research
+- Buffer reuse patterns from the stream fusion and buffer optimization literature
 
 ## References
 

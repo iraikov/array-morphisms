@@ -970,14 +970,17 @@
   ;; morph-batch-matmul).  Each cell is computed as the 2-D product of that
   ;; cell stored on its own would be: the cell's gemm-plan is prepared from
   ;; an array with the cell's shape and strides that starts at the cell's
-  ;; first element.  A cell whose rows (or columns) are contiguous but lie
-  ;; further apart than its width (or height), as when frame axes come
-  ;; between its axes, is a padded cell: its own array is the contiguous
-  ;; one, in the same orientation, and kernels read it in place with its
-  ;; actual leading dimension.  When that plan calls a kernel of a backend that has an
-  ;; offset GEMM kernel, the kernel reads the cell in place.  Otherwise the
-  ;; cell is copied, strides and all, into a scratch buffer, the plan runs
-  ;; on the copy, and the product is copied into place.
+  ;; first element.  When that plan calls a kernel of a backend that has
+  ;; an offset GEMM kernel, the kernel reads the cell in place.  Otherwise
+  ;; the cell is copied, strides and all, into a scratch buffer, the plan
+  ;; runs on the copy, and the product is copied into place.
+  ;;
+  ;; A cell whose rows (or columns) are contiguous but lie further apart
+  ;; than its width (or height), as when frame axes come between its axes,
+  ;; is a padded cell.  Its own array is the contiguous one in the same
+  ;; orientation: its plan is prepared for that layout, an offset kernel
+  ;; reads the cell in place with its actual leading dimension, and the
+  ;; copy path packs it row by row (or column by column).
 
   (define-record batched-gemm-plan
     cell        ; gemm-plan of one cell
