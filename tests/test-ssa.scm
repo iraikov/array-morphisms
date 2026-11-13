@@ -4445,4 +4445,62 @@
       (s2-same-lists? (lt-elements (realize (am:var-value (am:var-lift morph-exp 2 (am:make-var (cadr d) #f)))))
                       (lt-elements (realize (morph-exp (cadr d))))))))
 
+;;;; Leading-axis sums of rank 3 and more
+;;;; ============================================================
+
+(test-group "leading-axis sums as axis-0 reductions"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (spec)
+        (let* ((op (car spec)) (axes (cadr spec)) (keep? (caddr spec))
+               (make (lambda () (morph-reduce op (s2-src dt '(4 5 9) frd-val) axes keep?)))
+               (r (s2-run make))
+               (name (sprintf "~A ~A axes ~A~A" dt op axes (if keep? " keepdims" ""))))
+          (test-assert (string-append name ": axis-0 executor")
+            (memq 'segop/reduce-axis0 (s2-tags (car r))))
+          (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+          (test-assert (string-append name ": values equal realize (the general loop)")
+            (s2-same-lists? (cadr r) (s2-values (realize (make)))))))
+      '((sum (0) #f) (sum (0 1) #f) (mean (0 1) #t) (sum (0 1 2) #f) (mean (0) #f))))
+   '(f32 f64)))
+
+;;;; Gradients of framed values
+;;;; ============================================================
+;;;; A parameter with a frame, used through a lifted softmax: each cell of
+;;;; its gradient equals, bit for bit, the gradient of the cell's own
+;;;; program.  The sums that undo the broadcasting of the row maximum and
+;;;; row sum take their frame rank, so they reduce each cell as the cell's
+;;;; program does.
+
+(define (fg-softmax-loss q c)
+  (let* ((sc (morph-matmul q (morph-transpose q '(1 0))))
+         (m  (morph-reduce 'max sc '(1) #t))
+         (e  (morph-exp (morph- sc m)))
+         (p  (morph/ e (morph-reduce 'sum e '(1) #t))))
+    (morph-matmul p c)))
+
+(test-group "gradients of framed values"
+  (for-each
+   (lambda (dt)
+     (let* ((H 3) (n 6) (d 4)
+            (qv (lt-vals (* H n d) 0.4))
+            (Q  (morph-from-list qv (vector H n d) dt))
+            (C  (morph-from-list (lt-vals (* n d) 1.9) (vector n d) dt))
+            (lifted (morph-reduce 'sum (morph-lift (lambda (q) (fg-softmax-loss q C)) 2 Q)))
+            (cj (lt-compile (am:make-var lifted #f) (list Q)))
+            (r  (lt-run! cj))
+            (cells (map (lambda (h)
+                          (let* ((Qh (morph-from-list (take (drop qv (* h n d)) (* n d)) (vector n d) dt))
+                                 (cjh (lt-compile (am:make-var (morph-reduce 'sum (fg-softmax-loss Qh C)) #f)
+                                                  (list Qh))))
+                            (cadr (lt-run! cjh))))
+                        (iota H))))
+       (test-assert (sprintf "~A: the gradient of each cell equals the cell program's" dt)
+         (s2-same-lists? (cadr r) (apply append cells)))
+       (lt-run! cj)
+       (test-assert (sprintf "~A: no reduction takes the general loop" dt)
+         (not (memq 'segop/reduce-general (s2-tags (cadr cj)))))))
+   '(f32 f64)))
+
 (test-end)

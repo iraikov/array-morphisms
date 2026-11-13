@@ -970,7 +970,11 @@
   ;; morph-batch-matmul).  Each cell is computed as the 2-D product of that
   ;; cell stored on its own would be: the cell's gemm-plan is prepared from
   ;; an array with the cell's shape and strides that starts at the cell's
-  ;; first element.  When that plan calls a kernel of a backend that has an
+  ;; first element.  A cell whose rows (or columns) are contiguous but lie
+  ;; further apart than its width (or height), as when frame axes come
+  ;; between its axes, is a padded cell: its own array is the contiguous
+  ;; one, in the same orientation, and kernels read it in place with its
+  ;; actual leading dimension.  When that plan calls a kernel of a backend that has an
   ;; offset GEMM kernel, the kernel reads the cell in place.  Otherwise the
   ;; cell is copied, strides and all, into a scratch buffer, the plan runs
   ;; on the copy, and the product is copied into place.
@@ -986,6 +990,7 @@
     a-lo b-lo   ; offset of a cell's lowest element from its first element
     a-span b-span ; elements spanned by one cell
     a-offs b-offs ; vector: offset of each cell's first element from the array's offset
+    a-pad b-pad   ; #f, or (rows . ld) or (cols . ld) for a padded cell
     scratch)    ; #f, or vector of the scratch buffers for A, B and C
 
   (define (dtype-bytes dtype)
@@ -1049,21 +1054,33 @@
      (batch-matmul-concrete? A B)
      (let ()
        (define (cell-of m)
-         ;; (shared? layout lo span fstrides frame) for operand m.
+         ;; (shared? layout lo span fstrides frame pad) for operand m.
          (cases array-morphism m
            (concrete-array (_ shape strides offset dtype _ _)
              (let ((r (vector-length shape)))
                (if (= r 2)
-                   (list #t m 0 0 #f #f)
-                   (let ((cs  (subvector shape (- r 2) r))
-                         (cst (subvector strides (- r 2) r)))
-                     (let-values (((lo hi) (matrix-extent cs cst)))
-                       (list #f
-                             (concrete-array (allocate-typed-vector dtype 0) cs cst (- lo)
-                                             dtype -1 -1)
-                             lo (max 0 (+ 1 (- hi lo)))
-                             (subvector strides 0 (- r 2))
-                             (subvector shape 0 (- r 2))))))))
+                   (list #t m 0 0 #f #f #f)
+                   (let* ((cs  (subvector shape (- r 2) r))
+                          (cst (subvector strides (- r 2) r))
+                          (R   (vector-ref cs 0)) (C (vector-ref cs 1))
+                          (s0  (vector-ref cst 0)) (s1 (vector-ref cst 1))
+                          (pad (cond ((and (= s1 1) (> R 1) (> s0 C)) (cons 'rows s0))
+                                     ((and (= s0 1) (> C 1) (> s1 R)) (cons 'cols s1))
+                                     (else #f)))
+                          (fst (subvector strides 0 (- r 2)))
+                          (frm (subvector shape 0 (- r 2))))
+                     (if pad
+                         (list #f
+                               (concrete-array (allocate-typed-vector dtype 0) cs
+                                               (if (eq? (car pad) 'rows) (vector C 1) (vector 1 R))
+                                               0 dtype -1 -1)
+                               0 (* R C) fst frm pad)
+                         (let-values (((lo hi) (matrix-extent cs cst)))
+                           (list #f
+                                 (concrete-array (allocate-typed-vector dtype 0) cs cst (- lo)
+                                                 dtype -1 -1)
+                                 lo (max 0 (+ 1 (- hi lo)))
+                                 fst frm #f)))))))
            (else (error "prepare-batched-gemm: operand not concrete" m))))
        (let* ((a  (cell-of A))
               (b  (cell-of B))
@@ -1080,6 +1097,7 @@
           (caddr a) (caddr b) (cadddr a) (cadddr b)
           (if (car a) #f (frame-offsets frame (list-ref a 4)))
           (if (car b) #f (frame-offsets frame (list-ref b 4)))
+          (list-ref a 6) (list-ref b 6)
           #f)))))
 
   (define (batched-gemm-plan-cells plan)
@@ -1126,11 +1144,15 @@
                 (let ((a-offs (batched-gemm-plan-a-offs plan))
                       (b-offs (batched-gemm-plan-b-offs plan))
                       (K      (gemm-plan-K cell)))
-                  (let-values (((lda ta ldb tb)
-                                (if (gemm-plan-strided? cell)
-                                    (values (gemm-plan-lda cell) (gemm-plan-transa cell)
-                                            (gemm-plan-ldb cell) (gemm-plan-transb cell))
-                                    (values K 'no-trans N 'no-trans))))
+                  (let*-values (((lda ta ldb tb)
+                                 (if (gemm-plan-strided? cell)
+                                     (values (gemm-plan-lda cell) (gemm-plan-transa cell)
+                                             (gemm-plan-ldb cell) (gemm-plan-transb cell))
+                                     (values K 'no-trans N 'no-trans)))
+                                ((a-pad) (batched-gemm-plan-a-pad plan))
+                                ((b-pad) (batched-gemm-plan-b-pad plan))
+                                ((lda) (if a-pad (cdr a-pad) lda))
+                                ((ldb) (if b-pad (cdr b-pad) ldb)))
                     (do ((c 0 (+ c 1)))
                         ((= c n))
                       (kernel M N K 1.0
@@ -1143,18 +1165,29 @@
                        (scratch (batched-scratch plan))
                        (c-buf   (vector-ref scratch 2)))
                   ;; The cell of operand m at cell index c, as an array with
-                  ;; the plan's cell layout.
-                  (define (cell-array m data off shared? layout lo span offs buf c)
+                  ;; the plan's cell layout.  A padded cell is packed row by
+                  ;; row (or column by column).
+                  (define (cell-array m data off shared? layout lo span offs buf c pad)
                     (if shared?
                         m
                         (let ((first (+ off (vector-ref offs c) lo)))
                           (cases array-morphism layout
                             (concrete-array (_ cs cst loff _ _ _)
-                              (if (= first 0)
-                                  (concrete-array data cs cst loff dt -1 -1)
-                                  (begin
-                                    (move-memory! data buf (* span bytes) (* first bytes) 0)
-                                    (concrete-array buf cs cst loff dt -1 -1))))
+                              (cond
+                               (pad
+                                (let* ((rows? (eq? (car pad) 'rows))
+                                       (n     (vector-ref cs (if rows? 0 1)))
+                                       (len   (vector-ref cs (if rows? 1 0))))
+                                  (do ((i 0 (+ i 1))) ((= i n))
+                                    (move-memory! data buf (* len bytes)
+                                                  (* (+ first (* i (cdr pad))) bytes)
+                                                  (* i len bytes)))
+                                  (concrete-array buf cs cst 0 dt -1 -1)))
+                               ((= first 0)
+                                (concrete-array data cs cst loff dt -1 -1))
+                               (else
+                                (move-memory! data buf (* span bytes) (* first bytes) 0)
+                                (concrete-array buf cs cst loff dt -1 -1))))
                             (else m)))))
                   (do ((c 0 (+ c 1)))
                       ((= c n))
@@ -1163,13 +1196,15 @@
                                          (batched-gemm-plan-a-lo plan)
                                          (batched-gemm-plan-a-span plan)
                                          (batched-gemm-plan-a-offs plan)
-                                         (vector-ref scratch 0) c))
+                                         (vector-ref scratch 0) c
+                                         (batched-gemm-plan-a-pad plan)))
                           (b (cell-array B data-B off-B (batched-gemm-plan-b-shared? plan)
                                          (batched-gemm-plan-b-layout plan)
                                          (batched-gemm-plan-b-lo plan)
                                          (batched-gemm-plan-b-span plan)
                                          (batched-gemm-plan-b-offs plan)
-                                         (vector-ref scratch 1) c)))
+                                         (vector-ref scratch 1) c
+                                         (batched-gemm-plan-b-pad plan))))
                       (if (= c 0)
                           (execute-gemm-plan/into! cell a b result-data)
                           (begin

@@ -1588,6 +1588,27 @@
                 (env-builder-extend! param-cid-eb (ssa-value-id v) #t))
               param-const-vals)
 
+    ;; The frame rank of each forward value: that of a reduction with a
+    ;; frame rank (see morph-reduce), carried through element-wise ops; 0
+    ;; elsewhere.  A sum that undoes the broadcasting of a value along a
+    ;; size-1 cell axis takes the value's frame rank, so that each cell's
+    ;; gradient is reduced as the cell's own would be.
+    (define frame-eb (make-env-builder))
+    (define (val-frame-rank v)
+      (cases ssa-value v
+        (binding-ref (bid) (or (env-builder-lookup frame-eb bid) 0))
+        (const-ref (cid) 0)))
+    (for-each (lambda (b)
+                (let* ((op (ssa-binding-op b))
+                       (fr (cond ((and (pair? op) (eq? (car op) 'reduce))
+                                  (binding-frame-rank (ssa-binding-meta b)))
+                                 ((memq op '(add sub mul div pow negate abs sqrt exp log sin cos
+                                             tan relu sigmoid tanh cast map))
+                                  (fold max 0 (map val-frame-rank (ssa-binding-inputs b))))
+                                 (else 0))))
+                  (when (> fr 0) (env-builder-extend! frame-eb (ssa-binding-name b) fr))))
+              fwd-bindings)
+
     ;; Forward bindings whose value depends on a trainable parameter
     (define param-dependent-eb (make-env-builder))
     (define (param-dependent? v)
@@ -1667,7 +1688,7 @@
               (accumulate-param-grad! cid new-val shape dtype))))))
 
     ;; emit-reduce-sum-to! -- reduce g-val to target-shape
-    (define (emit-reduce-sum-to! g-val g-shape target-shape dtype)
+    (define (emit-reduce-sum-to! g-val g-shape target-shape dtype #!optional (fr 0))
       (let* ((g-rank (vector-length g-shape))
              (t-vec  (if (vector? target-shape)
                          target-shape
@@ -1698,9 +1719,13 @@
                              (_ (vector-set! new-shape k 1))
                              (r (emit! (list 'reduce 'sum) (list cur)
                                        new-shape dtype
-                                       (list (cons 'axes (list k))
-                                             (cons 'keepdims? #t)
-                                             (cons 'src-shape cur-shape)))))
+                                       (append
+                                        (list (cons 'axes (list k))
+                                              (cons 'keepdims? #t)
+                                              (cons 'src-shape cur-shape))
+                                        (if (and (> fr 0) (>= k fr) (= extra 0))
+                                            (list (cons 'frame-rank fr))
+                                            '())))))
                         (loop (+ k 1) r new-shape))
                       (loop (+ k 1) cur cur-shape))))))))
 
@@ -1789,9 +1814,9 @@
                        (y-val (list-ref inputs 1))
                        (x-shape (val-shape x-val))
                        (y-shape (val-shape y-val)))
-                  (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype)))
+                  (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype (val-frame-rank x-val))))
                     (accumulate-input-adjoint! x-val dx))
-                  (let ((dy (emit-reduce-sum-to! g-val g-shape y-shape dtype)))
+                  (let ((dy (emit-reduce-sum-to! g-val g-shape y-shape dtype (val-frame-rank y-val))))
                     (accumulate-input-adjoint! y-val dy))))
 
                ;; sub(x, y) -- dx = reduce-sum-to(g, shape-x); dy = reduce-sum-to(-g, shape-y)
@@ -1800,11 +1825,11 @@
                        (y-val (list-ref inputs 1))
                        (x-shape (val-shape x-val))
                        (y-shape (val-shape y-val)))
-                  (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype)))
+                  (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype (val-frame-rank x-val))))
                     (accumulate-input-adjoint! x-val dx))
                   (let* ((neg-g (emit! 'negate (list g-val) g-shape dtype
                                         `((combiner . ,(scalar-op-combiner 'negate)))))
-                         (dy    (emit-reduce-sum-to! neg-g g-shape y-shape dtype)))
+                         (dy    (emit-reduce-sum-to! neg-g g-shape y-shape dtype (val-frame-rank y-val))))
                     (accumulate-input-adjoint! y-val dy))))
 
                ;; mul(x, y) -- dx = reduce-sum-to(g*y, shape-x); dy = reduce-sum-to(g*x, shape-y)
@@ -1815,11 +1840,11 @@
                        (y-shape (val-shape y-val)))
                   (let* ((gy    (emit! 'mul (list g-val y-val) g-shape dtype
                                         `((combiner . ,*))))
-                         (dx    (emit-reduce-sum-to! gy g-shape x-shape dtype)))
+                         (dx    (emit-reduce-sum-to! gy g-shape x-shape dtype (val-frame-rank x-val))))
                     (accumulate-input-adjoint! x-val dx))
                   (let* ((gx    (emit! 'mul (list g-val x-val) g-shape dtype
                                         `((combiner . ,*))))
-                         (dy    (emit-reduce-sum-to! gx g-shape y-shape dtype)))
+                         (dy    (emit-reduce-sum-to! gx g-shape y-shape dtype (val-frame-rank y-val))))
                     (accumulate-input-adjoint! y-val dy))))
 
                ;; div(x, y) -- dx = g/y; dy = -g*x/y^2
@@ -1830,7 +1855,8 @@
                        (y-shape (val-shape y-val)))
                   (let* ((g-over-y (emit! 'div (list g-val y-val) g-shape dtype
                                            `((combiner . ,/))))
-                         (dx       (emit-reduce-sum-to! g-over-y g-shape x-shape dtype)))
+                         (dx       (emit-reduce-sum-to! g-over-y g-shape x-shape dtype
+                                                        (val-frame-rank x-val))))
                     (accumulate-input-adjoint! x-val dx))
                   (let* ((y2      (emit! 'mul (list y-val y-val) y-shape dtype
                                           `((combiner . ,*))))
@@ -1840,7 +1866,8 @@
                                           `((combiner . ,*))))
                          (neg-dy2 (emit! 'negate (list neg-dy) g-shape dtype
                                           `((combiner . ,(scalar-op-combiner 'negate)))))
-                         (dy      (emit-reduce-sum-to! neg-dy2 g-shape y-shape dtype)))
+                         (dy      (emit-reduce-sum-to! neg-dy2 g-shape y-shape dtype
+                                                       (val-frame-rank y-val))))
                     (accumulate-input-adjoint! y-val dy))))
 
                ;; pow(x, n) -- dx = g * n * x^(n-1); dn skipped (n usually not a param)

@@ -442,17 +442,37 @@
    pool-idx of the given shape, strides and dtype.  The space lists the
    kept axes, then the reduced axes in increasing order.  Its combine spec
    is the one of the loop execute-framed-reduction takes for this layout
-   and frame rank.  A framed reduction whose rows run as the rows of one
-   array, over a row-major source, is lowered as the axis-1 reduction of
-   the source viewed as that [R, N] array."
+   and frame rank.  Two cases over a row-major source are lowered as
+   reductions of a 2-D view of it, which accumulate in the same order and
+   dtype as the loop for the source itself and run on the fast paths:
+     - a framed reduction whose rows run as the rows of one array, as the
+       axis-1 reduction of the [R, N] view;
+     - a sum or mean over the leading axes of a source of rank 3 or more,
+       as the axis-0 reduction of the [P, rest] view, P the size of the
+       reduced axes and rest that of the others (1 when every axis is
+       reduced)."
   (cases array-morphism src-tr
     (concrete-array (data s st off sdt _ _)
-     (let ((plan (framed-reduction-plan rop s st sdt (sort-axes axes) frame-rank)))
-      (if (and (pair? plan) (eq? (car plan) 'rows) (= off 0) (equal? st (compute-strides s)))
-          (let ((R (cadr plan)) (N (caddr plan)))
-            (lower-reduction-binding rop '(1) #f
-                                     (concrete-array data (vector R N) (vector N 1) 0 sdt -1 -1)
-                                     in-ref pool-idx (vector R) (vector 1) dtype))
+     (let* ((plan  (framed-reduction-plan rop s st sdt (sort-axes axes) frame-rank))
+            (flat? (and (= off 0) (equal? st (compute-strides s))))
+            (nlead (and (= frame-rank 0) (memq rop '(sum mean)) (memq sdt '(f32 f64))
+                        (eq? sdt dtype) (>= (vector-length s) 3) flat?
+                        (equal? (sort-axes axes) (iota (length axes)))
+                        (length axes))))
+      (cond
+       ((and (pair? plan) (eq? (car plan) 'rows) flat?)
+        (let ((R (cadr plan)) (N (caddr plan)))
+          (lower-reduction-binding rop '(1) #f
+                                   (concrete-array data (vector R N) (vector N 1) 0 sdt -1 -1)
+                                   in-ref pool-idx (vector R) (vector 1) dtype)))
+       ((and nlead (> nlead 0))
+        (let* ((dims (vector->list s))
+               (P    (fold * 1 (take dims nlead)))
+               (rest (fold * 1 (drop dims nlead))))
+          (lower-reduction-binding rop '(0) #f
+                                   (concrete-array data (vector P rest) (vector rest 1) 0 sdt -1 -1)
+                                   in-ref pool-idx (vector rest) (vector 1) dtype)))
+       (else
       (let* ((rank  (vector-length s))
              (red   (filter (lambda (k) (memv k axes)) (iota rank)))
              (par   (filter (lambda (k) (not (memv k axes))) (iota rank)))
@@ -474,7 +494,7 @@
                              (make-segop-operand pool-idx dtype shape strides 0 out-map)
                              '(in 0)
                              (reduction-combine-spec rop path sdt dtype)
-                             (and (eq? rop 'mean) `(/ (reduced) ,count)))))))))
+                             (and (eq? rop 'mean) `(/ (reduced) ,count))))))))))
     (else (error "lower-reduction-binding: source not concrete" src-tr))))
 
 ;; The axes in increasing order.

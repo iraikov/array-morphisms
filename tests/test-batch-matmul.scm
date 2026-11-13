@@ -192,3 +192,55 @@
       (bm-error? (lambda () (morph-matmul A v))))
     (test-assert "morph-batch-matmul of rank 1 is an error"
       (bm-error? (lambda () (morph-batch-matmul v A))))))
+
+;; Padded cells: rows (or columns) of each cell lie further apart than its
+;; width (or height), as in a [M, F, K] array viewed as [F, M, K].  Each
+;; cell is compared with the product of the cell stored contiguously, in
+;; the same orientation.
+(define (bm-padded dt F rows cols kind seed)
+  ;; (values operand cells): kind rows stores [rows, F, cols] and views it
+  ;; as [F, rows, cols]; kind cols stores [cols, F, rows] and views it as
+  ;; [F, rows, cols] through a transpose of the last two axes.
+  (let* ((vals (bm-vals (* F rows cols) seed))
+         (at   (lambda (i j k) (list-ref vals (+ (* i F (if (eq? kind 'rows) cols rows))
+                                                 (* j (if (eq? kind 'rows) cols rows)) k)))))
+    (if (eq? kind 'rows)
+        (values (morph-transpose (morph-from-list vals (vector rows F cols) dt) '(1 0 2))
+                (map (lambda (f)
+                       (morph-from-list (append-map (lambda (i) (map (lambda (k) (at i f k)) (iota cols)))
+                                                    (iota rows))
+                                        (vector rows cols) dt))
+                     (iota F)))
+        (values (morph-transpose (morph-from-list vals (vector cols F rows) dt) '(1 2 0))
+                (map (lambda (f)
+                       (morph-transpose
+                        (morph-from-list (append-map (lambda (k) (map (lambda (i) (at k f i)) (iota rows)))
+                                                     (iota cols))
+                                         (vector cols rows) dt)
+                        '(1 0)))
+                     (iota F))))))
+
+(test-group "batch-matmul: padded cells"
+  (for-each
+   (lambda (backend)
+     (let ((saved (active-blas-backend)))
+       (when (eq? backend 'copying) (register-blas-backend! (bm-copying-backend)))
+       (for-each
+        (lambda (dt)
+          (for-each
+           (lambda (mkn)
+             (for-each
+              (lambda (kinds)
+                (let ((M (car mkn)) (K (cadr mkn)) (N (caddr mkn)))
+                  (let-values (((A a-cells) (bm-padded dt 4 M K (car kinds) 0.3))
+                               ((B b-cells) (bm-padded dt 4 K N (cadr kinds) 1.1)))
+                    (test-assert (sprintf "~A ~A ~Ax~Ax~A A ~A B ~A" backend dt M K N
+                                          (car kinds) (cadr kinds))
+                      (bm-same? (bm-elements (morph-batch-matmul A B))
+                                (append-map (lambda (a b) (bm-elements (morph-matmul a b)))
+                                            a-cells b-cells))))))
+              '((rows rows) (cols rows) (rows cols) (cols cols))))
+           '((3 4 5) (9 8 10))))
+        '(f32 f64))
+       (register-blas-backend! saved)))
+   '(offset copying)))
