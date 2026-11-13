@@ -46,7 +46,8 @@
                                                 array-morphisms-activation-exec
                                                 array-morphisms-scalar-ops))
              (extension array-morphisms-context     (source "context.scm")     (csc-options "-O2" "-d1"))
-             (extension array-morphisms-batch-ops   (source "batch-ops.scm")   (csc-options "-O2" "-d1"))
+             (extension array-morphisms-batch-ops   (source "batch-ops.scm")   (csc-options "-O2" "-d1")
+                        (component-dependencies array-morphisms-lift))
              (extension array-morphisms-lift        (source "lift.scm")        (csc-options "-O2" "-d1")
                         (component-dependencies array-morphisms-core array-morphisms-basic-ops
                                                 array-morphisms-structural-ops

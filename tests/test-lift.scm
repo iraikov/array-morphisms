@@ -16,6 +16,7 @@
 (import array-morphisms-realization)
 (import array-morphisms-blas-exec)
 (import array-morphisms-lift)
+(import array-morphisms-batch-ops)
 
 ;;;; Helpers
 
@@ -237,3 +238,52 @@
                                                (lf-arr '(4 3 5) 'f64 0))
                                    #f)
               (c (lift-unsupported) (lift-unsupported-op c)))))))
+
+(test-group "batch-map and batch-zip on morph-lift"
+  (for-each
+   (lambda (dt)
+     (let ((m (lf-arr '(4 3 5) dt 0)) (w (lf-arr '(5) dt 2)))
+       (for-each
+        (lambda (axis)
+          (let ((f (lambda (x) (morph-sigmoid (morph* x (morph-exp x))))))
+            (test-assert (sprintf "~A batch-map axis ~A: values of batch-map/slices" dt axis)
+              (lf-same? (lf-elements (batch-map f m axis))
+                        (lf-elements (batch-map/slices f m axis))))
+            (test (sprintf "~A batch-map axis ~A: batch axis" dt axis) axis
+                  (get-morphism-batch-axis (batch-map f m axis)))))
+        '(0 1 2))
+       (test-assert (sprintf "~A batch-map of a softmax: the cells' own values" dt)
+         (lf-same? (lf-elements (batch-map softmax-rows m))
+                   (lf-oracle softmax-rows (list m) '(1))))
+       (let ((wm (lf-arr '(5 2) dt 4)))
+         (test-assert (sprintf "~A batch-map of x W: the cells' own values" dt)
+           (lf-same? (lf-elements (batch-map (lambda (x) (morph-matmul x wm)) m))
+                     (lf-oracle (lambda (x) (morph-matmul x wm)) (list m) '(1)))))
+       (test-assert (sprintf "~A batch-zip morph*: values of batch-zip/slices" dt)
+         (lf-same? (lf-elements (batch-zip morph* m (lf-arr '(4 3 5) dt 1)))
+                   (lf-elements (batch-zip/slices morph* m (lf-arr '(4 3 5) dt 1)))))
+       (test-assert (sprintf "~A batch-zip of matrix products: the cells' own values" dt)
+         (let ((b (lf-arr '(4 5 2) dt 3)))
+           (lf-same? (lf-elements (batch-zip morph-matmul m b))
+                     (lf-oracle morph-matmul (list m b) '(1 1)))))))
+   '(f32 f64))
+  (let ((f (lambda (x) (morph-negate x))))
+    (test "batch-map has the same nodes for 4 and 64 elements"
+          (lf-node-count (batch-map f (lf-arr '(4 3) 'f64 0)))
+          (lf-node-count (batch-map f (lf-arr '(64 3) 'f64 0))))
+    (test-assert "batch-map/slices has a node per element"
+      (> (lf-node-count (batch-map/slices f (lf-arr '(64 3) 'f64 0)))
+         (lf-node-count (batch-map/slices f (lf-arr '(4 3) 'f64 0))))))
+  (let ((m (lf-arr '(4 3 5) 'f64 0)) (v (lf-arr '(5) 'f64 1)))
+    (test-assert "an fn morph-lift cannot widen runs on slices"
+      (lf-same? (lf-elements (batch-map (lambda (a) (morph-matvec a v)) m))
+                (lf-elements (batch-map/slices (lambda (a) (morph-matvec a v)) m))))
+    (let ((data-dependent (lambda (a) (morph-from-list (map (lambda (x) (* 2.0 x)) (lf-elements a))
+                                                       (get-morphism-shape a) 'f64))))
+      (test-assert "an fn that reads its argument's values runs on slices"
+        (lf-same? (lf-elements (batch-map data-dependent m))
+                  (lf-elements (batch-map/slices data-dependent m)))))
+    (test-assert "batch-zip falls back as well"
+      (lf-same? (lf-elements (batch-zip (lambda (a b) (morph-matvec a (morph-reduce 'sum b '(0)))) m m))
+                (lf-elements (batch-zip/slices
+                              (lambda (a b) (morph-matvec a (morph-reduce 'sum b '(0)))) m m))))))
