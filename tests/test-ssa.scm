@@ -34,7 +34,8 @@
         array-morphisms-segop
         array-morphisms-activation-exec
         (only array-morphisms-scalar-ops scalar-op-combiner)
-        array-morphisms-ssa)
+        array-morphisms-ssa
+        array-morphisms-lift)
 
 
 ;;;; ============================================================
@@ -4272,6 +4273,30 @@
        (test-assert (sprintf "~A softmax: fusion 'all equals fusion off" dt)
          (let ((r (run 'all)))
            (and (s2-same-lists? (cadr off) (cadr r)) (= 0 (list-ref r 4)))))))
+   '(f32 f64)))
+
+;;;; Lifted programs
+;;;; ============================================================
+
+(test-group "lifted programs"
+  (for-each
+   (lambda (dt)
+     (let* ((w    (morph-from-list (map (lambda (i) (* 0.3 (cos (* 0.7 i)))) (iota 72)) #(9 8) dt))
+            (make (lambda ()
+                    (morph-lift (lambda (x)
+                                  (let* ((h (morph-matmul x w))
+                                         (m (morph-reduce 'max h '(1) #t))
+                                         (e (morph-exp (morph- h m))))
+                                    (morph/ e (morph-reduce 'sum e '(1) #t))))
+                                2 (s2-src dt '(4 5 9) frd-val))))
+            (run (lambda (policy) (parameterize ((segop-fusion policy)) (s2-run make))))
+            (off (run #f)))
+       (test-assert (sprintf "~A lifted matmul and softmax: one batched GEMM" dt)
+         (memq 'segop/gemm-batched (s2-tags (car off))))
+       (test-assert (sprintf "~A lifted matmul and softmax: values equal realize" dt)
+         (s2-same-lists? (cadr off) (s2-values (realize (make)))))
+       (test-assert (sprintf "~A lifted matmul and softmax: fusion 'all equals fusion off" dt)
+         (s2-same-lists? (cadr off) (cadr (run 'all))))))
    '(f32 f64)))
 
 (test-end)

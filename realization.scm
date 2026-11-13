@@ -895,9 +895,12 @@
                   (execute-compute-morphism index-fn output-buffer shape operands dtype))))
              (else
               (execute-compute-morphism index-fn output-buffer shape operands dtype))))
-          ;; Fast path 3: bias broadcast A[...,N] + B[N]
+          ;; Fast path 3: bias broadcast A[...,N] + B[N], operands of the
+          ;; output dtype
           ((and (= nops 2)
                 (> (vector-length shape) 0)
+                (eq? (get-morphism-dtype (car operands)) dtype)
+                (eq? (get-morphism-dtype (cadr operands)) dtype)
                 (flat-operand? (car operands) shape)
                 (let ((N (vector-ref shape (- (vector-length shape) 1))))
                   (cases array-morphism (cadr operands)
