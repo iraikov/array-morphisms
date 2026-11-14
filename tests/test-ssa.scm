@@ -4275,6 +4275,84 @@
            (and (s2-same-lists? (cadr off) (cadr r)) (= 0 (list-ref r 4)))))))
    '(f32 f64)))
 
+;;;; Scans
+;;;; ============================================================
+
+(test-group "scans as seg-scan"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (op)
+        (for-each
+         (lambda (axis)
+           (for-each
+            (lambda (flags)
+              (let* ((excl (car flags)) (rev (cadr flags)) (init? (caddr flags))
+                     (shape '(3 4 5))
+                     (make (lambda ()
+                             (let* ((x (s2-src dt shape s2-val))
+                                    (ishape (append (take shape axis) (drop shape (+ axis 1))))
+                                    (init (and init? (s2-src dt ishape (lambda (i) (- (* 0.5 i) 1.0))))))
+                               (morph-scan op x axis exclusive?: excl reverse?: rev init: init))))
+                     (r (s2-run make))
+                     (name (sprintf "~A ~A axis ~A~A~A~A" dt op axis (if excl " exclusive" "")
+                                    (if rev " reverse" "") (if init? " init" ""))))
+                (test-assert (string-append name ": segop/scan") (memq 'segop/scan (s2-tags (car r))))
+                (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+                (test-assert (string-append name ": replay reproduces the trace")
+                  (s2-same-lists? (cadr r) (caddr r)))
+                (test-assert (string-append name ": values equal realize")
+                  (s2-same-lists? (cadr r) (s2-values (realize (make)))))))
+            '((#f #f #f) (#t #f #f) (#f #t #t) (#t #t #t))))
+         '(0 2)))
+      '(sum prod max min)))
+   '(f32 f64))
+
+  ;; A transposed (strided, zero-copy) source, and integer data on the
+  ;; strided executor.
+  (for-each
+   (lambda (case-spec)
+     (let* ((name (car case-spec)) (tag (cadr case-spec)) (make (caddr case-spec))
+            (r (s2-run make)))
+       (test-assert (string-append name ": " (symbol->string tag)) (memq tag (s2-tags (car r))))
+       (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+       (test-assert (string-append name ": replay reproduces the trace") (s2-same-lists? (cadr r) (caddr r)))
+       (test-assert (string-append name ": values equal realize")
+         (s2-same-lists? (cadr r) (s2-values (realize (make)))))))
+   (list
+    (list "f32 cumsum of a transposed source" 'segop/scan
+          (lambda () (morph-cumsum (morph-transpose (s2-src 'f32 '(4 6) s2-val) '(1 0)) 1 reverse?: #t)))
+    (list "s32 cumsum" 'segop/strided-scan
+          (lambda () (morph-cumsum (morph* (morph-from-list (map (lambda (i) (- (modulo (* 7 i) 11) 5)) (iota 12)) #(3 4) 's32)
+                                           (morph-from-list '(1) #(1) 's32))
+                                   1 exclusive?: #t)))
+    (list "s32 running max with init" 'segop/strided-scan
+          (lambda () (morph-scan 'max (morph* (morph-from-list (map (lambda (i) (- (modulo (* 7 i) 11) 5)) (iota 12)) #(3 4) 's32)
+                                              (morph-from-list '(1) #(1) 's32))
+                                 0 init: (morph-from-list '(0 -9 2 3) #(4) 's32))))))
+
+  ;; A scan between element-wise ops is not fused, and every fusion policy
+  ;; gives the same values.
+  (for-each
+   (lambda (dt)
+     (let* ((make (lambda ()
+                    (let* ((x (s2-src dt '(5 7) (lambda (i) (* 0.7 (sin (* 1.37 i))))))
+                           (c (morph-cumsum (morph-exp x) 1)))
+                      (morph* (morph-log c) (morph-from-list '(2.0) #(1) dt)))))
+            (run (lambda (policy) (parameterize ((segop-fusion policy)) (s2-run make))))
+            (off (run #f)))
+       (test-assert (sprintf "~A exp-cumsum-log: fusion off equals realize" dt)
+         (s2-same-lists? (cadr off) (s2-values (realize (make)))))
+       (for-each
+        (lambda (policy)
+          (let ((r (run policy)))
+            (test-assert (sprintf "~A exp-cumsum-log: fusion ~A equals fusion off" dt policy)
+              (and (s2-same-lists? (cadr off) (cadr r)) (= 0 (list-ref r 4))))
+            (test-assert (sprintf "~A exp-cumsum-log: fusion ~A keeps the scan" dt policy)
+              (memq 'segop/scan (s2-tags (car r))))))
+        '(#t all))))
+   '(f32 f64)))
+
 ;;;; Lifted programs
 ;;;; ============================================================
 

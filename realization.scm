@@ -25,6 +25,8 @@
    reduction-path
    reduction-neutral
    execute-routing-morphism
+   execute-scan-morphism
+   scan-step-procedure
    
    ;; Value retrieval
    retrieve-value
@@ -933,6 +935,10 @@
      ((col2im-index-fn? index-fn)
       (execute-col2im-morphism index-fn output-buffer shape operands dtype))
     
+     ;; Scan along one axis
+     ((scan-index-fn? index-fn)
+      (execute-scan-morphism index-fn output-buffer shape operands dtype))
+
      ;; Composed - inline execution
      ((composed-index-fn? index-fn)
       (execute-composed-morphism index-fn output-buffer shape operands dtype))
@@ -1830,6 +1836,85 @@
             (typed-vector-set! output-buffer dtype i value))))))
 
   
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Scans
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (scan-step-procedure op swapped?)
+    "The step (lambda (acc x) ...) of a scan with op sum, prod, max or min:
+    the value so far combined with one more element, before rounding.  With
+    swapped? the two arguments of the combining operation trade places."
+    (let ((f (case op
+               ((sum)  scalar-add)
+               ((prod) *)
+               ((max)  (lambda (acc x) (if (> x acc) x acc)))
+               ((min)  (lambda (acc x) (if (< x acc) x acc)))
+               (else (error "scan: unknown op" op)))))
+      (if swapped? (lambda (acc x) (f x acc)) f)))
+
+  (define (execute-scan-morphism fn output-buffer shape operands dtype)
+    "Fill the row-major output-buffer of the given shape with the scan
+    described by the scan-index-fn fn.  operands is (src) or (src init),
+    realized concrete arrays of any layout; init has the shape of src
+    without the scanned axis.  Each line along the axis is scanned in order
+    (in reverse order when the scan is reversed); every output is the
+    previous one combined with one more element and rounded to dtype by
+    storing it.  An exclusive scan stores init, or the neutral element,
+    first, and keeps its running value in a one-element vector of dtype so
+    that it is rounded the same way."
+    (define (layout m)
+      (cases array-morphism m
+        (concrete-array (data shp strides offset dt _ _) (list data strides offset dt))
+        (else (error "execute-scan-morphism: operand must be concrete" m))))
+    (let* ((op (scan-index-fn-op fn))
+           (ax (scan-index-fn-axis fn))
+           (excl? (scan-index-fn-exclusive? fn))
+           (rev? (scan-index-fn-reverse? fn))
+           (step (scan-step-procedure op (scan-index-fn-swapped? fn)))
+           (rank (vector-length shape))
+           (n (vector-ref shape ax))
+           (src (layout (car operands)))
+           (sdata (car src)) (sstr (cadr src)) (soff (caddr src)) (sdt (cadddr src))
+           (init (and (pair? (cdr operands)) (layout (cadr operands))))
+           (ostr (compute-strides shape))
+           (par-dims (filter (lambda (d) (not (= d ax))) (iota rank)))
+           (par-shape (map (lambda (d) (vector-ref shape d)) par-dims))
+           (s-par (map (lambda (d) (vector-ref sstr d)) par-dims))
+           (o-par (map (lambda (d) (vector-ref ostr d)) par-dims))
+           (i-par (if init (vector->list (cadr init)) (map (lambda (d) 0) par-dims)))
+           (s-step (vector-ref sstr ax))
+           (o-step (vector-ref ostr ax))
+           (cell (allocate-typed-vector dtype 1))
+           (neutral (reduction-neutral op dtype)))
+      (define (rounded x)
+        (typed-vector-set! cell dtype 0 x)
+        (typed-vector-ref cell dtype 0))
+      (define (scan-line! sbase obase seed)
+        (let loop ((r 0) (acc seed))
+          (when (< r n)
+            (let* ((pos (if rev? (- n 1 r) r))
+                   (x (typed-vector-ref sdata sdt (+ sbase (* pos s-step))))
+                   (o (+ obase (* pos o-step))))
+              (if excl?
+                  (begin
+                    (typed-vector-set! output-buffer dtype o (or acc neutral))
+                    (loop (+ r 1) (rounded (if acc (step acc x) x))))
+                  (begin
+                    (typed-vector-set! output-buffer dtype o (if acc (step acc x) x))
+                    (loop (+ r 1) (typed-vector-ref output-buffer dtype o))))))))
+      (unless (= n 0)
+        ;; Visit every line: an odometer over the other axes, carrying the
+        ;; source, output and init positions of the line's first element.
+        (let walk ((dims par-shape) (ss s-par) (os o-par) (is i-par)
+                   (sbase soff) (obase 0) (ibase (if init (caddr init) 0)))
+          (if (null? dims)
+              (scan-line! sbase obase
+                          (and init (rounded (typed-vector-ref (car init) (cadddr init) ibase))))
+              (do ((k 0 (+ k 1))) ((= k (car dims)))
+                (walk (cdr dims) (cdr ss) (cdr os) (cdr is)
+                      (+ sbase (* k (car ss))) (+ obase (* k (car os)))
+                      (+ ibase (* k (car is))))))))))
+
   (define (execute-col2im-morphism fn output-buffer shape operands dtype)
     "Execute col2im with accumulation for overlapping windows
   

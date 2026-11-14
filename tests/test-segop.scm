@@ -10,12 +10,13 @@
 ;;;   Group 3 - Scalar expressions
 ;;;   Group 4 - seg-map interpretation
 ;;;   Group 5 - seg-reduce interpretation
+;;;   Group 5b - seg-scan interpretation and construction
 ;;;   Group 6 - Construction checks
 ;;;   Group 7 - Backend registry
 ;;;   Plan contexts and executor cells
 
 (import scheme (chicken base) (chicken format) test
-        (only srfi-1 every iota fold make-list filter)
+        (only srfi-1 every iota fold make-list filter take)
         srfi-4
         datatype
         array-morphisms-core
@@ -485,6 +486,157 @@
                                                      #f)))))
     (segop-interpret sr (list data) (list out))
     (test "an opaque combine op, full reduction to rank 0" 234.0 (f64vector-ref out 0))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 5b - seg-scan interpretation and construction
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A scan along the rows of a row-major [rows cols] array: space (rows cols),
+;; identity maps, body (in 0).  seed-op, when given, is a [rows] operand read
+;; at the parallel point and becomes input 1.
+(define (sg-row-scan dtype rows cols spec #!key (exclusive #f) (seed-op #f) (swapped #f) (rev #f))
+  (let* ((m (if rev
+                (make-index-map (vector '(dim 0) `(+ ,(- cols 1) (* -1 (dim 1)))) #f 0.0 #f)
+                (identity-index-map 2)))
+         (x (sg-op dtype (vector rows cols) m))
+         (o (sg-op dtype (vector rows cols) m)))
+    (make-seg-scan (vector rows cols)
+                   (if seed-op (list x seed-op) (list x))
+                   (list (make-scan-result o '(in 0) spec (and seed-op '(in 1)) exclusive swapped)))))
+
+;; The inclusive scan of lst by step, starting from the first element
+;; (or from seed), as a plain loop computes it.
+(define (sg-plain-scan step lst #!optional (seed #f))
+  (let loop ((l lst) (acc seed) (out '()))
+    (if (null? l)
+        (reverse out)
+        (let ((a (if acc (step acc (car l)) (car l))))
+          (loop (cdr l) a (cons a out))))))
+
+(define (sg-list-same? a b) (and (= (length a) (length b)) (every sg-same? a b)))
+
+(test-group "seg-scan interpretation"
+  (let* ((xs '(1.5 -2.25 3.0 0.1 7.0 -0.5 2.0 1e10))
+         (out (make-f64vector 8)))
+    (segop-interpret (sg-row-scan 'f64 2 4 (make-combine-spec 'add 0.0 'f64)) (list (sg-f64 xs)) (list out))
+    (test-assert "inclusive sum of each row equals a plain loop"
+      (sg-list-same? (f64vector->list out)
+                     (append (sg-plain-scan + (take xs 4)) (sg-plain-scan + (list-tail xs 4))))))
+
+  (let ((out (make-f64vector 3)))
+    (segop-interpret (sg-row-scan 'f64 1 3 (make-combine-spec 'add 0.0 'f64))
+                     (list (f64vector -0.0 -0.0 2.0)) (list out))
+    (test-assert "a first element -0.0 stays -0.0" (eqv? -0.0 (f64vector-ref out 0)))
+    (test-assert "-0.0 + -0.0 is -0.0" (eqv? -0.0 (f64vector-ref out 1)))
+    (test "then 2.0" 2.0 (f64vector-ref out 2)))
+
+  (let ((out (make-f64vector 4)) (outs (make-f64vector 4)))
+    (segop-interpret (sg-row-scan 'f64 1 4 (make-combine-spec 'max -inf.0 'f64))
+                     (list (f64vector +nan.0 3.0 -1.0 5.0)) (list out))
+    (test-assert "max: a NaN first element is kept, not replaced by the neutral"
+      (every nan? (f64vector->list out)))
+    (segop-interpret (sg-row-scan 'f64 1 4 (make-combine-spec 'max -inf.0 'f64))
+                     (list (f64vector 1.0 +nan.0 0.5 2.0)) (list out))
+    (test-assert "max: a later NaN is skipped by (if (> v acc) v acc)"
+      (sg-list-same? '(1.0 1.0 1.0 2.0) (f64vector->list out)))
+    (segop-interpret (sg-row-scan 'f64 1 4 (make-combine-spec 'max -inf.0 'f64) swapped: #t)
+                     (list (f64vector 1.0 +nan.0 0.5 2.0)) (list outs))
+    ;; Swapped, each step is (if (> acc v) acc v): a NaN on either side
+    ;; makes the step return the new value.
+    (test-assert "max with swapped operands takes the new value when a NaN is compared"
+      (sg-list-same? (list 1.0 +nan.0 0.5 2.0) (f64vector->list outs))))
+
+  (let ((out (make-f64vector 4)))
+    (segop-interpret (sg-row-scan 'f64 1 4 (make-combine-spec 'min +inf.0 'f64))
+                     (list (f64vector 3.0 -inf.0 1.0 +inf.0)) (list out))
+    (test "min" '(3.0 -inf.0 -inf.0 -inf.0) (f64vector->list out)))
+
+  (let* ((xs (cons 1e8 (make-list 5 1.0)))
+         (out (make-f32vector 6)))
+    (segop-interpret (sg-row-scan 'f32 1 6 (make-combine-spec 'add 0.0 'f32)) (list (sg-f32 xs)) (list out))
+    (test "f32 accumulation rounds at every step" (make-list 6 1e8) (f32vector->list out)))
+
+  (let ((out (make-f64vector 4)))
+    (segop-interpret (sg-row-scan 'f64 1 4 (make-combine-spec 'mul 1.0 'f64) exclusive: #t)
+                     (list (sg-f64 '(2 3 4 5))) (list out))
+    (test "exclusive product without a seed starts from the neutral" '(1.0 2.0 6.0 24.0)
+          (f64vector->list out)))
+
+  (let ((out (make-f64vector 6)) (outx (make-f64vector 6))
+        (seed (sg-op 'f64 (vector 2) (make-index-map (vector '(dim 0)) #f 0.0 #f))))
+    (segop-interpret (sg-row-scan 'f64 2 3 (make-combine-spec 'add 0.0 'f64) seed-op: seed)
+                     (list (sg-f64 '(1 2 3 4 5 6)) (sg-f64 '(10 -0.5))) (list out))
+    (test "seeded inclusive sum" '(11.0 13.0 16.0 3.5 8.5 14.5) (f64vector->list out))
+    (segop-interpret (sg-row-scan 'f64 2 3 (make-combine-spec 'add 0.0 'f64) seed-op: seed exclusive: #t)
+                     (list (sg-f64 '(1 2 3 4 5 6)) (sg-f64 '(10 -0.5))) (list outx))
+    (test "seeded exclusive sum" '(10.0 11.0 13.0 -0.5 3.5 8.5) (f64vector->list outx)))
+
+  (let ((out (make-f64vector 4)))
+    (segop-interpret (sg-row-scan 'f64 1 4 (make-combine-spec 'add 0.0 'f64) rev: #t)
+                     (list (sg-f64 '(1 2 3 4))) (list out))
+    (test "reverse sum through reversed maps" '(10.0 9.0 7.0 4.0) (f64vector->list out)))
+
+  (let* ((m (make-index-map (vector '(dim 0) '(+ 3 (* -1 (dim 1)))) #f 0.0 #f))
+         (lin (index-map->linear m '#(4 1) 0 2)))
+    (test-assert "a reversed map has a negative coefficient" (equal? lin (cons 3 (vector 4 -1))))
+    (test-assert "and is one-to-one" (linear-injective? (cdr lin) '#(2 4))))
+
+  ;; Along axis 0 of a [3 2] array: space (2 3), input read transposed.
+  (let ((out (make-f64vector 6)))
+    (segop-interpret
+     (make-seg-scan (vector 2 3)
+                    (list (sg-op 'f64 (vector 3 2) (permutation-index-map '(1 0))))
+                    (list (make-scan-result (sg-op 'f64 (vector 3 2) (permutation-index-map '(1 0)))
+                                            '(in 0) (make-combine-spec 'add 0.0 'f64) #f #f #f)))
+     (list (sg-f64 '(1 2 3 4 5 6))) (list out))
+    (test "sum along axis 0 of a [3 2] array" '(1.0 2.0 4.0 6.0 9.0 12.0) (f64vector->list out)))
+
+  (let ((out (make-s32vector 4)))
+    (segop-interpret (sg-row-scan 's32 1 4 (make-combine-spec 'add 0 's32))
+                     (list (s32vector 1 -2 3 40)) (list out))
+    (test "s32 sum" '(1 -1 2 42) (s32vector->list out)))
+
+  (let* ((xs '(0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 1.1))
+         (blk (make-f64vector 11)) (seq (make-f64vector 11)) (blkx (make-f64vector 11)))
+    (segop-interpret (sg-row-scan 'f64 1 11 (make-combine-spec 'add 0.0 'f64 'blocked 4))
+                     (list (sg-f64 xs)) (list blk))
+    (segop-interpret (sg-row-scan 'f64 1 11 (make-combine-spec 'add 0.0 'f64 'blocked 4) exclusive: #t)
+                     (list (sg-f64 xs)) (list blkx))
+    (segop-interpret (sg-row-scan 'f64 1 11 (make-combine-spec 'add 0.0 'f64))
+                     (list (sg-f64 xs)) (list seq))
+    (let* ((c0 (sg-plain-scan + (take xs 4)))
+           (c1 (map (lambda (l) (+ (list-ref c0 3) l)) (sg-plain-scan + (take (list-tail xs 4) 4))))
+           (c2 (map (lambda (l) (+ (list-ref c1 3) l)) (sg-plain-scan + (list-tail xs 8))))
+           (expect (append c0 c1 c2)))
+      (test-assert "blocked order: carry + local scan of each chunk"
+        (sg-list-same? expect (f64vector->list blk)))
+      (test-assert "blocked exclusive: the inclusive value shifted by one"
+        (sg-list-same? (cons 0.0 (take expect 10)) (f64vector->list blkx)))
+      (test-assert "the blocked order differs from the sequential one here"
+        (not (sg-list-same? (f64vector->list seq) (f64vector->list blk))))
+      (test-assert "the sequential order equals a plain loop"
+        (sg-list-same? (sg-plain-scan + xs) (f64vector->list seq))))))
+
+(test-group "seg-scan construction"
+  (let ((sg (sg-row-scan 'f64 2 3 (make-combine-spec 'add 0.0 'f64))))
+    (test "kind" 'seg-scan (segop-kind sg))
+    (test "space" '#(2 3) (segop-space sg))
+    (test "inputs" 1 (length (segop-inputs sg)))
+    (test "outputs" 1 (length (segop-outputs sg)))
+    (test "no fallback" #f (segop-fallback sg)))
+  (test-error "a seed may not read the scanned dimension"
+    (sg-row-scan 'f64 2 3 (make-combine-spec 'add 0.0 'f64)
+                 seed-op: (sg-op 'f64 (vector 2 3) (identity-index-map 2))))
+  (test-error "an output map must be one-to-one"
+    (make-seg-scan (vector 2 3) (list (sg-op 'f64 (vector 2 3) (identity-index-map 2)))
+                   (list (make-scan-result (sg-op 'f64 (vector 3) (make-index-map (vector '(dim 1)) #f 0.0 #f))
+                                           '(in 0) (make-combine-spec 'add 0.0 'f64) #f #f #f))))
+  (test-error "a scan needs a dimension"
+    (make-seg-scan (vector) '() (list (make-scan-result (sg-op 'f64 (vector) (identity-index-map 0))
+                                                        0.0 (make-combine-spec 'add 0.0 'f64) #f #f #f))))
+  (test-error "at least one result" (make-seg-scan (vector 2) '() '()))
+  (test-error "results are scan-results"
+    (make-seg-scan (vector 2) '() (list 'x))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 6 - Construction checks

@@ -20,6 +20,8 @@
                 morph> morph< morph= morph>= morph<=
                 ;; Higher-order
                 morph-map morph-reduce
+                ;; Scans
+                morph-scan morph-cumsum morph-cumprod
                 ;; Helpers
                 create-binary-morphism
                 create-unary-morphism
@@ -629,5 +631,83 @@
                         result-shape
                         result-dtype
                         result-batch-axis)))
+
+;;; ============================================================================
+;;; Scans
+;;; ============================================================================
+
+(define (morph-scan op m axis #!key (exclusive? #f) (reverse? #f) (init #f) (swapped? #f))
+  "Scan m along axis: the cumulative sum, product, maximum or minimum.
+
+   Args:
+     op: sum, prod, max or min
+     m: input morphism, of rank 1 or more
+     axis: the scanned axis; negative values count from the end
+     exclusive?: #f (inclusive) to give, at position r, the combination of
+           the elements at positions 0 to r; #t (exclusive) to give that of
+           the elements at 0 to r - 1, and at position 0 init, or the
+           neutral element of op (0, 1, the lowest or the highest value of
+           the dtype) when there is no init
+     reverse?: #t to scan from the last position down to the first
+     init: #f, or a morphism with the shape of m without axis and the dtype
+           of the result: the value the scan starts from in each line
+     swapped?: #t to combine each element with the value so far as
+           (op element acc) rather than (op acc element).  The two give the
+           same number, but not always the same NaN payload when both are
+           NaN; for max and min they treat NaN differently (see below).
+
+   Each output is the previous output combined with one more element and
+   rounded to the result dtype, as a loop over the elements in order
+   computes it.  The first output of an inclusive scan is the first
+   element itself (or init combined with it), so a first element -0.0 or
+   NaN is kept.  max combines as (if (> x acc) x acc), so a NaN after the
+   first element is passed over; min likewise with <.
+
+   Returns:
+     A morphism of m's shape and dtype (op scan)
+
+   Examples:
+     (morph-scan 'sum m 0)                    ; cumulative sum down axis 0
+     (morph-scan 'max m -1 reverse?: #t)      ; running maximum from the right
+     (morph-scan 'sum m 0 exclusive?: #t)     ; sums of the elements before"
+  (unless (memq op '(sum prod max min))
+    (error "morph-scan: op must be sum, prod, max or min" op))
+  (unless (array-morphism? m)
+    (error "morph-scan: operand must be an array morphism" m))
+  (let* ((shape (get-morphism-shape m))
+         (rank (vector-length shape))
+         (_ (when (= rank 0) (error "morph-scan: operand must have rank 1 or more" shape)))
+         (ax (if (and (integer? axis) (exact? axis) (< axis rank) (>= axis (- rank)))
+                 (normalize-axis axis rank)
+                 (error "morph-scan: axis out of range" axis rank)))
+         (dtype (infer-reduction-dtype op (get-morphism-dtype m)))
+         (line-shape (list->vector (append (take (vector->list shape) ax)
+                                           (drop (vector->list shape) (+ ax 1))))))
+    (when init
+      (unless (array-morphism? init)
+        (error "morph-scan: init must be an array morphism" init))
+      (unless (equal? (get-morphism-shape init) line-shape)
+        (error "morph-scan: init must have the shape of the operand without the scanned axis"
+               (get-morphism-shape init) line-shape))
+      (unless (eq? (get-morphism-dtype init) dtype)
+        (error "morph-scan: init must have the dtype of the result"
+               (get-morphism-dtype init) dtype)))
+    (morphism-expr (gensym 'morph-)
+                   'scan
+                   (if init (list m init) (list m))
+                   (make-scan-index-fn op ax (and exclusive? #t) (and reverse? #t) (and swapped? #t))
+                   shape
+                   dtype
+                   `((scan-op . ,op) (axis . ,ax) (exclusive? . ,(and exclusive? #t))
+                     (reverse? . ,(and reverse? #t)) (swapped? . ,(and swapped? #t)))
+                   (get-morphism-batch-axis m))))
+
+(define (morph-cumsum m axis #!key (exclusive? #f) (reverse? #f) (init #f))
+  "The cumulative sum of m along axis; (morph-scan 'sum m axis ...)."
+  (morph-scan 'sum m axis exclusive?: exclusive? reverse?: reverse? init: init))
+
+(define (morph-cumprod m axis #!key (exclusive? #f) (reverse? #f) (init #f))
+  "The cumulative product of m along axis; (morph-scan 'prod m axis ...)."
+  (morph-scan 'prod m axis exclusive?: exclusive? reverse?: reverse? init: init))
 
 )

@@ -9,13 +9,15 @@
 ;;;     iteration coordinates to the array's multi-index;
 ;;;   * a scalar body, a symbolic expression computing one output element
 ;;;     from the input elements at the same iteration point;
-;;;   * for reductions, a combine spec giving the combining operator, its
-;;;     neutral element, the accumulator precision and the summation order.
+;;;   * for reductions and scans, a combine spec giving the combining
+;;;     operator, its neutral element, the accumulator precision and the
+;;;     summation order.
 ;;;
 ;;; The design follows the segmented operations of the Futhark compiler's
 ;;; internal representation, which expresses parallel code as operations
-;;; (SegMap, SegRed and others) over an iteration space [1, 2].  seg-map
-;;; and seg-reduce take their structure from SegMap and SegRed.  The fusion
+;;; (SegMap, SegRed, SegScan and others) over an iteration space [1, 2].
+;;; seg-map, seg-reduce and seg-scan take their structure from SegMap,
+;;; SegRed and SegScan.  The fusion
 ;;; of a map into the reduction that reads it, with the map's value kept as
 ;;; an extra output when other code needs it, follows Futhark's redomap
 ;;; construct [3].
@@ -115,10 +117,16 @@
    red-result-out red-result-body red-result-combine red-result-finalize
    combine-step round-to-dtype
 
+   ;; Scans
+   make-scan-result
+   scan-result?
+   scan-result-out scan-result-body scan-result-combine scan-result-seed
+   scan-result-exclusive? scan-result-swapped?
+
    ;; Segops
    segop segop?
-   seg-map seg-reduce seg-lib
-   make-seg-map make-seg-reduce make-seg-lib
+   seg-map seg-reduce seg-scan seg-lib
+   make-seg-map make-seg-reduce make-seg-scan make-seg-lib
    segop-kind
    segop-space
    segop-inputs
@@ -1033,6 +1041,23 @@
 ;;             or #f for (reduced) itself.
 (define-record red-result out body combine finalize)
 
+;; One scanned value of a seg-scan.
+;;   out:        the output operand; its map uses every dimension of the
+;;               space.
+;;   body:       value at each point before combining.
+;;   combine:    a combine-spec.
+;;   seed:       #f, or an expression over inputs read at the parallel
+;;               point: the value the scan starts from.
+;;   exclusive?: #f for an inclusive scan, whose output at position r
+;;               combines the values at positions 0 to r; #t for an
+;;               exclusive scan, whose output at r combines those at 0 to
+;;               r - 1, and is the seed (or the neutral element) at 0.
+;;   swapped?:   #t when each step combines the new value with the
+;;               accumulator as (op value acc) rather than (op acc value).
+;;               The two orders give the same number, but when both are
+;;               NaN they may give different NaN payloads.
+(define-record scan-result out body combine seed exclusive? swapped?)
+
 
 ;;;; ============================================================
 ;;;; Segops
@@ -1062,6 +1087,20 @@
     (ins      list?)
     (results  list?)
     (map-outs list?)
+    (fallback procedure-or-false?))
+
+  ;; For each result j and every point (p, r) of space, r being the last
+  ;; dimension (the scanned one) and p the others (the parallel ones):
+  ;;   out_j[omap_j(p, r)] = s_j(p) + v_j(p, 0) + ... + v_j(p, r)
+  ;; for an inclusive scan, where v_j is body_j, s_j the seed and + the
+  ;; combine op, applied from left to right.  Without a seed the first
+  ;; term is v_j(p, 0) itself, so the first output equals the first value
+  ;; as stored, whatever the neutral element.  An exclusive scan stops at
+  ;; v_j(p, r - 1) and gives s_j(p), or the neutral element, at r = 0.
+  (seg-scan
+    (space    space-vector?)
+    (ins      list?)
+    (results  list?)
     (fallback procedure-or-false?))
 
   ;; A named operation with a fixed backend contract, such as an index
@@ -1158,6 +1197,38 @@
                 map-outs))
     (seg-reduce space nred ins results map-outs fallback)))
 
+(define (make-seg-scan space ins results #!optional (fallback #f))
+  "A seg-scan over space, whose last dimension is scanned.  results is a
+   non-empty list of scan-result records.  Output maps must be affine and
+   one-to-one over the whole space; a seed may read only inputs whose maps
+   use the parallel dimensions alone."
+  (let* ((rank (and (space-vector? space) (vector-length space)))
+         (npar (and rank (- rank 1))))
+    (unless rank (error 'make-seg-scan "space must be a vector of extents" space))
+    (when (< rank 1) (error 'make-seg-scan "a seg-scan needs at least one dimension" space))
+    (when (null? results) (error 'make-seg-scan "a seg-scan needs at least one result"))
+    (check-operands 'make-seg-scan ins rank)
+    (for-each
+     (lambda (r)
+       (unless (scan-result? r) (error 'make-seg-scan "not a scan-result" r))
+       (unless (combine-spec? (scan-result-combine r))
+         (error 'make-seg-scan "not a combine spec" (scan-result-combine r)))
+       (let ((o (scan-result-out r)))
+         (check-operands 'make-seg-scan (list o) rank)
+         (check-output 'make-seg-scan o space))
+       (check-body 'make-seg-scan (scan-result-body r) (length ins) rank #f)
+       (let ((seed (scan-result-seed r)))
+         (when seed
+           (check-body 'make-seg-scan seed (length ins) npar #f)
+           (for-each (lambda (k)
+                       (let ((dims (index-map-dims (segop-operand-map (list-ref ins k)))))
+                         (unless (and dims (every (lambda (d) (< d npar)) dims))
+                           (error 'make-seg-scan
+                                  "a seed input may use only the parallel dimensions" k))))
+                     (scalar-expr-inputs seed)))))
+     results)
+    (seg-scan space ins results fallback)))
+
 (define (make-seg-lib name ins outs attrs)
   "A named library operation (seg-lib) with operands ins and outs and the
    parameter alist attrs."
@@ -1165,10 +1236,11 @@
   (seg-lib name ins outs attrs))
 
 (define (segop-kind s)
-  "seg-map, seg-reduce or seg-lib."
+  "seg-map, seg-reduce, seg-scan or seg-lib."
   (cases segop s
     (seg-map (space ins outs bodies fallback) 'seg-map)
     (seg-reduce (space nred ins results map-outs fallback) 'seg-reduce)
+    (seg-scan (space ins results fallback) 'seg-scan)
     (seg-lib (name ins outs attrs) 'seg-lib)))
 
 (define (segop-space s)
@@ -1176,6 +1248,7 @@
   (cases segop s
     (seg-map (space ins outs bodies fallback) space)
     (seg-reduce (space nred ins results map-outs fallback) space)
+    (seg-scan (space ins results fallback) space)
     (seg-lib (name ins outs attrs) #f)))
 
 (define (segop-inputs s)
@@ -1183,6 +1256,7 @@
   (cases segop s
     (seg-map (space ins outs bodies fallback) ins)
     (seg-reduce (space nred ins results map-outs fallback) ins)
+    (seg-scan (space ins results fallback) ins)
     (seg-lib (name ins outs attrs) ins)))
 
 (define (segop-outputs s)
@@ -1192,6 +1266,7 @@
     (seg-map (space ins outs bodies fallback) outs)
     (seg-reduce (space nred ins results map-outs fallback)
       (append (map red-result-out results) (map car map-outs)))
+    (seg-scan (space ins results fallback) (map scan-result-out results))
     (seg-lib (name ins outs attrs) outs)))
 
 (define (segop-fallback s)
@@ -1199,6 +1274,7 @@
   (cases segop s
     (seg-map (space ins outs bodies fallback) fallback)
     (seg-reduce (space nred ins results map-outs fallback) fallback)
+    (seg-scan (space ins results fallback) fallback)
     (seg-lib (name ins outs attrs) #f)))
 
 
@@ -1264,8 +1340,13 @@
    result outputs then the map outputs), laid out as the operands describe.
    params is the vector of runtime parameters.  A seg-map with a fallback
    uses it instead of its body when use-fallback is true or when an
-   operand has an integer dtype.  Reductions follow their combine spec,
-   with the unspecified order taken as sequential."
+   operand has an integer dtype.  Reductions and scans follow their
+   combine spec, with the unspecified order taken as sequential.  A scan in
+   the blocked order scans each chunk of block-size positions on its own
+   and combines the result so far (the carry) with each chunk value, so
+   that position r holds carry + (v_c + ... + v_r) for the chunk starting
+   at c; an exclusive scan in that order gives at r the inclusive value
+   at r - 1."
   (cases segop s
     (seg-map (space ins outs bodies fallback)
       (let* ((in-v (list->vector in-bufs))
@@ -1335,6 +1416,63 @@
                                acc)))
                    (write-operand! (red-result-out res) buf coords v)))
                results res-bufs))))))
+
+    (seg-scan (space ins results fallback)
+      (let* ((rank (vector-length space))
+             (npar (- rank 1))
+             (n    (vector-ref space npar))
+             (in-v (list->vector in-bufs))
+             (ins-v (list->vector ins)))
+        (for-each-point (subvector space 0 npar)
+          (lambda (p)
+            (let* ((coords-at (lambda (r) (vector-append p (vector r))))
+                   (reader (lambda (coords)
+                             (lambda (k) (read-operand (vector-ref ins-v k) (vector-ref in-v k) coords)))))
+              (for-each
+               (lambda (res buf)
+                 (let* ((spec (scan-result-combine res))
+                        (dt   (combine-spec-acc-dtype spec))
+                        (step (if (scan-result-swapped? res)
+                                  (lambda (acc v) (combine-step spec v acc))
+                                  (lambda (acc v) (combine-step spec acc v))))
+                        (seed (and (scan-result-seed res)
+                                   (round-to-dtype
+                                    (eval-scalar-expr (scan-result-seed res) (reader (coords-at 0))
+                                                      params: params coords: p)
+                                    dt)))
+                        (value (lambda (r)
+                                 (let ((c (coords-at r)))
+                                   (eval-scalar-expr (scan-result-body res) (reader c)
+                                                     params: params coords: c))))
+                        ;; push: the accumulator after one more value; #f
+                        ;; stands for an empty accumulator.
+                        (push (lambda (acc v) (if acc (step acc v) (round-to-dtype v dt))))
+                        (incl (make-vector n #f)))
+                   ;; incl[r] is the inclusive scan at r, seed included.
+                   (if (eq? (combine-spec-order spec) 'blocked)
+                       (let ((b (combine-spec-block-size spec)))
+                         (let chunk ((start 0) (carry seed))
+                           (when (< start n)
+                             (let ((end (min n (+ start b))))
+                               (let loop ((r start) (local #f))
+                                 (when (< r end)
+                                   (let ((l (push local (value r))))
+                                     (vector-set! incl r (if carry (step carry l) l))
+                                     (loop (+ r 1) l))))
+                               (chunk end (vector-ref incl (- end 1)))))))
+                       (let loop ((r 0) (acc seed))
+                         (when (< r n)
+                           (let ((a (push acc (value r))))
+                             (vector-set! incl r a)
+                             (loop (+ r 1) a)))))
+                   (do ((r 0 (+ r 1))) ((= r n))
+                     (write-operand! (scan-result-out res) buf (coords-at r)
+                                     (if (scan-result-exclusive? res)
+                                         (if (= r 0)
+                                             (or seed (round-to-dtype (combine-spec-neutral spec) dt))
+                                             (vector-ref incl (- r 1)))
+                                         (vector-ref incl r))))))
+               results out-bufs))))))
 
     (seg-lib (name ins outs attrs)
       (error 'segop-interpret "a seg-lib has no reference semantics" name))))

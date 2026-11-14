@@ -100,7 +100,7 @@
           (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
                 f32vector f32vector? f32vector-ref f32vector-set! f32vector-length
-                s32vector-set! s64vector-set!)
+                make-f32vector s32vector-set! s64vector-set!)
           (only srfi-69
                 make-hash-table
                 hash-table-ref
@@ -424,10 +424,11 @@
          (hash-table->alist table))))
 
 ;; Ops that never take part in a fusion: contractions, views and the
-;; convolution family read their operands in their own patterns.
+;; convolution family read their operands in their own patterns, and a
+;; scan carries a value from one position to the next.
 (define fusion-barrier-ops
   '(matmul batch-matmul reshape transpose broadcast-expand slice
-    im2col col2im conv2d-fwd conv2d-bwd-data conv2d-bwd-weights attention))
+    im2col col2im conv2d-fwd conv2d-bwd-data conv2d-bwd-weights attention scan))
 
 ;; The largest number of nodes in a fused body, and of its inputs.
 (define fusion-max-body-size 64)
@@ -1642,7 +1643,7 @@
           (fold promote-types (car in-dtypes) (cdr in-dtypes)))
          ((and (pair? op) (eq? (car op) 'reduce))
           (infer-reduction-dtype (cadr op) (car in-dtypes)))
-         ((memq op '(reshape transpose col2im map relu-deriv sigmoid-deriv tanh-deriv))
+         ((memq op '(reshape transpose col2im map relu-deriv sigmoid-deriv tanh-deriv scan))
           (car in-dtypes))
          ((memq op '(negate abs floor ceiling sqrt exp log sin cos tan relu sigmoid tanh))
           (infer-unary-dtype op (car in-dtypes)))
@@ -2332,6 +2333,12 @@
        (morph-matmul (car inputs) (cadr inputs)))
       ((eq? op 'batch-matmul)
        (morph-batch-matmul (car inputs) (cadr inputs)))
+      ((eq? op 'scan)
+       (let ((get (lambda (k) (cdr (assq k meta)))))
+         (morph-scan (get 'scan-op) (car inputs) (get 'axis)
+                     exclusive?: (get 'exclusive?) reverse?: (get 'reverse?)
+                     swapped?: (get 'swapped?)
+                     init: (and (pair? (cdr inputs)) (cadr inputs)))))
       ((eq? op 'transpose)
        (let ((perm (cdr (assq 'perm meta))))
          (morph-transpose (car inputs) perm)))
@@ -2812,6 +2819,12 @@
                                        (car in-refs) (cadr in-refs) pool-idx shape strides dtype)
            (error "compile-one-instruction: batch-matmul not BLAS-compatible"
                   (ssa-binding-name b))))
+
+      ;; Scans: a seg-scan over the other axes and the scanned one (see
+      ;; lower-scan-binding).
+      ((eq? op 'scan)
+       (compile-scan-segop meta (map trace-arr-of (ssa-binding-inputs b)) in-refs
+                           pool-idx shape strides dtype))
 
       ((eq? op 'matmul)
        (or (compile-matmul-segop (trace-arr-of (car  (ssa-binding-inputs b)))

@@ -87,6 +87,15 @@
    batch-reduce-index-fn-batch-axis
    batch-reduce-index-fn-keepdims?
 
+   ;; Scan index functions (cumulative sums, products, maxima, minima)
+   scan-index-fn?
+   make-scan-index-fn
+   scan-index-fn-op
+   scan-index-fn-axis
+   scan-index-fn-exclusive?
+   scan-index-fn-reverse?
+   scan-index-fn-swapped?
+
    ;; col2im index functions (accumulation)
    col2im-index-fn?
    make-col2im-index-fn-record
@@ -352,6 +361,16 @@
   batch-axis    ; Batch dimension
   keepdims?)    ; Keep batch dimension?
 
+;; Scan along one axis (cumulative sum, product, maximum or minimum).
+;;   op:         sum, prod, max or min.
+;;   axis:       the scanned axis.
+;;   exclusive?: #f when the output at position r combines the elements at
+;;               0 to r; #t when it combines those at 0 to r - 1.
+;;   reverse?:   #t to scan from the last position down to the first.
+;;   swapped?:   #t when each step is (op element acc) rather than
+;;               (op acc element).
+(define-record scan-index-fn op axis exclusive? reverse? swapped?)
+
 (define-record-type col2im-index-fn
   (make-col2im-index-fn-record kernel-h kernel-w stride-h stride-w pad-h pad-w col-layout)
   col2im-index-fn?
@@ -385,6 +404,7 @@
       (batch-map-index-fn? obj)
       (batch-reduce-index-fn? obj)
       (col2im-index-fn? obj)
+      (scan-index-fn? obj)
       (stack-index-fn? obj)    
       (concat-index-fn? obj)   
       (procedure? obj)

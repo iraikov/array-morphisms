@@ -956,11 +956,223 @@
              (cons 'segop/strided-red (strided-red-executor space nred ins results map-outs)))))
     (else #f)))
 
-;; The last resort: evaluate a seg-map or a seg-reduce with the reference
-;; interpreter.  The executor of a segop with several outputs takes the
-;; buffers of the outputs after the first as a list.
+;;; ------------------------------------------------------------
+;;; Scans
+;;; ------------------------------------------------------------
+;;;
+;;; A scan along axis a of a source of rank R becomes a seg-scan whose
+;;; space lists the other axes in increasing order, then axis a.  The
+;;; source is read, and the row-major output written, through the map
+;;; that sends each space dimension back to its axis; a reversed scan
+;;; reads and writes the scanned axis at n - 1 - r, so its maps have a
+;;; negative coefficient there.  The body is (in 0); an init array is input
+;;; 1, read at the parallel point, and is the seed.  The combine spec has
+;;; the result's dtype as accumulator dtype and the sequential order, which
+;;; is the loop of execute-scan-morphism.
+
+(define (scan-combine-op op)
+  (case op ((sum) 'add) ((prod) 'mul) ((max) 'max) ((min) 'min)
+    (else (error "scan: unknown op" op))))
+
+(define (lower-scan-binding meta in-traces in-refs pool-idx shape strides dtype)
+  "The seg-scan of a scan binding with meta meta (scan-op, axis,
+   exclusive?, reverse?, swapped?), whose source (and init, when there is
+   one) had the trace-time arrays in-traces and are found at in-refs,
+   writing pool slot pool-idx of the given shape, strides and dtype."
+  (let* ((get  (lambda (k) (cdr (assq k meta))))
+         (op   (get 'scan-op))
+         (ax   (get 'axis))
+         (rev? (get 'reverse?))
+         (rank (vector-length shape))
+         (n    (vector-ref shape ax))
+         (npar (- rank 1))
+         (par  (filter (lambda (k) (not (= k ax))) (iota rank)))
+         (space (list->vector (append (map (lambda (k) (vector-ref shape k)) par) (list n))))
+         (scan-expr (if rev? `(+ ,(- n 1) (* -1 (dim ,npar))) `(dim ,npar)))
+         (axis-map (make-index-map
+                    (list->vector (map (lambda (k)
+                                         (if (= k ax) scan-expr `(dim ,(list-index (lambda (j) (= j k)) par))))
+                                       (iota rank)))
+                    #f 0.0 #f))
+         (operand (lambda (tr ref m)
+                    (cases array-morphism tr
+                      (concrete-array (_ s st off dt _ _) (make-segop-operand ref dt s st off m))
+                      (else (error "lower-scan-binding: input not concrete" tr)))))
+         (src  (operand (car in-traces) (car in-refs) axis-map))
+         (init (and (pair? (cdr in-traces))
+                    (operand (cadr in-traces) (cadr in-refs) (identity-index-map npar))))
+         (spec (make-combine-spec (scan-combine-op op) (reduction-neutral op dtype) dtype)))
+    (make-seg-scan space
+                   (if init (list src init) (list src))
+                   (list (make-scan-result (make-segop-operand pool-idx dtype shape strides 0 axis-map)
+                                           '(in 0) spec (and init '(in 1))
+                                           (get 'exclusive?) (get 'swapped?))))))
+
+(define (compile-scan-segop meta in-traces in-refs pool-idx shape strides dtype)
+  "The ri-segop instruction of a scan binding (see lower-scan-binding)."
+  (or (segop-instruction (lower-scan-binding meta in-traces in-refs pool-idx shape strides dtype)
+                         pool-idx shape strides dtype)
+      (error "compile-scan-segop: no backend accepts the scan" meta)))
+
+;; The step (acc x) -> value of combine op cop, before rounding, the
+;; arguments trading places when swapped?.  It is the step of combine-step.
+(define (scan-step cop swapped?)
+  (let ((f (case cop
+             ((add) scalar-add)
+             ((mul) *)
+             ((max) (lambda (acc x) (if (> x acc) x acc)))
+             ((min) (lambda (acc x) (if (< x acc) x acc)))
+             (else (lambda (acc x) ((cadr cop) acc x))))))
+    (if swapped? (lambda (acc x) (f x acc)) f)))
+
+;; The parts of a seg-scan the executors below share: the parallel space,
+;; the linear forms of every operand over it (inputs, then the output), the
+;; step along the scanned dimension of each, and the scan length.
+(define (scan-layout space ops)
+  (let* ((rank (vector-length space))
+         (npar (- rank 1))
+         (lins (map (lambda (o) (segop-operand-linear o rank)) ops)))
+    (values (subvector space 0 npar)
+            (map (lambda (l) (cons (car l) (subvector (cdr l) 0 npar))) lins)
+            (list->vector (map (lambda (l) (vector-ref (cdr l) npar)) lins))
+            (vector-ref space npar))))
+
+;; Executor of a seg-scan with one result, body (in 0), an optional seed
+;; (in 1) and a table combine op, over f32 or f64 operands of one dtype.
+(define (scan-executor space ins res)
+  (let*-values (((out)  (scan-result-out res))
+                ((spec) (scan-result-combine res))
+                ((dt)   (segop-operand-dtype out))
+                ((par-space lins steps n) (scan-layout space (append ins (list out))))
+                ((seed?) (and (scan-result-seed res) #t))
+                ((excl?) (scan-result-exclusive? res))
+                ((step)  (scan-step (combine-spec-op spec) (scan-result-swapped? res)))
+                ((neutral) (round-to-dtype (combine-spec-neutral spec) dt))
+                ((x-ref) (car (map segop-operand-slot ins)))
+                ((s-ref) (and seed? (cadr (map segop-operand-slot ins))))
+                ((xs)    (vector-ref steps 0))
+                ((os)    (vector-ref steps (if seed? 2 1)))
+                ((oi)    (if seed? 2 1)))
+    (define-syntax scan-lines
+      (syntax-rules ()
+        ((_ vref vset! round x-data s-data buf)
+         (for-each-strided-point
+          par-space lins
+          (lambda (offs)
+            (let ((xb (vector-ref offs 0)) (ob (vector-ref offs oi)))
+              (let loop ((r 0) (xo xb) (oo ob)
+                         (acc (and seed? (vref s-data (vector-ref offs 1)))))
+                (when (fx< r n)
+                  (let ((x (vref x-data xo)))
+                    (if excl?
+                        (begin (vset! buf oo (or acc neutral))
+                               (loop (fx+ r 1) (fx+ xo xs) (fx+ oo os)
+                                     (if acc (round (step acc x)) x)))
+                        (let ((v (if acc (round (step acc x)) x)))
+                          (vset! buf oo v)
+                          (loop (fx+ r 1) (fx+ xo xs) (fx+ oo os) v))))))))))))
+    (lambda (deref buf #!optional (extra-bufs '()))
+      (let ((x-data (operand-data 'scan (deref x-ref)))
+            (s-data (and seed? (operand-data 'scan (deref s-ref)))))
+        (if (eq? dt 'f32)
+            (let ((cell (make-f32vector 1)))
+              (define (round32 v) (f32vector-set! cell 0 v) (f32vector-ref cell 0))
+              (scan-lines f32vector-ref f32vector-set! round32 x-data s-data buf))
+            (scan-lines f64vector-ref f64vector-set! values x-data s-data buf))))))
+
+(define (scan-select sg)
+  (cases segop sg
+    (seg-scan (space ins results fallback)
+      (and (= (length results) 1)
+           (let* ((res  (car results))
+                  (out  (scan-result-out res))
+                  (dt   (segop-operand-dtype out))
+                  (spec (scan-result-combine res))
+                  (rank (vector-length space)))
+             (and (memq dt '(f32 f64))
+                  (memq (combine-spec-op spec) '(add mul max min))
+                  (eq? (combine-spec-acc-dtype spec) dt)
+                  (memq (combine-spec-order spec) '(sequential unspecified))
+                  (equal? (scan-result-body res) '(in 0))
+                  (if (scan-result-seed res)
+                      (and (= (length ins) 2) (equal? (scan-result-seed res) '(in 1)))
+                      (= (length ins) 1))
+                  (every (lambda (o) (eq? (segop-operand-dtype o) dt)) ins)
+                  (all-linear? (append ins (list out)) rank)
+                  (cons 'segop/scan (scan-executor space ins res))))))
+    (else #f)))
+
+;; Executor of any seg-scan in the sequential order whose operands all have
+;; linear forms: bodies and seeds are compiled procedures.
+(define (strided-scan-executor space ins results)
+  (let*-values (((n-in) (length ins))
+                ((outs) (map scan-result-out results))
+                ((par-space lins steps n) (scan-layout space (append ins outs)))
+                ((refs) (map segop-operand-slot ins))
+                ((dtypes) (list->vector (map segop-operand-dtype ins)))
+                ((res-v) (list->vector results))
+                ((n-res) (length results))
+                ((bodies) (list->vector (map (lambda (r) (scalar-expr->procedure (scan-result-body r) n-in))
+                                             results)))
+                ((seeds) (list->vector (map (lambda (r) (and (scan-result-seed r)
+                                                             (scalar-expr->procedure (scan-result-seed r) n-in)))
+                                            results)))
+                ((steps-of) (list->vector
+                             (map (lambda (r) (scan-step (combine-spec-op (scan-result-combine r))
+                                                         (scan-result-swapped? r)))
+                                  results)))
+                ((odts) (list->vector (map segop-operand-dtype outs))))
+    (lambda (deref buf #!optional (extra-bufs '()))
+      (let* ((datas (list->vector (map (lambda (r) (operand-data 'strided-scan (deref r))) refs)))
+             (bufs  (list->vector (cons buf extra-bufs)))
+             (offs* (make-vector (+ n-in n-res) 0))
+             (accs  (make-vector n-res #f)))
+        (define (args offs)
+          (map (lambda (k) (typed-vector-ref (vector-ref datas k) (vector-ref dtypes k) (vector-ref offs k)))
+               (iota n-in)))
+        (for-each-strided-point
+         par-space lins
+         (lambda (poffs)
+           (do ((k 0 (+ k 1))) ((= k (+ n-in n-res))) (vector-set! offs* k (vector-ref poffs k)))
+           (do ((j 0 (+ j 1))) ((= j n-res))
+             (let* ((seed (vector-ref seeds j))
+                    (dt (combine-spec-acc-dtype (scan-result-combine (vector-ref res-v j)))))
+               (vector-set! accs j (and seed (round-to-dtype (apply seed (args poffs)) dt)))))
+           (do ((r 0 (+ r 1))) ((= r n))
+             (let ((xs (args offs*)))
+               (do ((j 0 (+ j 1))) ((= j n-res))
+                 (let* ((res  (vector-ref res-v j))
+                        (spec (scan-result-combine res))
+                        (dt   (combine-spec-acc-dtype spec))
+                        (acc  (vector-ref accs j))
+                        (v    (apply (vector-ref bodies j) xs))
+                        (next (round-to-dtype (if acc ((vector-ref steps-of j) acc v) v) dt))
+                        (o    (vector-ref offs* (+ n-in j))))
+                   (typed-vector-set! (vector-ref bufs j) (vector-ref odts j) o
+                                      (if (scan-result-exclusive? res)
+                                          (or acc (round-to-dtype (combine-spec-neutral spec) dt))
+                                          next))
+                   (vector-set! accs j next))))
+             (do ((k 0 (+ k 1))) ((= k (+ n-in n-res)))
+               (vector-set! offs* k (+ (vector-ref offs* k) (vector-ref steps k)))))))))))
+
+(define (strided-scan-select sg)
+  (cases segop sg
+    (seg-scan (space ins results fallback)
+      (let ((rank (vector-length space)))
+        (and (all-linear? (append ins (map scan-result-out results)) rank)
+             (every (lambda (r) (memq (combine-spec-order (scan-result-combine r)) '(sequential unspecified)))
+                    results)
+             (every (lambda (o) (memq (segop-operand-dtype o) '(f32 f64 s32 s64 u32 u64)))
+                    (append ins (map scan-result-out results)))
+             (cons 'segop/strided-scan (strided-scan-executor space ins results)))))
+    (else #f)))
+
+;; The last resort: evaluate a seg-map, a seg-reduce or a seg-scan with the
+;; reference interpreter.  The executor of a segop with several outputs
+;; takes the buffers of the outputs after the first as a list.
 (define (interpreted-select sg)
-  (and (memq (segop-kind sg) '(seg-map seg-reduce))
+  (and (memq (segop-kind sg) '(seg-map seg-reduce seg-scan))
        (let ((refs (map segop-operand-slot (segop-inputs sg))))
          (cons 'segop/interpreted
                (lambda (deref buf #!optional (extra-bufs '()))
@@ -2045,7 +2257,8 @@
       (registry-colsum-select sg)
       (registry-elementwise-select sg)
       (select-standard-reduction sg '(axis0 axis1))
-      (registry-gather-select sg)))
+      (registry-gather-select sg)
+      (scan-select sg)))
 
 (define (scheme-select sg)
   (or (scheme-gemm-select sg)
@@ -2056,6 +2269,8 @@
       (strided-select sg)
       (strided-multi-select sg)
       (strided-red-select sg)
+      (scan-select sg)
+      (strided-scan-select sg)
       (host-index-fn-select sg)
       (interpreted-select sg)))
 

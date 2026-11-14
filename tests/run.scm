@@ -19,6 +19,7 @@
 (include-relative "test-batch-matmul.scm")
 (include-relative "test-framed-reduce.scm")
 (include-relative "test-lift.scm")
+(include-relative "test-scan.scm")
 (include-relative "test-blas.scm")
 (include-relative "test-microblas.scm")
 (include-relative "test-structural-ops.scm")
