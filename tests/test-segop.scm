@@ -638,6 +638,77 @@
   (test-error "results are scan-results"
     (make-seg-scan (vector 2) '() (list 'x))))
 
+(test-group "seg-scan with combine expressions"
+  (let* ((ema (make-combine-spec '(lambda (a b) (+ (* a 0.9) b)) #f 'f64))
+         (xs '(1.0 2.0 -3.5 0.25 10.0))
+         (out (make-f64vector 5)))
+    (test-assert "a combine expression has a procedure" (procedure? (combine-spec-procedure ema)))
+    (segop-interpret (sg-row-scan 'f64 1 5 ema) (list (sg-f64 xs)) (list out))
+    (test-assert "an exponential moving sum equals a plain loop"
+      (sg-list-same? (sg-plain-scan (lambda (a b) (+ (* a 0.9) b)) xs) (f64vector->list out))))
+
+  ;; In f32 the step-by-step program rounds (* a 0.9) when it stores it;
+  ;; a cast in the expression does the same.
+  (let* ((xs (map (lambda (i) (* 1.37 (sin (* 0.7 i)))) (iota 9)))
+         (r32 (lambda (x) (let ((v (make-f32vector 1))) (f32vector-set! v 0 x) (f32vector-ref v 0))))
+         (xs32 (map r32 xs))
+         (out (make-f32vector 9)))
+    (segop-interpret (sg-row-scan 'f32 1 9 (make-combine-spec '(lambda (a b) (+ (cast f32 (* a 0.9)) b)) #f 'f32))
+                     (list (sg-f32 xs32)) (list out))
+    (test-assert "casts give the rounding of a step-by-step f32 program"
+      (sg-list-same? (sg-plain-scan (lambda (a b) (r32 (+ (r32 (* a 0.9)) b))) xs32) (f32vector->list out))))
+
+  (let ((a (make-f64vector 5)) (b (make-f64vector 5))
+        (xs (sg-f64 '(1.0 +nan.0 3.0 -inf.0 2.0))))
+    (segop-interpret (sg-row-scan 'f64 1 5 (make-combine-spec '(lambda (acc x) (if (> x acc) x acc)) #f 'f64))
+                     (list xs) (list a))
+    (segop-interpret (sg-row-scan 'f64 1 5 (make-combine-spec 'max -inf.0 'f64)) (list xs) (list b))
+    (test-assert "an if expression equals the max op"
+      (sg-list-same? (f64vector->list a) (f64vector->list b))))
+
+  (let ((out (make-f64vector 4))
+        (seed (sg-op 'f64 (vector 1) (make-index-map (vector '(dim 0)) #f 0.0 #f))))
+    (segop-interpret (sg-row-scan 'f64 1 4 (make-combine-spec '(lambda (a b) (- a b)) #f 'f64)
+                                  exclusive: #t seed-op: seed)
+                     (list (sg-f64 '(1 2 3 4)) (sg-f64 '(10))) (list out))
+    (test "exclusive with a seed and no neutral" '(10.0 9.0 7.0 4.0) (f64vector->list out)))
+
+  (let ((out (make-f64vector 1)))
+    (segop-interpret (make-seg-reduce (vector 4) 1 (list (sg-op 'f64 (vector 4) (identity-index-map 1)))
+                                      (list (make-red-result (sg-op 'f64 (vector) (identity-index-map 0))
+                                                             '(in 0)
+                                                             (make-combine-spec '(lambda (a b) (+ a (* b b))) 0.0 'f64)
+                                                             #f)))
+                     (list (sg-f64 '(1 2 3 4))) (list out))
+    (test "a reduction with a combine expression" 30.0 (f64vector-ref out 0)))
+
+  (let ((blk (make-f64vector 7)))
+    (segop-interpret (sg-row-scan 'f64 1 7 (make-combine-spec '(lambda (a b) (+ a b)) #f 'f64 'blocked 3))
+                     (list (sg-f64 '(0.1 0.2 0.3 0.4 0.5 0.6 0.7))) (list blk))
+    (test-assert "blocked order with a combine expression and no neutral"
+      (sg-list-same? (f64vector->list blk)
+                     (let* ((c0 (sg-plain-scan + '(0.1 0.2 0.3)))
+                            (c1 (map (lambda (l) (+ (list-ref c0 2) l)) (sg-plain-scan + '(0.4 0.5 0.6))))
+                            (c2 (map (lambda (l) (+ (list-ref c1 2) l)) (sg-plain-scan + '(0.7)))))
+                       (append c0 c1 c2)))))
+
+  (test-error "an expression may not read inputs"
+    (make-combine-spec '(lambda (a b) (+ (in 0) b)) #f 'f64))
+  (test-error "an expression may not use a free variable"
+    (make-combine-spec '(lambda (a b) (+ c b)) #f 'f64))
+  (test-error "an expression may not use an unknown op"
+    (make-combine-spec '(lambda (a b) (frobnicate a b)) #f 'f64))
+  (test-error "the two variables must differ"
+    (make-combine-spec '(lambda (a a) (+ a a)) #f 'f64))
+  (test-error "a standard op needs a neutral element"
+    (make-combine-spec 'add #f 'f64))
+  (test-error "an exclusive scan without seed or neutral"
+    (sg-row-scan 'f64 1 4 (make-combine-spec '(lambda (a b) (+ a b)) #f 'f64) exclusive: #t))
+  (test-error "a reduction needs a neutral element"
+    (make-seg-reduce (vector 4) 1 (list (sg-op 'f64 (vector 4) (identity-index-map 1)))
+                     (list (make-red-result (sg-op 'f64 (vector) (identity-index-map 0)) '(in 0)
+                                            (make-combine-spec '(lambda (a b) (+ a b)) #f 'f64) #f)))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 6 - Construction checks
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

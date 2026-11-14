@@ -15,6 +15,8 @@
 (import array-morphisms-structural-ops)
 (import array-morphisms-realization)
 (import array-morphisms-context)
+(import array-morphisms-lift)
+(import (only array-morphisms-batch-ops batch-scan))
 
 ;;;; Helpers
 
@@ -72,17 +74,17 @@
 
 ;; One step of the plain loop: the value so far acc combined with x.
 (define (sc-step op swapped?)
-  (let ((f (case op
+  (let ((f (if (procedure? op) op (case op
              ((sum) (lambda (a x) (if (and (flonum? a) (flonum? x)) (fp+ a x) (+ a x))))
              ((prod) *)
              ((max) (lambda (a x) (if (> x a) x a)))
-             ((min) (lambda (a x) (if (< x a) x a))))))
+             ((min) (lambda (a x) (if (< x a) x a)))))))
     (if swapped? (lambda (a x) (f x a)) f)))
 
 ;; The reference scan of the row-major element list vals of shape (a list),
 ;; along axis, as a row-major list.  init-vals: #f or the row-major list of
 ;; the init array (shape without axis).
-(define (sc-ref op vals shape axis dt #!key (excl #f) (rev #f) (init-vals #f) (swapped #f))
+(define (sc-ref op vals shape axis dt #!key (excl #f) (rev #f) (init-vals #f) (swapped #f) (neutral #f))
   (let* ((rank (length shape))
          (n (list-ref shape axis))
          (strides (vector->list (compute-strides (list->vector shape))))
@@ -103,7 +105,7 @@
                     (k (+ base (* pos (list-ref strides axis))))
                     (x (vector-ref v k))
                     (next (sc-round (if acc (step acc x) x) dt)))
-               (vector-set! out k (if excl (or acc (sc-neutral op dt)) next))
+               (vector-set! out k (if excl (or acc neutral (sc-neutral op dt)) next))
                (loop (+ r 1) next))))))
      (iota (sc-product par-shape)))
     (vector->list out)))
@@ -229,3 +231,69 @@
     (test-error "init of the wrong dtype"
       (morph-scan 'sum m 0 init: (morph-from-list '(1.0 2.0) #(2) 'f32)))))
 
+
+;;;; Combine expressions and procedures
+
+(define (sc-lift-unsupported? thunk)
+  (condition-case (begin (thunk) #f) (e (lift-unsupported) #t)))
+
+(test-group "scans with combine expressions"
+  (for-each
+   (lambda (dt)
+     (let* ((vals (map (lambda (x) (sc-round x dt)) (sc-vals 24 3 dt #f)))
+            (m (morph-from-list vals #(4 6) dt))
+            (r (lambda (x) (sc-round x dt))))
+       ;; f64 needs no cast; f32 rounds the product as the expression says.
+       (test-assert (sprintf "~A exponential moving sum equals a plain loop" dt)
+         (sc-same? (sc-elements (morph-scan `(lambda (a b) (+ (cast ,dt (* a 0.5)) b)) m 1))
+                   (sc-ref (lambda (a x) (r (+ (r (* a 0.5)) x))) vals '(4 6) 1 dt)))
+       (test-assert (sprintf "~A expression along axis 0, reversed, exclusive with init" dt)
+         (let ((init (morph-from-list (map r '(1.0 -2.0 0.5 3.0 0.0 -0.0)) #(6) dt)))
+           (sc-same? (sc-elements (morph-scan '(lambda (a b) (- a b)) m 0 reverse?: #t exclusive?: #t
+                                              init: init))
+                     (sc-ref (lambda (a x) (- a x)) vals '(4 6) 0 dt rev: #t excl: #t
+                             init-vals: (map r '(1.0 -2.0 0.5 3.0 0.0 -0.0))))))
+       (test-assert (sprintf "~A exclusive with a neutral element" dt)
+         (sc-same? (sc-elements (morph-scan '(lambda (a b) (* a b)) m 1 exclusive?: #t neutral: 1.0))
+                   (sc-ref (lambda (a x) (r (* a x))) vals '(4 6) 1 dt excl: #t neutral: 1.0)))))
+   '(f32 f64))
+
+  ;; morph-scan/fn: the traced procedure, against the step-by-step program
+  ;; of batch-scan (slice-and-stack), bit for bit.
+  (for-each
+   (lambda (dt)
+     (let* ((vals (sc-vals 20 1 dt #t))
+            (m (morph-from-list vals #(5 4) dt))
+            (k (morph-from-list '(0.9) #(1) dt))
+            (fn (lambda (acc x) (morph+ (morph* acc k) (morph-exp (morph-negate x)))))
+            (init (morph-from-list '(0.0 1.0 -1.0 2.0) #(4) dt)))
+       (test "the traced expression"
+             (if (eq? dt 'f64)
+                 `(lambda (a b) (add (mul a ,(sc-round 0.9 dt)) (exp (negate b))))
+                 `(lambda (a b) (add (cast f32 (mul a ,(sc-round 0.9 dt))) (cast f32 (exp (cast f32 (negate b)))))))
+             (scan-combine-expression fn dt))
+       (test-assert (sprintf "~A morph-scan/fn equals batch-scan's slice-and-stack values" dt)
+         (sc-same? (sc-elements (morph-scan/fn fn m 0 init: init))
+                   (sc-elements (batch-scan fn init m))))))
+   '(f32 f64))
+  (test "operand order is kept" '(lambda (a b) (sub b a))
+        (scan-combine-expression (lambda (acc x) (morph- x acc)) 'f64))
+
+  (let ((c (morph-from-list '(1.0 2.0 3.0) #(3) 'f64))
+        (h (morph-from-list '(1.0) #(1) 'f64)))
+    (test-assert "a map step is not a combine expression"
+      (sc-lift-unsupported? (lambda () (scan-combine-expression (lambda (a b) (morph-map (lambda (x) x) (morph+ a b))) 'f64))))
+    (test-assert "a captured array that is not a scalar"
+      (sc-lift-unsupported? (lambda () (scan-combine-expression (lambda (a b) (morph+ (morph* a c) b)) 'f64))))
+    (test-assert "a reduction in the step"
+      (sc-lift-unsupported? (lambda () (scan-combine-expression (lambda (a b) (morph+ (morph-reduce 'sum a) b)) 'f64))))
+    (test-assert "a constant of another dtype"
+      (sc-lift-unsupported? (lambda () (scan-combine-expression (lambda (a b) (morph+ (morph* a h) b)) 'f32)))))
+
+  (let ((m (morph-from-list '(1.0 2.0) #(2) 'f64)))
+    (test-error "an exclusive custom scan needs init or a neutral element"
+      (morph-scan '(lambda (a b) (+ a b)) m 0 exclusive?: #t))
+    (test-error "a neutral element only with a combine expression"
+      (morph-scan 'sum m 0 neutral: 0.0))
+    (test-error "an invalid combine expression"
+      (morph-scan '(lambda (a b) (+ a c)) m 0))))

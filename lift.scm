@@ -11,12 +11,18 @@
 ;;; batched matrix product, so the tree has as many nodes for a frame of
 ;;; any size.  Each cell of the result has the values fn gives for that
 ;;; cell on its own.
+;;;
+;;; The same tracing turns a procedure of two morphisms, the step of a
+;;; scan, into a combine expression (scan-combine-expression), so that
+;;; (morph-scan/fn fn m axis ...) scans with it as one node.
 
 (module array-morphisms-lift
 
   (morph-lift
    lift-unsupported?
-   lift-unsupported-op)
+   lift-unsupported-op
+   scan-combine-expression
+   morph-scan/fn)
 
   (import scheme (chicken base) (chicken condition))
   (import (only srfi-1 iota every any fold take drop make-list list-index))
@@ -26,6 +32,7 @@
   (import array-morphisms-basic-ops)
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-exec)
+  (import (only array-morphisms-scalar-ops scalar-op? scalar-op-arity scalar-op-combiner))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Conditions
@@ -167,6 +174,14 @@
                (lift-unsupported op "rank above 4"))
              (wv (attention-morphism (car qkv) (cadr qkv) (caddr qkv) (meta-ref meta 'scale))
                  fr)))
+          ((scan)
+           (let ((e (expanded)) (p (lambda (k) (meta-ref meta k))))
+             (wv (morph-scan (p 'scan-op) (car e) (+ fr (p 'axis))
+                             exclusive?: (p 'exclusive?) reverse?: (p 'reverse?)
+                             swapped?: (p 'swapped?)
+                             neutral: (let ((n (assq 'neutral meta))) (and n (cdr n)))
+                             init: (and (pair? (cdr e)) (cadr e)))
+                 fr)))
           ((im2col) (widen-im2col node meta ws fr frame-prefix))
           ((col2im) (widen-col2im node meta shape ws fr frame-prefix))
           (else (lift-unsupported op "no widening rule")))))))
@@ -287,5 +302,59 @@
             (unless (array-morphism? traced)
               (error "morph-lift: fn must return a morphism" traced))
             (expand-frame (walk traced) frame (length frame))))))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Scans with a procedure as combine op
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (scan-combine-expression fn dtype)
+    "The combine expression (lambda (a b) e) of fn, a procedure of two
+    morphisms (the value so far and the next element) that builds its
+    result from them with element-wise table ops (add, mul, exp, ...) and
+    one-element constant arrays, every node of dtype dtype.  fn is called
+    once, on placeholder arrays of one element.  Each intermediate node is
+    rounded as storing it in an array of dtype would round it (a cast in
+    e), so that a scan with the expression gives the values of applying fn
+    step by step.  Signals a lift-unsupported condition naming the first
+    node that does not fit."
+    (let* ((holders (map (lambda (k) (concrete-array (allocate-typed-vector dtype 0) (vector 1)
+                                                     (vector 1) 0 dtype -1 -1))
+                         '(0 1)))
+           (traced (apply fn holders)))
+      (define (stored e) (if (eq? dtype 'f64) e `(cast ,dtype ,e)))
+      (define (walk m root?)
+        (cases array-morphism m
+          (concrete-array (data shape strides offset dt _ _)
+            (cond ((eq? m (car holders)) 'a)
+                  ((eq? m (cadr holders)) 'b)
+                  ((and (= (shape-size shape) 1) (eq? dt dtype))
+                   (typed-vector-ref data dt offset))
+                  (else (lift-unsupported 'scan "a captured array that is not a scalar of the scan's dtype"))))
+          (morphism-expr (id op operands ifn shape dtype2 meta _)
+            (unless (and (symbol? op) (scalar-op? op)
+                         (= (scalar-op-arity op) (length operands))
+                         (compute-index-fn? ifn)
+                         (eq? (compute-index-fn-combiner ifn) (scalar-op-combiner op)))
+              (lift-unsupported op "not an element-wise table op in a scan step"))
+            (unless (eq? dtype2 dtype)
+              (lift-unsupported op "a scan step node of another dtype"))
+            (let ((e (cons op (map (lambda (o) (walk o #f)) operands))))
+              (if root? e (stored e))))
+          (else (lift-unsupported 'scan "a reduction in a scan step"))))
+      (unless (array-morphism? traced)
+        (error "scan-combine-expression: fn must return a morphism" traced))
+      `(lambda (a b) ,(walk traced #t))))
+
+  (define (morph-scan/fn fn m axis #!key (exclusive? #f) (reverse? #f) (init #f) (neutral #f)
+                         (swapped? #f))
+    "Scan m along axis with the procedure fn of two morphisms as combine op:
+    (morph-scan (scan-combine-expression fn dtype) m axis ...), dtype being
+    m's.  Each output is fn applied to the previous output and the next
+    element, with the rounding of fn's element-wise ops; the keywords are
+    those of morph-scan.  Signals a lift-unsupported condition when fn is
+    not made of element-wise table ops (see scan-combine-expression)."
+    (morph-scan (scan-combine-expression fn (get-morphism-dtype m)) m axis
+                exclusive?: exclusive? reverse?: reverse? init: init neutral: neutral
+                swapped?: swapped?))
 
 ) ;; end module array-morphisms-lift

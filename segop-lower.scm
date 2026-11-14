@@ -968,11 +968,13 @@
 ;;; negative coefficient there.  The body is (in 0); an init array is input
 ;;; 1, read at the parallel point, and is the seed.  The combine spec has
 ;;; the result's dtype as accumulator dtype and the sequential order, which
-;;; is the loop of execute-scan-morphism.
+;;; is the loop of execute-scan-morphism.  A scan with a combine expression
+;;; keeps the expression as its combine op, with the neutral element the
+;;; scan was given (or #f).
 
 (define (scan-combine-op op)
   (case op ((sum) 'add) ((prod) 'mul) ((max) 'max) ((min) 'min)
-    (else (error "scan: unknown op" op))))
+    (else (if (pair? op) op (error "scan: unknown op" op)))))
 
 (define (lower-scan-binding meta in-traces in-refs pool-idx shape strides dtype)
   "The seg-scan of a scan binding with meta meta (scan-op, axis,
@@ -1001,7 +1003,10 @@
          (src  (operand (car in-traces) (car in-refs) axis-map))
          (init (and (pair? (cdr in-traces))
                     (operand (cadr in-traces) (cadr in-refs) (identity-index-map npar))))
-         (spec (make-combine-spec (scan-combine-op op) (reduction-neutral op dtype) dtype)))
+         (neutral (if (symbol? op)
+                      (reduction-neutral op dtype)
+                      (let ((p (assq 'neutral meta))) (and p (cdr p)))))
+         (spec (make-combine-spec (scan-combine-op op) neutral dtype)))
     (make-seg-scan space
                    (if init (list src init) (list src))
                    (list (make-scan-result (make-segop-operand pool-idx dtype shape strides 0 axis-map)
@@ -1014,15 +1019,17 @@
                          pool-idx shape strides dtype)
       (error "compile-scan-segop: no backend accepts the scan" meta)))
 
-;; The step (acc x) -> value of combine op cop, before rounding, the
+;; The step (acc x) -> value of combine spec spec, before rounding, the
 ;; arguments trading places when swapped?.  It is the step of combine-step.
-(define (scan-step cop swapped?)
-  (let ((f (case cop
-             ((add) scalar-add)
-             ((mul) *)
-             ((max) (lambda (acc x) (if (> x acc) x acc)))
-             ((min) (lambda (acc x) (if (< x acc) x acc)))
-             (else (lambda (acc x) ((cadr cop) acc x))))))
+(define (scan-step spec swapped?)
+  (let* ((cop (combine-spec-op spec))
+         (f (case cop
+              ((add) scalar-add)
+              ((mul) *)
+              ((max) (lambda (acc x) (if (> x acc) x acc)))
+              ((min) (lambda (acc x) (if (< x acc) x acc)))
+              (else (or (combine-spec-procedure spec)
+                        (lambda (acc x) ((cadr cop) acc x)))))))
     (if swapped? (lambda (acc x) (f x acc)) f)))
 
 ;; The parts of a seg-scan the executors below share: the parallel space,
@@ -1046,7 +1053,7 @@
                 ((par-space lins steps n) (scan-layout space (append ins (list out))))
                 ((seed?) (and (scan-result-seed res) #t))
                 ((excl?) (scan-result-exclusive? res))
-                ((step)  (scan-step (combine-spec-op spec) (scan-result-swapped? res)))
+                ((step)  (scan-step spec (scan-result-swapped? res)))
                 ((neutral) (round-to-dtype (combine-spec-neutral spec) dt))
                 ((x-ref) (car (map segop-operand-slot ins)))
                 ((s-ref) (and seed? (cadr (map segop-operand-slot ins))))
@@ -1118,7 +1125,7 @@
                                                              (scalar-expr->procedure (scan-result-seed r) n-in)))
                                             results)))
                 ((steps-of) (list->vector
-                             (map (lambda (r) (scan-step (combine-spec-op (scan-result-combine r))
+                             (map (lambda (r) (scan-step (scan-result-combine r)
                                                          (scan-result-swapped? r)))
                                   results)))
                 ((odts) (list->vector (map segop-operand-dtype outs))))

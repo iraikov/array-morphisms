@@ -111,7 +111,8 @@
    make-combine-spec
    combine-spec?
    combine-spec-op combine-spec-neutral combine-spec-acc-dtype
-   combine-spec-order combine-spec-block-size
+   combine-spec-order combine-spec-block-size combine-spec-procedure
+   combine-expression? combine-expression-body
    make-red-result
    red-result?
    red-result-out red-result-body red-result-combine red-result-finalize
@@ -989,16 +990,21 @@
 ;;;; Reductions
 ;;;; ============================================================
 
-;; How the values of a reduction are combined.
-;;   op:         add, mul, max, min, or (opaque proc) with proc a procedure
-;;               of the accumulator and a value.
+;; How the values of a reduction or a scan are combined.
+;;   op:         add, mul, max, min, (opaque proc) with proc a procedure
+;;               of the accumulator and a value, or a combine expression
+;;               (lambda (a b) e): e is a scalar expression (no (in k),
+;;               (param k), (idx d) or (reduced)) in the variables a, the
+;;               accumulator, and b, the value; it is computed in double
+;;               precision.
 ;;               max and min replace the accumulator by a value only when
 ;;               the value is greater (smaller); a NaN value never
 ;;               replaces it.  The Scheme procedures max and min, which
 ;;               treat NaN otherwise, are written (opaque max) and
 ;;               (opaque min).
 ;;   neutral:    the neutral element of op (0.0, 1.0, -inf.0, +inf.0, or the
-;;               extreme values of an integer dtype).
+;;               extreme values of an integer dtype); #f, for a combine
+;;               expression, when there is none.
 ;;   acc-dtype:  the dtype the accumulator is rounded to after every step:
 ;;               f64 accumulates in double precision, f32 rounds to single
 ;;               precision, and an integer dtype truncates.
@@ -1008,21 +1014,39 @@
 ;;               in increasing order;
 ;;               unspecified: chosen by the backend.
 ;;   block-size: chunk length for the blocked order, otherwise #f.
+;;   procedure:  for a combine expression, the procedure of the accumulator
+;;               and a value that computes it (before rounding), otherwise #f.
 (define-record-type combine-spec
-  (%make-combine-spec op neutral acc-dtype order block-size)
+  (%make-combine-spec op neutral acc-dtype order block-size procedure)
   combine-spec?
   (op combine-spec-op)
   (neutral combine-spec-neutral)
   (acc-dtype combine-spec-acc-dtype)
   (order combine-spec-order)
-  (block-size combine-spec-block-size))
+  (block-size combine-spec-block-size)
+  (procedure combine-spec-procedure))
+
+(define (combine-expression? op)
+  "True when op has the form (lambda (a b) e) of a combine expression whose
+   e is a valid scalar expression in the variables a and b."
+  (and (pair? op) (eq? (car op) 'lambda) (list? op) (= (length op) 3)
+       (let ((vars (cadr op)))
+         (and (list? vars) (= (length vars) 2) (every symbol? vars)
+              (not (eq? (car vars) (cadr vars)))
+              (scalar-expr-valid? `(let* ((,(car vars) 0.0) (,(cadr vars) 0.0)) ,(caddr op)) 0 0)))))
+
+(define (combine-expression-body op)
+  "The body of combine expression op as a scalar expression of two inputs:
+   (in 0) the accumulator and (in 1) the value."
+  `(let* ((,(car (cadr op)) (in 0)) (,(cadr (cadr op)) (in 1))) ,(caddr op)))
 
 (define (make-combine-spec op neutral acc-dtype #!optional (order 'sequential) (block-size #f))
     "A combine spec; see the record definition for the fields."
     (unless (or (memq op '(add mul max min))
-                (and (pair? op) (eq? (car op) 'opaque) (pair? (cdr op)) (procedure? (cadr op))))
+                (and (pair? op) (eq? (car op) 'opaque) (pair? (cdr op)) (procedure? (cadr op)))
+                (combine-expression? op))
       (error 'make-combine-spec "unknown combine op" op))
-    (unless (number? neutral)
+    (unless (or (number? neutral) (and (not neutral) (combine-expression? op)))
       (error 'make-combine-spec "neutral element must be a number" neutral))
     (unless (memq acc-dtype '(f32 f64 s32 s64 u32 u64))
       (error 'make-combine-spec "unknown accumulator dtype" acc-dtype))
@@ -1031,7 +1055,9 @@
     (when (and (eq? order 'blocked)
                (not (and (exact-integer? block-size) (> block-size 0))))
       (error 'make-combine-spec "the blocked order needs a positive block size" block-size))
-    (%make-combine-spec op neutral acc-dtype order (and (eq? order 'blocked) block-size)))
+    (%make-combine-spec op neutral acc-dtype order (and (eq? order 'blocked) block-size)
+                        (and (combine-expression? op)
+                             (scalar-expr->procedure (combine-expression-body op) 2))))
 
 ;; One reduced value of a seg-reduce.
 ;;   out:      the output operand; its map uses only the parallel dimensions.
@@ -1173,6 +1199,8 @@
          (unless (red-result? r) (error 'make-seg-reduce "not a red-result" r))
          (unless (combine-spec? (red-result-combine r))
            (error 'make-seg-reduce "not a combine spec" (red-result-combine r)))
+         (unless (combine-spec-neutral (red-result-combine r))
+           (error 'make-seg-reduce "a reduction needs a neutral element" (red-result-combine r)))
          (let ((o (red-result-out r)))
            (check-operands 'make-seg-reduce (list o) rank)
            (unless (parallel-only? (segop-operand-map o))
@@ -1213,6 +1241,10 @@
        (unless (scan-result? r) (error 'make-seg-scan "not a scan-result" r))
        (unless (combine-spec? (scan-result-combine r))
          (error 'make-seg-scan "not a combine spec" (scan-result-combine r)))
+       (when (and (scan-result-exclusive? r) (not (scan-result-seed r))
+                  (not (combine-spec-neutral (scan-result-combine r))))
+         (error 'make-seg-scan "an exclusive scan without a seed needs a neutral element"
+                (scan-result-combine r)))
        (let ((o (scan-result-out r)))
          (check-operands 'make-seg-scan (list o) rank)
          (check-output 'make-seg-scan o space))
@@ -1331,7 +1363,9 @@
              ((mul) (* acc v))
              ((max) (if (> v acc) v acc))
              ((min) (if (< v acc) v acc))
-             (else ((cadr (combine-spec-op spec)) acc v)))))
+             (else (if (combine-spec-procedure spec)
+                       ((combine-spec-procedure spec) acc v)
+                       ((cadr (combine-spec-op spec)) acc v))))))
     (round-to-dtype r (combine-spec-acc-dtype spec))))
 
 (define (segop-interpret s in-bufs out-bufs #!key (params '#()) (use-fallback #f))

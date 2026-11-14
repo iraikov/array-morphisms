@@ -34,7 +34,8 @@
         (import scheme (chicken base)
                 srfi-4 datatype matchable
                 srfi-1 srfi-69 array-morphisms-core
-                array-morphisms-index-fn array-morphisms-scalar-ops)
+                array-morphisms-index-fn array-morphisms-scalar-ops
+                (only array-morphisms-segop combine-expression?))
 
 ;;; ============================================================================
 ;;; Helper Functions for Binary Operations
@@ -636,11 +637,19 @@
 ;;; Scans
 ;;; ============================================================================
 
-(define (morph-scan op m axis #!key (exclusive? #f) (reverse? #f) (init #f) (swapped? #f))
-  "Scan m along axis: the cumulative sum, product, maximum or minimum.
+(define (morph-scan op m axis #!key (exclusive? #f) (reverse? #f) (init #f) (swapped? #f)
+                    (neutral #f))
+  "Scan m along axis: the cumulative sum, product, maximum or minimum, or a
+   scan with a combine expression.
 
    Args:
-     op: sum, prod, max or min
+     op: sum, prod, max, min, or a combine expression (lambda (a b) e),
+           where e is a scalar expression (see segop.scm) of a, the value
+           so far, and b, the next element, for example
+           (lambda (a b) (+ (* a 0.9) b)).  e is computed in double
+           precision and rounded to the result dtype at every step; a
+           (cast f32 ...) inside it rounds an intermediate value.  The
+           elements are combined in order, so e need not be associative.
      m: input morphism, of rank 1 or more
      axis: the scanned axis; negative values count from the end
      exclusive?: #f (inclusive) to give, at position r, the combination of
@@ -655,6 +664,9 @@
            (op element acc) rather than (op acc element).  The two give the
            same number, but not always the same NaN payload when both are
            NaN; for max and min they treat NaN differently (see below).
+     neutral: for a combine expression, the value an exclusive scan without
+           init gives at position 0 (#f when it has none; such a scan then
+           needs init)
 
    Each output is the previous output combined with one more element and
    rounded to the result dtype, as a loop over the elements in order
@@ -664,14 +676,21 @@
    first element is passed over; min likewise with <.
 
    Returns:
-     A morphism of m's shape and dtype (op scan)
+     A morphism of m's shape and dtype (op scan); the dtype of a standard
+     op follows infer-reduction-dtype, that of a combine expression is
+     m's
 
    Examples:
      (morph-scan 'sum m 0)                    ; cumulative sum down axis 0
      (morph-scan 'max m -1 reverse?: #t)      ; running maximum from the right
      (morph-scan 'sum m 0 exclusive?: #t)     ; sums of the elements before"
-  (unless (memq op '(sum prod max min))
-    (error "morph-scan: op must be sum, prod, max or min" op))
+  (unless (or (memq op '(sum prod max min)) (combine-expression? op))
+    (error "morph-scan: op must be sum, prod, max, min or a combine expression" op))
+  (unless (or (not neutral) (and (number? neutral) (pair? op)))
+    (error "morph-scan: a neutral element is given only with a combine expression" neutral))
+  (when (and (pair? op) exclusive? (not init) (not neutral))
+    (error "morph-scan: an exclusive scan with a combine expression needs init or a neutral element"
+           op))
   (unless (array-morphism? m)
     (error "morph-scan: operand must be an array morphism" m))
   (let* ((shape (get-morphism-shape m))
@@ -680,7 +699,7 @@
          (ax (if (and (integer? axis) (exact? axis) (< axis rank) (>= axis (- rank)))
                  (normalize-axis axis rank)
                  (error "morph-scan: axis out of range" axis rank)))
-         (dtype (infer-reduction-dtype op (get-morphism-dtype m)))
+         (dtype (if (symbol? op) (infer-reduction-dtype op (get-morphism-dtype m)) (get-morphism-dtype m)))
          (line-shape (list->vector (append (take (vector->list shape) ax)
                                            (drop (vector->list shape) (+ ax 1))))))
     (when init
@@ -695,11 +714,14 @@
     (morphism-expr (gensym 'morph-)
                    'scan
                    (if init (list m init) (list m))
-                   (make-scan-index-fn op ax (and exclusive? #t) (and reverse? #t) (and swapped? #t))
+                   (make-scan-index-fn op ax (and exclusive? #t) (and reverse? #t) (and swapped? #t)
+                                       neutral)
                    shape
                    dtype
-                   `((scan-op . ,op) (axis . ,ax) (exclusive? . ,(and exclusive? #t))
-                     (reverse? . ,(and reverse? #t)) (swapped? . ,(and swapped? #t)))
+                   (append
+                    `((scan-op . ,op) (axis . ,ax) (exclusive? . ,(and exclusive? #t))
+                      (reverse? . ,(and reverse? #t)) (swapped? . ,(and swapped? #t)))
+                    (if neutral `((neutral . ,neutral)) '()))
                    (get-morphism-batch-axis m))))
 
 (define (morph-cumsum m axis #!key (exclusive? #f) (reverse? #f) (init #f))

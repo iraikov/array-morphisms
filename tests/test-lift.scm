@@ -287,3 +287,24 @@
       (lf-same? (lf-elements (batch-zip (lambda (a b) (morph-matvec a (morph-reduce 'sum b '(0)))) m m))
                 (lf-elements (batch-zip/slices
                               (lambda (a b) (morph-matvec a (morph-reduce 'sum b '(0)))) m m))))))
+
+;;;; Scans inside lifted functions
+
+(test-group "morph-lift: scans"
+  (for-each
+   (lambda (dt)
+     (lf-check (sprintf "~A cumsum of each cell along its axis 1" dt)
+               (lambda (x) (morph-cumsum x 1)) 2 (lf-arr '(3 4 5) dt 1))
+     (lf-check (sprintf "~A reverse exclusive max with a captured init" dt)
+               (let ((init (lf-arr '(5) dt 2)))
+                 (lambda (x) (morph-scan 'max x 0 reverse?: #t exclusive?: #t init: init)))
+               2 (lf-arr '(3 4 5) dt 3))
+     (lf-check (sprintf "~A a combine expression with a framed init" dt)
+               (lambda (x i) (morph-scan '(lambda (a b) (+ (* a 0.5) b)) x 0 init: i))
+               (list 2 1) (lf-arr '(2 3 4 5) dt 4) (lf-arr '(2 3 5) dt 5))
+     (lf-check (sprintf "~A a scan after an element-wise op, frame of rank 2" dt)
+               (lambda (x) (morph-cumprod (morph-exp x) 0)) 1 (lf-arr '(2 3 4) dt 6)))
+   '(f32 f64))
+  (test-assert "a lifted scan is one scan node"
+    (= (lf-node-count (morph-lift (lambda (x) (morph-cumsum x 0)) 1 (lf-arr '(4 5) 'f64 1)))
+       (lf-node-count (morph-lift (lambda (x) (morph-cumsum x 0)) 1 (lf-arr '(64 5) 'f64 1))))))

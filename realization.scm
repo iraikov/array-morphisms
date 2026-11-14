@@ -120,7 +120,8 @@
           array-morphisms-blas-exec
           array-morphisms-activation-exec
           array-morphisms-micro-blas-backend
-          (only array-morphisms-scalar-ops scalar-add))
+          (only array-morphisms-scalar-ops scalar-add)
+          (only array-morphisms-segop combine-expression-body scalar-expr->procedure))
 
   ;; Default-backend bootstrap: register the dependency-free microBLAS
   ;; backend unless something (e.g. the system-BLAS egg backend) has
@@ -1841,15 +1842,18 @@
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
   (define (scan-step-procedure op swapped?)
-    "The step (lambda (acc x) ...) of a scan with op sum, prod, max or min:
-    the value so far combined with one more element, before rounding.  With
-    swapped? the two arguments of the combining operation trade places."
+    "The step (lambda (acc x) ...) of a scan with op sum, prod, max, min or a
+    combine expression: the value so far combined with one more element,
+    before rounding.  With swapped? the two arguments of the combining
+    operation trade places."
     (let ((f (case op
                ((sum)  scalar-add)
                ((prod) *)
                ((max)  (lambda (acc x) (if (> x acc) x acc)))
                ((min)  (lambda (acc x) (if (< x acc) x acc)))
-               (else (error "scan: unknown op" op)))))
+               (else (if (pair? op)
+                         (scalar-expr->procedure (combine-expression-body op) 2)
+                         (error "scan: unknown op" op))))))
       (if swapped? (lambda (acc x) (f x acc)) f)))
 
   (define (execute-scan-morphism fn output-buffer shape operands dtype)
@@ -1885,7 +1889,7 @@
            (s-step (vector-ref sstr ax))
            (o-step (vector-ref ostr ax))
            (cell (allocate-typed-vector dtype 1))
-           (neutral (reduction-neutral op dtype)))
+           (neutral (if (symbol? op) (reduction-neutral op dtype) (scan-index-fn-neutral fn))))
       (define (rounded x)
         (typed-vector-set! cell dtype 0 x)
         (typed-vector-ref cell dtype 0))

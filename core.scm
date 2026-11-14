@@ -95,6 +95,7 @@
    scan-index-fn-exclusive?
    scan-index-fn-reverse?
    scan-index-fn-swapped?
+   scan-index-fn-neutral
 
    ;; col2im index functions (accumulation)
    col2im-index-fn?
@@ -361,15 +362,19 @@
   batch-axis    ; Batch dimension
   keepdims?)    ; Keep batch dimension?
 
-;; Scan along one axis (cumulative sum, product, maximum or minimum).
-;;   op:         sum, prod, max or min.
+;; Scan along one axis (cumulative sum, product, maximum, minimum, or a
+;; scan with a combine expression).
+;;   op:         sum, prod, max, min, or a combine expression (lambda (a b) e)
+;;               (see segop.scm).
 ;;   axis:       the scanned axis.
 ;;   exclusive?: #f when the output at position r combines the elements at
 ;;               0 to r; #t when it combines those at 0 to r - 1.
 ;;   reverse?:   #t to scan from the last position down to the first.
 ;;   swapped?:   #t when each step is (op element acc) rather than
 ;;               (op acc element).
-(define-record scan-index-fn op axis exclusive? reverse? swapped?)
+;;   neutral:    for a combine expression, its neutral element or #f;
+;;               otherwise #f (the neutral element follows from op).
+(define-record scan-index-fn op axis exclusive? reverse? swapped? neutral)
 
 (define-record-type col2im-index-fn
   (make-col2im-index-fn-record kernel-h kernel-w stride-h stride-w pad-h pad-w col-layout)

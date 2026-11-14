@@ -4326,6 +4326,12 @@
           (lambda () (morph-cumsum (morph* (morph-from-list (map (lambda (i) (- (modulo (* 7 i) 11) 5)) (iota 12)) #(3 4) 's32)
                                            (morph-from-list '(1) #(1) 's32))
                                    1 exclusive?: #t)))
+    (list "f32 combine expression" 'segop/strided-scan
+          (lambda () (morph-scan '(lambda (a b) (+ (cast f32 (* a 0.5)) b)) (s2-src 'f32 '(3 4 5) s2-val) 1
+                                 reverse?: #t)))
+    (list "f64 exclusive combine expression with a neutral element" 'segop/strided-scan
+          (lambda () (morph-scan '(lambda (a b) (if (> b a) b a)) (s2-src 'f64 '(3 4 5) s2-val) 2
+                                 exclusive?: #t neutral: -inf.0)))
     (list "s32 running max with init" 'segop/strided-scan
           (lambda () (morph-scan 'max (morph* (morph-from-list (map (lambda (i) (- (modulo (* 7 i) 11) 5)) (iota 12)) #(3 4) 's32)
                                               (morph-from-list '(1) #(1) 's32))

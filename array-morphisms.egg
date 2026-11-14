@@ -24,7 +24,7 @@
              (extension array-morphisms-segop (source "segop.scm") (csc-options "-O2" "-d1")
                         (component-dependencies array-morphisms-core array-morphisms-scalar-ops))
              (extension array-morphisms-basic-ops (source "basic-ops.scm") (csc-options "-O3" "-d1")
-                        (component-dependencies array-morphisms-scalar-ops))
+                        (component-dependencies array-morphisms-scalar-ops array-morphisms-segop))
              (extension array-morphisms-blas-compat (source "blas-compat.scm")   (csc-options "-O2" "-d1"))
              (extension array-morphisms-blas-exec   (source "blas-exec.scm")     (csc-options "-O2" "-d1"))
              (extension array-morphisms-activation-exec (source "activation-exec.scm") (csc-options "-O2" "-d1"))
@@ -44,7 +44,8 @@
              (extension array-morphisms-realization (source "realization.scm") (csc-options "-O3" "-d1")
                         (component-dependencies array-morphisms-micro-blas-backend
                                                 array-morphisms-activation-exec
-                                                array-morphisms-scalar-ops))
+                                                array-morphisms-scalar-ops
+                                                array-morphisms-segop))
              (extension array-morphisms-context     (source "context.scm")     (csc-options "-O2" "-d1"))
              (extension array-morphisms-batch-ops   (source "batch-ops.scm")   (csc-options "-O2" "-d1")
                         (component-dependencies array-morphisms-lift))

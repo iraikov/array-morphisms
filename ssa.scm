@@ -2338,6 +2338,7 @@
          (morph-scan (get 'scan-op) (car inputs) (get 'axis)
                      exclusive?: (get 'exclusive?) reverse?: (get 'reverse?)
                      swapped?: (get 'swapped?)
+                     neutral: (let ((p (assq 'neutral meta))) (and p (cdr p)))
                      init: (and (pair? (cdr inputs)) (cadr inputs)))))
       ((eq? op 'transpose)
        (let ((perm (cdr (assq 'perm meta))))
