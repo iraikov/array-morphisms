@@ -1210,14 +1210,14 @@
       (cases array-morphism a
         (concrete-array (data _ _ _ _ _ _) data)
         (else (error "with-segop-checker: not concrete" a))))
-    ;; A seg-red whose combine order the backend chooses (as the BLAS dot
+    ;; A seg-reduce whose combine order the backend chooses (as the BLAS dot
     ;; product of a rank-1 sum, or a GEMM kernel) is compared up to
     ;; rounding: the relative tolerance is 8 n eps, with n the number of
     ;; reduced values and eps the machine epsilon of the accumulator dtype.
     ;; Returns that tolerance, or #f for an exact comparison.
     (define (unspecified-order-tolerance sg)
       (cases segop sg
-        (seg-red (space nred ins results map-outs fallback)
+        (seg-reduce (space nred ins results map-outs fallback)
           (let ((specs (filter (lambda (spec) (eq? 'unspecified (combine-spec-order spec)))
                                (map red-result-combine results))))
             (and (pair? specs)
@@ -1314,12 +1314,12 @@
           (reset-context! ctx)
           (values joint trace-lists (map concrete->list (ssa-realize/ctx ctx joint))))))))
 
-;; The bodies of segop sg: those of a seg-map's outputs, or a seg-red's
+;; The bodies of segop sg: those of a seg-map's outputs, or a seg-reduce's
 ;; result and map-output bodies.
 (define (segop-bodies sg)
   (cases segop sg
     (seg-map (space ins outs bodies fallback) bodies)
-    (seg-red (space nred ins results map-outs fallback)
+    (seg-reduce (space nred ins results map-outs fallback)
       (append (map red-result-body results) (map cdr map-outs)))
     (else '())))
 
@@ -1631,7 +1631,7 @@
 
 (define (s2-val i) (case (modulo i 7) ((0) -0.0) ((3) 1e8) (else (- (* 0.37 i) 2.0))))
 
-(test-group "reductions as seg-red"
+(test-group "reductions as seg-reduce"
   (for-each
    (lambda (dt)
      (for-each
@@ -1683,7 +1683,7 @@
 
   (let* ((r (s2-run (lambda () (morph-reduce 'mean (s2-src 'f64 '(2 3 4) s2-val) '(2 0) #t))))
          (prog (car r))
-         (reds (filter (lambda (ts) (eq? 'seg-red (segop-kind (cdr ts)))) (plan-segops prog))))
+         (reds (filter (lambda (ts) (eq? 'seg-reduce (segop-kind (cdr ts)))) (plan-segops prog))))
     (test "standard-reduction recovers the reduction" '((mean (0 2) #t))
       (map (lambda (ts) (let ((p (standard-reduction (cdr ts)))) (list (car p) (cadr p) (caddr p))))
            reds))
@@ -1778,9 +1778,9 @@
       (test "the interpreted gather reads the second row" '(4.0 5.0 6.0) (f64vector->list buf)))))
 
 ;;;; ============================================================
-;;;; The strided seg-red executor
+;;;; The strided seg-reduce executor
 ;;;;
-;;;; Seg-reds that are not standard reductions (two inputs, a body other
+;;;; Seg-reduces that are not standard reductions (two inputs, a body other
 ;;;; than (in 0), map outputs, finalize bodies with inputs) run on the
 ;;;; strided reduction executor, which must write exactly what
 ;;;; segop-interpret writes.
@@ -1805,7 +1805,7 @@
 ;; A row-major output operand of the given shape, written through m.
 (define (e4-out dtype shape m) (make-segop-operand #f dtype shape (compute-strides shape) 0 m))
 
-;; Runs seg-red sg on the arrays of arrs (an alist from slot to array)
+;; Runs seg-reduce sg on the arrays of arrs (an alist from slot to array)
 ;; with its selected executor and with segop-interpret, each into fresh
 ;; output buffers of the given (dtype size) specs.  Returns the tag and
 ;; whether every output element is the same in both, NaNs included.
@@ -1837,60 +1837,60 @@
   (let ((v (make-s32vector n)))
     (do ((i 0 (+ i 1))) ((= i n) v) (s32vector-set! v i (- (* 7 (modulo (* 3 i) 11)) 30)))))
 
-(test-group "strided seg-red executor"
+(test-group "strided seg-reduce executor"
   ;; Sum over axis 0 of x*y, with x*y kept as a map output sharing the body.
   (let* ((x (e4-arr (e4-values 15 'f32) #(5 3) #(3 1) 'f32))
          (y (e4-arr (e4-values 15 'f32) #(5 3) #(3 1) 'f32))
          (t (e4-map '(dim 1) '(dim 0)))
          (body '(cast f32 (mul (in 0) (in 1))))
-         (sg (make-seg-red #(3 5) 1 (list (e4-op 'x x 'f32 t) (e4-op 'y y 'f32 t))
-                           (list (make-red-result (e4-out 'f32 #(3) (e4-map '(dim 0))) body
-                                                  (make-combine-spec 'add 0.0 'f32) #f))
-                           (list (cons (e4-out 'f32 #(5 3) t) body))))
+         (sg (make-seg-reduce #(3 5) 1 (list (e4-op 'x x 'f32 t) (e4-op 'y y 'f32 t))
+                              (list (make-red-result (e4-out 'f32 #(3) (e4-map '(dim 0))) body
+                                                     (make-combine-spec 'add 0.0 'f32) #f))
+                              (list (cons (e4-out 'f32 #(5 3) t) body))))
          (r (e4-run sg `((x . ,x) (y . ,y)) '((f32 3) (f32 15)))))
     (test "a fused column sum runs on the strided reduction executor" 'segop/strided-red (car r))
     (test-assert "column sum and kept products equal the interpreter's" (cadr r)))
   ;; Sum over axis 1 accumulated in f64, a mean finalize and keepdims.
   (let* ((x (e4-arr (e4-values 24 'f32) #(4 6) #(6 1) 'f32))
-         (sg (make-seg-red #(4 6) 1 (list (e4-op 'x x 'f32 (identity-index-map 2)))
-                           (list (make-red-result (e4-out 'f32 #(4 1) (e4-map '(dim 0) 0))
-                                                  '(cast f32 (exp (in 0)))
-                                                  (make-combine-spec 'add 0.0 'f64) '(/ (reduced) 6)))))
+         (sg (make-seg-reduce #(4 6) 1 (list (e4-op 'x x 'f32 (identity-index-map 2)))
+                              (list (make-red-result (e4-out 'f32 #(4 1) (e4-map '(dim 0) 0))
+                                                     '(cast f32 (exp (in 0)))
+                                                     (make-combine-spec 'add 0.0 'f64) '(/ (reduced) 6)))))
          (r (e4-run sg `((x . ,x)) '((f32 4)))))
     (test "a row mean with keepdims is a strided reduction" 'segop/strided-red (car r))
     (test-assert "the row mean equals the interpreter's" (cadr r)))
   ;; Max and min over axes 0 and 2 of a 3-D array, as two results.
   (let* ((x (e4-arr (e4-values 24 'f64) #(2 3 4) #(12 4 1) 'f64))
          (m (e4-map '(dim 1) '(dim 0) '(dim 2)))
-         (sg (make-seg-red #(3 2 4) 2 (list (e4-op 'x x 'f64 m))
-                           (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 0.5)
-                                                  (make-combine-spec 'max -inf.0 'f64) #f)
-                                 (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 0.5)
-                                                  (make-combine-spec 'min +inf.0 'f64) #f))))
+         (sg (make-seg-reduce #(3 2 4) 2 (list (e4-op 'x x 'f64 m))
+                              (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 0.5)
+                                                     (make-combine-spec 'max -inf.0 'f64) #f)
+                                    (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 0.5)
+                                                     (make-combine-spec 'min +inf.0 'f64) #f))))
          (r (e4-run sg `((x . ,x)) '((f64 3) (f64 3)))))
     (test "two results over two reduced axes" 'segop/strided-red (car r))
     (test-assert "max and min with NaN, infinities and -0.0 equal the interpreter's" (cadr r)))
   ;; A product over axis 1 of a transposed (column-major) input.
   (let* ((x (e4-arr (e4-values 12 'f64) #(3 4) #(1 3) 'f64))
-         (sg (make-seg-red #(3 4) 1 (list (e4-op 'x x 'f64 (identity-index-map 2)))
-                           (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 1.0)
-                                                  (make-combine-spec 'mul 1.0 'f64) #f))))
+         (sg (make-seg-reduce #(3 4) 1 (list (e4-op 'x x 'f64 (identity-index-map 2)))
+                              (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(add (in 0) 1.0)
+                                                     (make-combine-spec 'mul 1.0 'f64) #f))))
          (r (e4-run sg `((x . ,x)) '((f64 3)))))
     (test "a strided input" 'segop/strided-red (car r))
     (test-assert "the product of a transposed input equals the interpreter's" (cadr r)))
   ;; Everything reduced to a rank-0 result, with a finalize.
   (let* ((x (e4-arr (e4-values 6 'f64) #(2 3) #(3 1) 'f64))
-         (sg (make-seg-red #(2 3) 2 (list (e4-op 'x x 'f64 (identity-index-map 2)))
-                           (list (make-red-result (e4-out 'f64 #() (e4-map)) '(mul (in 0) (in 0))
-                                                  (make-combine-spec 'add 0.0 'f64) '(sqrt (reduced))))))
+         (sg (make-seg-reduce #(2 3) 2 (list (e4-op 'x x 'f64 (identity-index-map 2)))
+                              (list (make-red-result (e4-out 'f64 #() (e4-map)) '(mul (in 0) (in 0))
+                                                     (make-combine-spec 'add 0.0 'f64) '(sqrt (reduced))))))
          (r (e4-run sg `((x . ,x)) '((f64 1)))))
     (test "a rank-0 result" 'segop/strided-red (car r))
     (test-assert "the rank-0 result equals the interpreter's" (cadr r)))
   ;; Integer sums of squares, rounded to s32 after every step.
   (let* ((x (e4-arr (e4-ints 12) #(3 4) #(4 1) 's32))
-         (sg (make-seg-red #(3 4) 1 (list (e4-op 'x x 's32 (identity-index-map 2)))
-                           (list (make-red-result (e4-out 's32 #(3) (e4-map '(dim 0))) '(mul (in 0) (in 0))
-                                                  (make-combine-spec 'add 0 's32) #f))))
+         (sg (make-seg-reduce #(3 4) 1 (list (e4-op 'x x 's32 (identity-index-map 2)))
+                              (list (make-red-result (e4-out 's32 #(3) (e4-map '(dim 0))) '(mul (in 0) (in 0))
+                                                     (make-combine-spec 'add 0 's32) #f))))
          (r (e4-run sg `((x . ,x)) '((s32 3)))))
     (test "an s32 reduction" 'segop/strided-red (car r))
     (test-assert "the s32 sums equal the interpreter's" (cadr r))
@@ -1903,9 +1903,9 @@
   (let* ((d (make-f32vector 10 1.0))
          (_ (f32vector-set! d 0 1e8))
          (x (e4-arr d #(1 10) #(10 1) 'f32))
-         (sg (make-seg-red #(1 10) 1 (list (e4-op 'x x 'f32 (identity-index-map 2)))
-                           (list (make-red-result (e4-out 'f32 #(1) (e4-map '(dim 0))) '(mul (in 0) 1.0)
-                                                  (make-combine-spec 'add 0.0 'f32 'blocked 3) #f))))
+         (sg (make-seg-reduce #(1 10) 1 (list (e4-op 'x x 'f32 (identity-index-map 2)))
+                              (list (make-red-result (e4-out 'f32 #(1) (e4-map '(dim 0))) '(mul (in 0) 1.0)
+                                                     (make-combine-spec 'add 0.0 'f32 'blocked 3) #f))))
          (r (e4-run sg `((x . ,x)) '((f32 1)))))
     (test "a blocked reduction" 'segop/strided-red (car r))
     (test-assert "the blocked sum equals the interpreter's" (cadr r))
@@ -1916,18 +1916,18 @@
   (let* ((x (e4-arr (e4-values 15 'f64) #(5 3) #(3 1) 'f64))
          (b (e4-arr (f64vector 0.25 -1.0 +inf.0) #(3) #(1) 'f64))
          (t (e4-map '(dim 1) '(dim 0)))
-         (sg (make-seg-red #(3 5) 1 (list (e4-op 'x x 'f64 t) (e4-op 'b b 'f64 (e4-map '(dim 0))))
-                           (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(mul (in 0) 2.0)
-                                                  (make-combine-spec 'add 0.0 'f64) '(add (reduced) (in 1))))
-                           (list (cons (e4-out 'f64 #(5 3) t) '(add (in 0) (in 1))))))
+         (sg (make-seg-reduce #(3 5) 1 (list (e4-op 'x x 'f64 t) (e4-op 'b b 'f64 (e4-map '(dim 0))))
+                              (list (make-red-result (e4-out 'f64 #(3) (e4-map '(dim 0))) '(mul (in 0) 2.0)
+                                                     (make-combine-spec 'add 0.0 'f64) '(add (reduced) (in 1))))
+                              (list (cons (e4-out 'f64 #(5 3) t) '(add (in 0) (in 1))))))
          (r (e4-run sg `((x . ,x) (b . ,b)) '((f64 3) (f64 15)))))
     (test "a finalize with an input and a separate map output" 'segop/strided-red (car r))
     (test-assert "they equal the interpreter's" (cadr r)))
-  ;; A seg-red whose input map is opaque still goes to the interpreter.
+  ;; A seg-reduce whose input map is opaque still goes to the interpreter.
   (let* ((x (e4-arr (e4-values 6 'f64) #(2 3) #(3 1) 'f64))
-         (sg (make-seg-red #(2 3) 1 (list (make-segop-operand 'x 'f64 #(2 3) #(3 1) 0 (opaque-index-map values)))
-                           (list (make-red-result (e4-out 'f64 #(2) (e4-map '(dim 0))) '(mul (in 0) 3.0)
-                                                  (make-combine-spec 'add 0.0 'f64) #f)))))
+         (sg (make-seg-reduce #(2 3) 1 (list (make-segop-operand 'x 'f64 #(2 3) #(3 1) 0 (opaque-index-map values)))
+                              (list (make-red-result (e4-out 'f64 #(2) (e4-map '(dim 0))) '(mul (in 0) 3.0)
+                                                     (make-combine-spec 'add 0.0 'f64) #f)))))
     (test "an opaque map is not a strided reduction" 'segop/interpreted
       (car (select-segop-executor sg)))))
 ;;;; ============================================================
@@ -2197,9 +2197,9 @@
       (eq? (get-morphism-dtype (realize (am:var-grad W))) 'f32))))
 
 ;;;; ============================================================
-;;;; GEMM as seg-red
+;;;; GEMM as seg-reduce
 ;;;;
-;;;; Every matmul is a seg-red over (M N K) routed to the BLAS backend.
+;;;; Every matmul is a seg-reduce over (M N K) routed to the BLAS backend.
 ;;;; Forward programs are traced and replayed with the checking backend, so
 ;;;; each GEMM is also run by the reference interpreter.  Products below
 ;;;; the BLAS size threshold run the Scheme loop, whose combine spec is
@@ -2254,7 +2254,7 @@
   (filter (lambda (p) (memq (car p) '(segop/gemm segop/gemm-strided segop/gemm-epilogue)))
           (plan-segops prog)))
 
-(test-group "GEMM as seg-red"
+(test-group "GEMM as seg-reduce"
   ;; layouts, dtypes, and sizes below (3x4x5) and above (9x8x10) the threshold
   (for-each
    (lambda (dt)
@@ -2276,7 +2276,7 @@
                  (let* ((sg (cdar gs))
                         (g  (standard-gemm sg))
                         (spec (red-result-combine (car (cases segop sg
-                                                         (seg-red (_ _ _ results _ _) results)
+                                                         (seg-reduce (_ _ _ results _ _) results)
                                                          (else '()))))))
                    (test-assert (string-append name ": standard-gemm recovers it")
                      (and g (eq? (list-ref g 3) (if (or tA? tB?) 'gemm-strided 'gemm))
@@ -2316,7 +2316,7 @@
     (let* ((r (s2-run (lambda () (morph-matmul A B))))
            (spec (red-result-combine
                   (car (cases segop (cdar (gm-segops (car r)))
-                         (seg-red (_ _ _ results _ _) results)
+                         (seg-reduce (_ _ _ results _ _) results)
                          (else '()))))))
       (enable-blas!)
       (test-assert "without BLAS the combine spec is sequential with an f64 accumulator"
@@ -2343,7 +2343,7 @@
             (test-assert (string-append name ": the finalize reads the stored product")
               (let ((fin (red-result-finalize
                           (car (cases segop (cdar gs)
-                                 (seg-red (_ _ _ results _ _) results)
+                                 (seg-reduce (_ _ _ results _ _) results)
                                  (else '()))))))
                 (and (pair? fin) (member `(cast ,dt (reduced)) (cdr fin)) #t)))
             (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
@@ -2393,13 +2393,13 @@
 (define (mm-square x) (* x x))
 (define (mm-shift x) (- (* 0.75 x) 0.5))
 
-;; The finalize body of the single seg-red among the plan's GEMM segops.
+;; The finalize body of the single seg-reduce among the plan's GEMM segops.
 (define (mm-gemm-finalize prog)
   (let ((gs (gm-segops prog)))
     (and (= 1 (length gs))
          (red-result-finalize
           (car (cases segop (cdar gs)
-                 (seg-red (_ _ _ results _ _) results)
+                 (seg-reduce (_ _ _ results _ _) results)
                  (else '())))))))
 
 (test-group "morph-map in SSA"
@@ -3907,7 +3907,7 @@
 ;;;; ============================================================
 ;;;; Convolution segops
 ;;;;
-;;;; The convolution bindings lower to seg-maps and seg-reds read through
+;;;; The convolution bindings lower to seg-maps and seg-reduces read through
 ;;;; guarded maps, which conv-select recognizes and runs with the
 ;;;; convolution executors.  im2col and col2im must write exactly what
 ;;;; segop-interpret writes; the contractions, whose order BLAS chooses,
@@ -4076,9 +4076,9 @@
           (* 4 (max s1 s2))
           (cdr (assq 'conv-scratch-bytes (replay-plan-stats joint))))))))
 
-;;;; Batched GEMM as seg-red
+;;;; Batched GEMM as seg-reduce
 ;;;;
-;;;; A batch-matmul is one seg-red over the frame and (M N K), run cell by
+;;;; A batch-matmul is one seg-reduce over the frame and (M N K), run cell by
 ;;;; cell through one batched gemm-plan.  Forward values are compared, bit
 ;;;; for bit, with realize.  Gradients of framed operands are compared bit
 ;;;; for bit with the 2-D products of their cells.  The gradient of an
@@ -4121,7 +4121,7 @@
 (define (bs-tags prog)
   (filter (lambda (t) (eq? t 'segop/gemm-batched)) (s2-tags prog)))
 
-(test-group "batched GEMM as seg-red"
+(test-group "batched GEMM as seg-reduce"
   (for-each
    (lambda (dt)
      (for-each

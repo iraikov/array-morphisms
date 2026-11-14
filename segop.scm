@@ -12,6 +12,22 @@
 ;;;   * for reductions, a combine spec giving the combining operator, its
 ;;;     neutral element, the accumulator precision and the summation order.
 ;;;
+;;; The design follows the segmented operations of the Futhark compiler's
+;;; internal representation, which expresses parallel code as operations
+;;; (SegMap, SegRed and others) over an iteration space [1, 2].  seg-map
+;;; and seg-reduce take their structure from SegMap and SegRed.  The fusion
+;;; of a map into the reduction that reads it, with the map's value kept as
+;;; an extra output when other code needs it, follows Futhark's redomap
+;;; construct [3].
+;;;
+;;;   [1] T. Henriksen, N. G. Serup, M. Elsman, F. Henglein and
+;;;       C. E. Oancea.  Futhark: Purely Functional GPU-Programming with
+;;;       Nested Parallelism and In-Place Array Updates.  PLDI 2017.
+;;;   [2] T. Henriksen, F. Thoroe, M. Elsman and C. E. Oancea.
+;;;       Incremental Flattening for Nested Data Parallelism.  PPoPP 2019.
+;;;   [3] T. Henriksen, K. F. Larsen and C. E. Oancea.  Design and GPGPU
+;;;       Performance of Futhark's Redomap Construct.  ARRAY 2016.
+;;;
 ;;; The bodies refer to the ops of the scalar-op table by name, so a code
 ;;; generator can read them.  A segop also keeps the Scheme combiner it was
 ;;; lowered from, which host execution uses.
@@ -101,8 +117,8 @@
 
    ;; Segops
    segop segop?
-   seg-map seg-red seg-lib
-   make-seg-map make-seg-red make-seg-lib
+   seg-map seg-reduce seg-lib
+   make-seg-map make-seg-reduce make-seg-lib
    segop-kind
    segop-space
    segop-inputs
@@ -1009,7 +1025,7 @@
       (error 'make-combine-spec "the blocked order needs a positive block size" block-size))
     (%make-combine-spec op neutral acc-dtype order (and (eq? order 'blocked) block-size)))
 
-;; One reduced value of a seg-red.
+;; One reduced value of a seg-reduce.
 ;;   out:      the output operand; its map uses only the parallel dimensions.
 ;;   body:     value at each point before combining.
 ;;   combine:  a combine-spec.
@@ -1040,7 +1056,7 @@
   ;; are reduced (r) and the others are parallel (p).  map-outs is a list of
   ;; (operand . body) pairs written at every point of the space during the
   ;; same pass.
-  (seg-red
+  (seg-reduce
     (space    space-vector?)
     (nred     exact-integer?)
     (ins      list?)
@@ -1054,7 +1070,9 @@
     (name  symbol?)
     (ins   list?)
     (outs  list?)
-    (attrs list?)))
+    (attrs list?))
+  
+  )
 
 (define (check-operands who ops space-rank)
   (for-each
@@ -1096,49 +1114,49 @@
     (for-each (lambda (b) (check-body 'make-seg-map b (length ins) rank #f)) bodies)
     (seg-map space ins outs bodies fallback)))
 
-(define (make-seg-red space nred ins results #!optional (map-outs '()) (fallback #f))
-  "A seg-red over space whose last nred dimensions are reduced.  results is
+(define (make-seg-reduce space nred ins results #!optional (map-outs '()) (fallback #f))
+  "A seg-reduce over space whose last nred dimensions are reduced.  results is
    a non-empty list of red-result records.  An output map, and the map of an
    input read in a finalize body, may use only the parallel dimensions."
   (let* ((rank (and (space-vector? space) (vector-length space)))
          (npar (and rank (exact-integer? nred) (- rank nred))))
-    (unless rank (error 'make-seg-red "space must be a vector of extents" space))
+    (unless rank (error 'make-seg-reduce "space must be a vector of extents" space))
     (unless (and npar (<= 0 nred rank))
-      (error 'make-seg-red "nred must be between 0 and the space rank" nred rank))
-    (when (null? results) (error 'make-seg-red "a seg-red needs at least one result"))
-    (check-operands 'make-seg-red ins rank)
+      (error 'make-seg-reduce "nred must be between 0 and the space rank" nred rank))
+    (when (null? results) (error 'make-seg-reduce "a seg-reduce needs at least one result"))
+    (check-operands 'make-seg-reduce ins rank)
     (let ((par-space (subvector space 0 npar)))
       (define (parallel-only? m)
         (let ((dims (index-map-dims m)))
           (and dims (every (lambda (d) (< d npar)) dims))))
       (for-each
        (lambda (r)
-         (unless (red-result? r) (error 'make-seg-red "not a red-result" r))
+         (unless (red-result? r) (error 'make-seg-reduce "not a red-result" r))
          (unless (combine-spec? (red-result-combine r))
-           (error 'make-seg-red "not a combine spec" (red-result-combine r)))
+           (error 'make-seg-reduce "not a combine spec" (red-result-combine r)))
          (let ((o (red-result-out r)))
-           (check-operands 'make-seg-red (list o) rank)
+           (check-operands 'make-seg-reduce (list o) rank)
            (unless (parallel-only? (segop-operand-map o))
-             (error 'make-seg-red "an output map may use only the parallel dimensions"
+             (error 'make-seg-reduce "an output map may use only the parallel dimensions"
                     (segop-operand-map o)))
-           (check-output 'make-seg-red o par-space))
-         (check-body 'make-seg-red (red-result-body r) (length ins) rank #f)
+           (check-output 'make-seg-reduce o par-space))
+         (check-body 'make-seg-reduce (red-result-body r) (length ins) rank #f)
          (let ((fin (red-result-finalize r)))
            (when fin
-             (check-body 'make-seg-red fin (length ins) npar #t)
+             (check-body 'make-seg-reduce fin (length ins) npar #t)
              (for-each (lambda (k)
                          (unless (parallel-only? (segop-operand-map (list-ref ins k)))
-                           (error 'make-seg-red
+                           (error 'make-seg-reduce
                                   "a finalize input may use only the parallel dimensions" k)))
                        (scalar-expr-inputs fin)))))
        results)
       (for-each (lambda (mo)
-                  (unless (pair? mo) (error 'make-seg-red "map-outs entries are (operand . body)" mo))
-                  (check-operands 'make-seg-red (list (car mo)) rank)
-                  (check-output 'make-seg-red (car mo) space)
-                  (check-body 'make-seg-red (cdr mo) (length ins) rank #f))
+                  (unless (pair? mo) (error 'make-seg-reduce "map-outs entries are (operand . body)" mo))
+                  (check-operands 'make-seg-reduce (list (car mo)) rank)
+                  (check-output 'make-seg-reduce (car mo) space)
+                  (check-body 'make-seg-reduce (cdr mo) (length ins) rank #f))
                 map-outs))
-    (seg-red space nred ins results map-outs fallback)))
+    (seg-reduce space nred ins results map-outs fallback)))
 
 (define (make-seg-lib name ins outs attrs)
   "A named library operation (seg-lib) with operands ins and outs and the
@@ -1147,32 +1165,32 @@
   (seg-lib name ins outs attrs))
 
 (define (segop-kind s)
-  "seg-map, seg-red or seg-lib."
+  "seg-map, seg-reduce or seg-lib."
   (cases segop s
     (seg-map (space ins outs bodies fallback) 'seg-map)
-    (seg-red (space nred ins results map-outs fallback) 'seg-red)
+    (seg-reduce (space nred ins results map-outs fallback) 'seg-reduce)
     (seg-lib (name ins outs attrs) 'seg-lib)))
 
 (define (segop-space s)
   "The iteration space of s, or #f for a seg-lib."
   (cases segop s
     (seg-map (space ins outs bodies fallback) space)
-    (seg-red (space nred ins results map-outs fallback) space)
+    (seg-reduce (space nred ins results map-outs fallback) space)
     (seg-lib (name ins outs attrs) #f)))
 
 (define (segop-inputs s)
   "The input operands of s."
   (cases segop s
     (seg-map (space ins outs bodies fallback) ins)
-    (seg-red (space nred ins results map-outs fallback) ins)
+    (seg-reduce (space nred ins results map-outs fallback) ins)
     (seg-lib (name ins outs attrs) ins)))
 
 (define (segop-outputs s)
-  "The output operands of s; for a seg-red, the result outputs followed by
+  "The output operands of s; for a seg-reduce, the result outputs followed by
    the map outputs."
   (cases segop s
     (seg-map (space ins outs bodies fallback) outs)
-    (seg-red (space nred ins results map-outs fallback)
+    (seg-reduce (space nred ins results map-outs fallback)
       (append (map red-result-out results) (map car map-outs)))
     (seg-lib (name ins outs attrs) outs)))
 
@@ -1180,7 +1198,7 @@
   "The Scheme procedure s was lowered from, or #f."
   (cases segop s
     (seg-map (space ins outs bodies fallback) fallback)
-    (seg-red (space nred ins results map-outs fallback) fallback)
+    (seg-reduce (space nred ins results map-outs fallback) fallback)
     (seg-lib (name ins outs attrs) #f)))
 
 
@@ -1242,7 +1260,7 @@
 
 (define (segop-interpret s in-bufs out-bufs #!key (params '#()) (use-fallback #f))
   "Execute s directly from its definition.  in-bufs and out-bufs are lists
-   of SRFI-4 vectors, one per input and output operand (for a seg-red, the
+   of SRFI-4 vectors, one per input and output operand (for a seg-reduce, the
    result outputs then the map outputs), laid out as the operands describe.
    params is the vector of runtime parameters.  A seg-map with a fallback
    uses it instead of its body when use-fallback is true or when an
@@ -1265,7 +1283,7 @@
                                   bodies))))
               (for-each (lambda (o buf v) (write-operand! o buf coords v)) outs out-bufs vals))))))
 
-    (seg-red (space nred ins results map-outs fallback)
+    (seg-reduce (space nred ins results map-outs fallback)
       (let* ((rank (vector-length space))
              (npar (- rank nred))
              (in-v (list->vector in-bufs))
@@ -1329,7 +1347,7 @@
 ;;;; Segop templates
 ;;;; ============================================================
 
-;; A layout-free description of a seg-map or a seg-red, for questions
+;; A layout-free description of a seg-map or a seg-reduce, for questions
 ;; asked before the arrays exist, such as whether a backend could run it
 ;; natively.  ins lists one template-input per input: its dtype, the index
 ;; map from the space to its index, and whether its layout is expected to

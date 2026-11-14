@@ -9,7 +9,7 @@
 ;;;   Group 2 - Index maps: constructors, linear form, composition
 ;;;   Group 3 - Scalar expressions
 ;;;   Group 4 - seg-map interpretation
-;;;   Group 5 - seg-red interpretation
+;;;   Group 5 - seg-reduce interpretation
 ;;;   Group 6 - Construction checks
 ;;;   Group 7 - Backend registry
 ;;;   Plan contexts and executor cells
@@ -383,18 +383,18 @@
     (test "a rank-0 space has one point" 4.0 (f64vector-ref out 0))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Group 5 - seg-red interpretation
+;;; Group 5 - seg-reduce interpretation
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; A seg-red summing a [rows cols] array over axis 0 (space (cols rows),
+;; A seg-reduce summing a [rows cols] array over axis 0 (space (cols rows),
 ;; the input read transposed) with one result.
 (define (sg-col-sum dtype rows cols spec #!optional (finalize #f))
-  (make-seg-red (vector cols rows) 1
-                (list (sg-op dtype (vector rows cols) (permutation-index-map '(1 0))))
-                (list (make-red-result (sg-op dtype (vector cols) (identity-index-map 1))
-                                       '(in 0) spec finalize))))
+  (make-seg-reduce (vector cols rows) 1
+                   (list (sg-op dtype (vector rows cols) (permutation-index-map '(1 0))))
+                   (list (make-red-result (sg-op dtype (vector cols) (identity-index-map 1))
+                                          '(in 0) spec finalize))))
 
-(test-group "seg-red interpretation"
+(test-group "seg-reduce interpretation"
   ;; 1e8 followed by ones: in single precision each 1 is lost (1e8 + 1
   ;; rounds back to 1e8), in double precision they are kept until the end.
   (let* ((rows 9) (data (sg-f32 (cons 1e8 (make-list (- rows 1) 1.0))))
@@ -440,12 +440,12 @@
   (let* ((data (sg-f64 '(1 2 3 4 5 6)))
          (sum (make-f64vector 2)) (sq (make-f64vector 2)) (squares (make-f64vector 6))
          (in (sg-op 'f64 #(2 3) (identity-index-map 2)))
-         (sr (make-seg-red #(2 3) 1 (list in)
-                           (list (make-red-result (sg-op 'f64 #(2) (identity-index-map 1))
-                                                  '(in 0) (make-combine-spec 'add 0.0 'f64) #f)
-                                 (make-red-result (sg-op 'f64 #(2) (identity-index-map 1))
-                                                  '(mul (in 0) (in 0)) (make-combine-spec 'add 0.0 'f64) #f))
-                           (list (cons (sg-op 'f64 #(2 3) (identity-index-map 2)) '(mul (in 0) (in 0)))))))
+         (sr (make-seg-reduce #(2 3) 1 (list in)
+                              (list (make-red-result (sg-op 'f64 #(2) (identity-index-map 1))
+                                                     '(in 0) (make-combine-spec 'add 0.0 'f64) #f)
+                                    (make-red-result (sg-op 'f64 #(2) (identity-index-map 1))
+                                                     '(mul (in 0) (in 0)) (make-combine-spec 'add 0.0 'f64) #f))
+                              (list (cons (sg-op 'f64 #(2 3) (identity-index-map 2)) '(mul (in 0) (in 0)))))))
     (segop-interpret sr (list data) (list sum sq squares))
     (test "first result: row sums" '(6.0 15.0) (f64vector->list sum))
     (test "second result: row sums of squares" '(14.0 77.0) (f64vector->list sq))
@@ -456,33 +456,33 @@
          (B (sg-f64 '(1 0 2 1 -1 1)))      ; [3 2]
          (bias (sg-f64 '(0.5 -10)))         ; [2]
          (out (make-f64vector 4))
-         (sr (make-seg-red #(2 2 3) 1
-                           (list (sg-op 'f64 #(2 3) (permutation-index-map '(0 2)))
-                                 (sg-op 'f64 #(3 2) (permutation-index-map '(2 1)))
-                                 (sg-op 'f64 #(2) (make-index-map #((dim 1)) #f 0.0 #f)))
-                           (list (make-red-result (sg-op 'f64 #(2 2) (identity-index-map 2))
-                                                  '(mul (in 0) (in 1))
-                                                  (make-combine-spec 'add 0.0 'f64 'unspecified)
-                                                  '(relu (add (reduced) (in 2))))))))
+         (sr (make-seg-reduce #(2 2 3) 1
+                              (list (sg-op 'f64 #(2 3) (permutation-index-map '(0 2)))
+                                    (sg-op 'f64 #(3 2) (permutation-index-map '(2 1)))
+                                    (sg-op 'f64 #(2) (make-index-map #((dim 1)) #f 0.0 #f)))
+                              (list (make-red-result (sg-op 'f64 #(2 2) (identity-index-map 2))
+                                                     '(mul (in 0) (in 1))
+                                                     (make-combine-spec 'add 0.0 'f64 'unspecified)
+                                                     '(relu (add (reduced) (in 2))))))))
     (segop-interpret sr (list A B bias) (list out))
     (test "a GEMM with a bias and relu epilogue" '(0.0 0.0 5.5 0.0)
       (f64vector->list out)))
 
   (let* ((out (make-f64vector 2 9.0))
-         (sr (make-seg-red #(2 0) 1 (list (sg-op 'f64 #(2 0) (identity-index-map 2)))
-                           (list (make-red-result (sg-op 'f64 #(2) (identity-index-map 1))
-                                                  '(in 0) (make-combine-spec 'add 0.0 'f64) #f)))))
+         (sr (make-seg-reduce #(2 0) 1 (list (sg-op 'f64 #(2 0) (identity-index-map 2)))
+                              (list (make-red-result (sg-op 'f64 #(2) (identity-index-map 1))
+                                                     '(in 0) (make-combine-spec 'add 0.0 'f64) #f)))))
     (segop-interpret sr (list (make-f64vector 0)) (list out))
     (test "an empty reduction gives the neutral element" '(0.0 0.0) (f64vector->list out)))
 
   (let* ((data (sg-f64 '(2 3 4)))
          (out (make-f64vector 1))
-         (sr (make-seg-red #(3) 1 (list (sg-op 'f64 #(3) (identity-index-map 1)))
-                           (list (make-red-result (sg-op 'f64 #() (identity-index-map 0))
-                                                  '(in 0)
-                                                  (make-combine-spec (list 'opaque (lambda (a b) (+ (* 10.0 a) b)))
-                                                                     0.0 'f64)
-                                                  #f)))))
+         (sr (make-seg-reduce #(3) 1 (list (sg-op 'f64 #(3) (identity-index-map 1)))
+                              (list (make-red-result (sg-op 'f64 #() (identity-index-map 0))
+                                                     '(in 0)
+                                                     (make-combine-spec (list 'opaque (lambda (a b) (+ (* 10.0 a) b)))
+                                                                        0.0 'f64)
+                                                     #f)))))
     (segop-interpret sr (list data) (list out))
     (test "an opaque combine op, full reduction to rank 0" 234.0 (f64vector-ref out 0))))
 
@@ -505,17 +505,17 @@
                    (max (max -inf.0 3.0) -1.0)))))
   (let* ((data (list->s32vector '(3 -1 4 1 -5 9)))
          (out (make-s32vector 3 0))
-         (sr (make-seg-red #(3 2) 1
-                           (list (sg-op 's32 #(2 3) (permutation-index-map '(1 0))))
-                           (list (make-red-result (sg-op 's32 #(3) (identity-index-map 1)) '(in 0)
-                                                  (make-combine-spec 'max (- (expt 2 31)) 's32) #f)))))
+         (sr (make-seg-reduce #(3 2) 1
+                              (list (sg-op 's32 #(2 3) (permutation-index-map '(1 0))))
+                              (list (make-red-result (sg-op 's32 #(3) (identity-index-map 1)) '(in 0)
+                                                     (make-combine-spec 'max (- (expt 2 31)) 's32) #f)))))
     (segop-interpret sr (list data) (list out))
     (test "an integer accumulator starting at the dtype minimum" '(3 -1 9) (s32vector->list out)))
   (let* ((data (sg-f64 '(0.75 0.75 0.75)))
          (out (make-f64vector 1))
-         (sr (make-seg-red #(3) 1 (list (sg-op 'f64 #(3) (identity-index-map 1)))
-                           (list (make-red-result (sg-op 'f64 #() (identity-index-map 0)) '(in 0)
-                                                  (make-combine-spec 'add 0.0 's32) #f)))))
+         (sr (make-seg-reduce #(3) 1 (list (sg-op 'f64 #(3) (identity-index-map 1)))
+                              (list (make-red-result (sg-op 'f64 #() (identity-index-map 0)) '(in 0)
+                                                     (make-combine-spec 'add 0.0 's32) #f)))))
     (segop-interpret sr (list data) (list out))
     (test "an integer accumulator truncates after every step" 0.0 (f64vector-ref out 0)))
   (test-error "an unknown accumulator dtype is an error" (make-combine-spec 'add 0.0 'c64)))
@@ -546,15 +546,15 @@
     (test-error "a fallback needs a single output"
       (make-seg-map #(2 3) (list (id2)) (list (id2) (id2)) '((in 0) (in 0)) abs))
     (test-error "nred may not exceed the space rank"
-      (make-seg-red #(2 3) 3 (list (id2)) (list (res (sg-op 'f64 #(2) (identity-index-map 1))))))
-    (test-error "a seg-red needs a result" (make-seg-red #(2 3) 1 (list (id2)) '()))
+      (make-seg-reduce #(2 3) 3 (list (id2)) (list (res (sg-op 'f64 #(2) (identity-index-map 1))))))
+    (test-error "a seg-reduce needs a result" (make-seg-reduce #(2 3) 1 (list (id2)) '()))
     (test-error "an output map may not use a reduced dimension"
-      (make-seg-red #(2 3) 1 (list (id2))
-                    (list (res (sg-op 'f64 #(3) (make-index-map #((dim 1)) #f 0.0 #f))))))
+      (make-seg-reduce #(2 3) 1 (list (id2))
+                       (list (res (sg-op 'f64 #(3) (make-index-map #((dim 1)) #f 0.0 #f))))))
     (test-error "a finalize input may not use a reduced dimension"
-      (make-seg-red #(2 3) 1 (list (id2))
-                    (list (make-red-result (sg-op 'f64 #(2) (identity-index-map 1)) '(in 0)
-                                           (make-combine-spec 'add 0.0 'f64) '(add (reduced) (in 0))))))
+      (make-seg-reduce #(2 3) 1 (list (id2))
+                       (list (make-red-result (sg-op 'f64 #(2) (identity-index-map 1)) '(in 0)
+                                              (make-combine-spec 'add 0.0 'f64) '(add (reduced) (in 0))))))
     (test-error "an unknown combine op" (make-combine-spec 'avg 0.0 'f64))
     (test-error "the blocked order needs a block size" (make-combine-spec 'add 0.0 'f64 'blocked))
     (test-error "an unknown accumulator dtype" (make-combine-spec 'add 0.0 'f16))

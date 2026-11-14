@@ -351,7 +351,7 @@
    templates) to the number of fusions of that class made; candidates, the bodies of the fused seg-maps made, each a list
    (canonical-body dtype count elements): how many bindings have that
    body and dtype, and their total number of elements; red-candidates,
-   the fused seg-reds made, each a list (canonical-body combine-op path
+   the fused seg-reduces made, each a list (canonical-body combine-op path
    map-output? dtype count elements), elements counting the reduced
    values (combine-op and path are gemm for a GEMM epilogue); and missed, an alist from reason to the number of pairs the
    last round left unfused for that reason:
@@ -749,7 +749,7 @@
 ;;; Fusion with reductions
 ;;; ------------------------------------------------------------
 ;;;
-;;; A map P read by a reduction C is fused into it: the fused seg-red
+;;; A map P read by a reduction C is fused into it: the fused seg-reduce
 ;;; computes P's body, rounded to P's dtype, at each point and combines it
 ;;; as the unfused reduction would.  When P has other uses, the fused
 ;;; binding also stores P's value as a map output and takes P's position,
@@ -794,7 +794,7 @@
         (values #f 'gemm-operands))))
 
 ;; The parts of reduction binding r (a reduce binding, a matmul or a fused
-;; seg-red) as a list (inputs space in-maps outs nred src-shape path), outs
+;; seg-reduce) as a list (inputs space in-maps outs nred src-shape path), outs
 ;; in the list form of make-fused-ssa-binding; or #f and the reason r
 ;; cannot be fused.  A reduce binding's source must be expected flat
 ;; (flat?), since its combine spec depends on its layout.
@@ -895,7 +895,7 @@
                           `((src-shape . ,src-shape) (path . ,path))))
 
 (define (fuse-map-into-reduction p parts k kept? members vtab)
-  "The fused seg-red computing map binding p and the reduction whose parts
+  "The fused seg-reduce computing map binding p and the reduction whose parts
    are parts (see reduction-parts), of which p is input k.  When kept? is
    true, p's value is also written, as a map output named after p."
   (let* ((r-ins   (list-ref parts 0))
@@ -937,7 +937,7 @@
      (list-ref parts 4) (list-ref parts 5) (list-ref parts 6) members)))
 
 (define (fuse-epilogue parts c k members vtab)
-  "The fused seg-red computing the reduction whose parts are parts and map
+  "The fused seg-reduce computing the reduction whose parts are parts and map
    binding c, which reads the reduction's result as input k: c's body
    becomes the result's finalize."
   (let* ((r-ins   (list-ref parts 0))
@@ -974,7 +974,7 @@
      (list-ref parts 4) (list-ref parts 5) (list-ref parts 6) members)))
 
 (define (fused-reduction-legal? f)
-  "True when fused seg-red f is within the bounds on the number of inputs
+  "True when fused seg-reduce f is within the bounds on the number of inputs
    and the size of its bodies, finalize bodies included."
   (and (<= (length (ssa-binding-inputs f)) fusion-max-inputs)
        (every (lambda (o)
@@ -2801,10 +2801,10 @@
               (view-fn    (lambda (src) (create-view src index-fn shape batch-axis))))
          (ri-view view-fn (car in-refs))))
 
-      ;; matmul: a seg-red over (M N K), routed to the BLAS backend through
+      ;; matmul: a seg-reduce over (M N K), routed to the BLAS backend through
       ;; a gemm-plan prepared from the trace-time operand layouts (see
       ;; lower-matmul-binding in segop-lower.scm).
-      ;; batch-matmul: a seg-red over the frame and (M N K), with one
+      ;; batch-matmul: a seg-reduce over the frame and (M N K), with one
       ;; gemm-plan for every cell (see lower-batch-matmul-binding).
       ((eq? op 'batch-matmul)
        (or (compile-batch-matmul-segop (trace-arr-of (car  (ssa-binding-inputs b)))
@@ -3258,7 +3258,7 @@
                               (when (memq tag '(segop/strided-map segop/gather
                                                 segop/host-index-fn segop/interpreted))
                                 (stack-push! index-shapes (cons i shape)))
-                              (let ((r (and (eq? (segop-kind sg) 'seg-red) (standard-reduction sg))))
+                              (let ((r (and (eq? (segop-kind sg) 'seg-reduce) (standard-reduction sg))))
                                 (when r
                                   (stack-push! reduce-specs (list i (cadr r) (caddr r) shape))))
                               (let ((g (conv-segop-geom sg)))

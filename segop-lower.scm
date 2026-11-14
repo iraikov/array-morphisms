@@ -3,8 +3,8 @@
 ;;; Lowering of SSA bindings to segops, and the two built-in segop
 ;;; backends that turn them into replay executors.  Included into the
 ;;; array-morphisms-ssa module.  Element-wise bindings become seg-maps,
-;;; reductions and matmuls seg-reds, affine views gathers, and the
-;;; convolution ops seg-maps and seg-reds with guarded maps; other index
+;;; reductions and matmuls seg-reduces, affine views gathers, and the
+;;; convolution ops seg-maps and seg-reduces with guarded maps; other index
 ;;; functions run on the host through a seg-lib.
 ;;;
 ;;; An element-wise binding becomes a seg-map over the binding's shape.
@@ -130,11 +130,11 @@
 ;;; ------------------------------------------------------------
 ;;;
 ;;; A fused binding (op fused) computes several bindings in one seg-map or
-;;; one seg-red.  Its template holds the iteration space, one index map per
+;;; one seg-reduce.  Its template holds the iteration space, one index map per
 ;;; input (from the space to the input's index, without a layout), the
 ;;; outputs, the binding's own result first, and nred, the number of
 ;;; trailing dimensions of the space that are reduced (0 for a seg-map).
-;;; A seg-red lists its reduced results before its map outputs.
+;;; A seg-reduce lists its reduced results before its map outputs.
 ;;;
 ;;; Layouts are attached when the template is lowered against arrays: the
 ;;; trace-time arrays when a plan is compiled, the input arrays when the
@@ -152,7 +152,7 @@
   (or (fused-out-map o) (identity-index-map (vector-length (fused-out-shape o)))))
 
 (define (lower-fused-binding tpl in-arrs in-slots out-slots)
-  "The seg-map or seg-red of fusion template tpl reading the concrete
+  "The seg-map or seg-reduce of fusion template tpl reading the concrete
    arrays in-arrs (for their layouts), found at in-slots, and writing
    out-slots, one slot per output.  A seg-map with a single output keeps
    its compiled body as the fallback."
@@ -184,9 +184,9 @@
               (begin
                 (when (any fused-out-red os)
                   (error "lower-fused-binding: reduced results must come before map outputs"))
-                (make-seg-red space nred ins (reverse results)
-                              (map (lambda (o slot) (cons (out-op o slot) (fused-out-body o)))
-                                   os slots)))))))))
+                (make-seg-reduce space nred ins (reverse results)
+                                 (map (lambda (o slot) (cons (out-op o slot) (fused-out-body o)))
+                                      os slots)))))))))
 
 ;;; ------------------------------------------------------------
 ;;; Operand patterns
@@ -437,7 +437,7 @@
 
 (define (lower-reduction-binding rop axes keepdims? src-tr in-ref pool-idx shape strides dtype
                                  #!optional (frame-rank 0))
-  "The seg-red of reduction rop over axes (with keepdims?) of the trace-time
+  "The seg-reduce of reduction rop over axes (with keepdims?) of the trace-time
    source array src-tr, found at in-ref at replay, writing pool slot
    pool-idx of the given shape, strides and dtype.  The space lists the
    kept axes, then the reduced axes in increasing order.  Its combine spec
@@ -488,13 +488,13 @@
                           (identity-index-map (length par))))
              (count (fold (lambda (k acc) (* acc (vector-ref s k))) 1 red))
              (path  (framed-path rop s st off sdt red frame-rank)))
-        (make-seg-red space (length red)
-                      (list (make-segop-operand in-ref sdt s st off in-map))
-                      (list (make-red-result
-                             (make-segop-operand pool-idx dtype shape strides 0 out-map)
-                             '(in 0)
-                             (reduction-combine-spec rop path sdt dtype)
-                             (and (eq? rop 'mean) `(/ (reduced) ,count))))))))))
+        (make-seg-reduce space (length red)
+                         (list (make-segop-operand in-ref sdt s st off in-map))
+                         (list (make-red-result
+                                (make-segop-operand pool-idx dtype shape strides 0 out-map)
+                                '(in 0)
+                                (reduction-combine-spec rop path sdt dtype)
+                                (and (eq? rop 'mean) `(/ (reduced) ,count))))))))))
     (else (error "lower-reduction-binding: source not concrete" src-tr))))
 
 ;; The axes in increasing order.
@@ -502,11 +502,11 @@
   (filter (lambda (k) (memv k axes)) (iota (+ 1 (fold max -1 axes)))))
 
 (define (standard-reduction sg)
-  "The parameters of execute-reduction-morphism that compute seg-red sg, as
+  "The parameters of execute-reduction-morphism that compute seg-reduce sg, as
    a list (rop axes keepdims? reducer src-operand path), or #f when sg is not
    in the form lower-reduction-binding produces, combine spec included."
   (cases segop sg
-    (seg-red (space nred ins results map-outs fallback)
+    (seg-reduce (space nred ins results map-outs fallback)
       (and
        (= (length ins) 1) (= (length results) 1) (null? map-outs)
        (let* ((src  (car ins))
@@ -603,7 +603,7 @@
     (and r
          (memq (list-ref r 5) paths)
          (let ((out (red-result-out (car (cases segop sg
-                                            (seg-red (space nred ins results map-outs fallback) results)
+                                            (seg-reduce (space nred ins results map-outs fallback) results)
                                             (else '()))))))
            (case (list-ref r 5)
              ((rows-1d)
@@ -851,7 +851,7 @@
 ;;; Strided reductions
 ;;; ------------------------------------------------------------
 ;;;
-;;; A seg-red that is not a standard reduction, such as a fused one, runs
+;;; A seg-reduce that is not a standard reduction, such as a fused one, runs
 ;;; on the host with compiled bodies when every operand has a linear form.
 ;;; It visits the points in the order segop-interpret does and rounds as it
 ;;; does, so the two agree bit for bit.  A map output whose body is the
@@ -948,7 +948,7 @@
 
 (define (strided-red-select sg)
   (cases segop sg
-    (seg-red (space nred ins results map-outs fallback)
+    (seg-reduce (space nred ins results map-outs fallback)
       (let ((rank (vector-length space)))
         (and (all-linear? (append ins (map red-result-out results) (map car map-outs)) rank)
              (every (lambda (o) (memq (segop-operand-dtype o) '(f32 f64 s32 s64 u32 u64)))
@@ -956,11 +956,11 @@
              (cons 'segop/strided-red (strided-red-executor space nred ins results map-outs)))))
     (else #f)))
 
-;; The last resort: evaluate a seg-map or a seg-red with the reference
+;; The last resort: evaluate a seg-map or a seg-reduce with the reference
 ;; interpreter.  The executor of a segop with several outputs takes the
 ;; buffers of the outputs after the first as a list.
 (define (interpreted-select sg)
-  (and (memq (segop-kind sg) '(seg-map seg-red))
+  (and (memq (segop-kind sg) '(seg-map seg-reduce))
        (let ((refs (map segop-operand-slot (segop-inputs sg))))
          (cons 'segop/interpreted
                (lambda (deref buf #!optional (extra-bufs '()))
@@ -971,7 +971,7 @@
 ;;; Contractions
 ;;; ------------------------------------------------------------
 ;;;
-;;; A matmul A[M,K] x B[K,N] becomes a seg-red over the space (M N K) with
+;;; A matmul A[M,K] x B[K,N] becomes a seg-reduce over the space (M N K) with
 ;;; K reduced.  A is read through #((dim 0) (dim 2)) and B through
 ;;; #((dim 2) (dim 1)), each with the layout of its trace-time array, so a
 ;;; transposed view is described by its strides.  The body is
@@ -985,9 +985,9 @@
 ;;; A GEMM can absorb the element-wise bindings that consume its product
 ;;; (the epilogue): the finalize is the epilogue's body with its input 0
 ;;; replaced by (cast dtype (reduced)), the product as stored in the output,
-;;; and its other inputs appended to the seg-red's inputs.  The seg-red's
+;;; and its other inputs appended to the seg-reduce's inputs.  The seg-reduce's
 ;;; fallback is the epilogue's combiner, which the executor applies to the
-;;; stored product in place.  The fusion pass makes such seg-reds from
+;;; stored product in place.  The fusion pass makes such seg-reduces from
 ;;; fusion templates whose result has red (gemm . finalize).
 
 (define gemm-A-exprs '#((dim 0) (dim 2)))
@@ -1025,11 +1025,11 @@
 
 (define (lower-matmul-binding A-tr B-tr A-ref B-ref pool-idx shape strides dtype
                               #!optional (epilogue #f))
-  "The seg-red of the matmul of the trace-time arrays A-tr and B-tr, found
+  "The seg-reduce of the matmul of the trace-time arrays A-tr and B-tr, found
    at A-ref and B-ref, writing pool slot pool-idx of the given shape,
    strides and dtype; #f when blas-exec cannot multiply them.  epilogue is
    #f or the single-output seg-map of an element-wise binding whose input 0
-   is the product; the seg-red then computes that binding's output, in the
+   is the product; the seg-reduce then computes that binding's output, in the
    epilogue's output slot."
   (let ((operand (lambda (tr ref exprs)
                    (cases array-morphism tr
@@ -1052,20 +1052,20 @@
              (if epilogue
                  (cases segop epilogue
                    (seg-map (e-space e-ins e-outs e-bodies e-fallback)
-                     (make-seg-red space 1 (append (list A B) (cdr e-ins))
-                                   (list (make-red-result
-                                          (out (segop-operand-slot (car e-outs)))
-                                          gemm-body spec
-                                          (scalar-expr-substitute-inputs
-                                           (car e-bodies)
-                                           (lambda (k) (if (= k 0) `(cast ,dtype (reduced)) `(in ,(+ k 1)))))))
-                                   '() e-fallback))
+                     (make-seg-reduce space 1 (append (list A B) (cdr e-ins))
+                                      (list (make-red-result
+                                             (out (segop-operand-slot (car e-outs)))
+                                             gemm-body spec
+                                             (scalar-expr-substitute-inputs
+                                              (car e-bodies)
+                                              (lambda (k) (if (= k 0) `(cast ,dtype (reduced)) `(in ,(+ k 1)))))))
+                                      '() e-fallback))
                    (else #f))
-                 (make-seg-red space 1 (list A B)
-                               (list (make-red-result (out pool-idx) gemm-body spec #f)))))))))
+                 (make-seg-reduce space 1 (list A B)
+                                  (list (make-red-result (out pool-idx) gemm-body spec #f)))))))))
 
 (define (standard-gemm sg)
-  "The GEMM that computes seg-red sg, as a list
+  "The GEMM that computes seg-reduce sg, as a list
    (A B out kind plan epilogue op), or #f when sg is not in the form
    lower-matmul-binding produces, combine spec included.  kind is gemm or
    gemm-strided and plan the gemm-plan for the operands; epilogue is #f,
@@ -1074,7 +1074,7 @@
    op is the op of an epilogue that applies one op to the product and its
    other inputs, in that order, and #f otherwise."
   (cases segop sg
-    (seg-red (space nred ins results map-outs fallback)
+    (seg-reduce (space nred ins results map-outs fallback)
       (and
        (= (vector-length space) 3) (= nred 1) (= (length results) 1) (null? map-outs)
        (>= (length ins) 2)
@@ -1218,7 +1218,7 @@
 ;;; Batched contractions
 ;;; ------------------------------------------------------------
 ;;;
-;;; A batched matmul with frame F (rank f) becomes a seg-red over the space
+;;; A batched matmul with frame F (rank f) becomes a seg-reduce over the space
 ;;; F ++ (M N K) with K reduced.  A framed operand is read through the frame
 ;;; dimensions followed by the 2-D GEMM map, (dim f) (dim f+2) for A and
 ;;; (dim f+2) (dim f+1) for B; an operand shared by every cell is read
@@ -1236,7 +1236,7 @@
   (list->vector (frame-dim-exprs (+ f 2))))
 
 (define (lower-batch-matmul-binding A-tr B-tr A-ref B-ref pool-idx shape strides dtype)
-  "The seg-red of the batched matmul of the trace-time arrays A-tr and B-tr,
+  "The seg-reduce of the batched matmul of the trace-time arrays A-tr and B-tr,
    found at A-ref and B-ref, writing pool slot pool-idx of the given shape,
    strides and dtype; #f when blas-exec cannot multiply them."
   (and (batch-matmul-concrete? A-tr B-tr)
@@ -1262,18 +1262,18 @@
               (out  (make-segop-operand pool-idx dtype shape strides 0
                                         (make-index-map (batched-out-exprs f) #f 0.0 #f))))
          (and plan
-              (make-seg-red space 1 (list A B)
-                            (list (make-red-result out gemm-body
-                                                   (gemm-combine-spec (batched-gemm-plan-cell plan)
-                                                                      dtype)
-                                                   #f)))))))
+              (make-seg-reduce space 1 (list A B)
+                               (list (make-red-result out gemm-body
+                                                      (gemm-combine-spec (batched-gemm-plan-cell plan)
+                                                                         dtype)
+                                                      #f)))))))
 
 (define (standard-batched-gemm sg)
-  "The batched GEMM that computes seg-red sg, as a list (A B out plan),
+  "The batched GEMM that computes seg-reduce sg, as a list (A B out plan),
    or #f when sg is not in the form lower-batch-matmul-binding produces,
    combine spec included.  plan is the batched-gemm-plan for the operands."
   (cases segop sg
-    (seg-red (space nred ins results map-outs fallback)
+    (seg-reduce (space nred ins results map-outs fallback)
       (and
        (>= (vector-length space) 4) (= nred 1) (= (length results) 1) (null? map-outs)
        (= (length ins) 2)
@@ -1351,7 +1351,7 @@
           (else (scalar-expr->procedure e n)))))
 
 (define (lower-gemm-template tpl in-arrs in-slots out-slot)
-  "The seg-red of fusion template tpl, whose result is a GEMM product
+  "The seg-reduce of fusion template tpl, whose result is a GEMM product
    with its epilogue as finalize: the product of the first two arrays of
    in-arrs, with the epilogue applied to it in place, written to pool slot
    out-slot.  The other arrays are the epilogue's inputs, read through
@@ -1499,7 +1499,7 @@
 ;;; Fused column sums
 ;;; ------------------------------------------------------------
 ;;;
-;;; A seg-red that sums a body over the rows of rows x cols arrays and
+;;; A seg-reduce that sums a body over the rows of rows x cols arrays and
 ;;; also stores the body's values runs as a column-sum kernel of the
 ;;; active activation backend (tag segop/colsum-kernel), when the backend
 ;;; holds one for the canonical body.  Its space is (cols rows), with the
@@ -1550,7 +1550,7 @@
 
 (define (registry-colsum-select sg)
   (cases segop sg
-    (seg-red (space nred ins results map-outs fallback)
+    (seg-reduce (space nred ins results map-outs fallback)
       (and (= nred 1)
            (= (vector-length space) 2)
            (= (length results) 1)
@@ -1604,13 +1604,13 @@
 ;;;   im2col            seg-map over (N C KH KW OH OW):
 ;;;                     col[n, fan, oh*OW + ow] = x[n, c, ih, iw], or 0
 ;;;                     where (ih, iw) is outside the image
-;;;   col2im            seg-red over (N C H W ; KH KW):
+;;;   col2im            seg-reduce over (N C H W ; KH KW):
 ;;;                     x[n, c, h, w] = sum of col[n, fan, oh*OW + ow]
-;;;   conv-fwd          seg-red over (N OH OW CO ; C KH KW):
+;;;   conv-fwd          seg-reduce over (N OH OW CO ; C KH KW):
 ;;;                     y[row, co] = b[co] + sum of x[n, c, ih, iw] * wt[fan, co]
-;;;   conv-bwd-weights  seg-red over (C KH KW CO ; N OH OW):
+;;;   conv-bwd-weights  seg-reduce over (C KH KW CO ; N OH OW):
 ;;;                     dwt[fan, co] = sum of g[row, co] * x[n, c, ih, iw]
-;;;   conv-bwd-data     seg-red over (N C H W ; KH KW CO):
+;;;   conv-bwd-data     seg-reduce over (N C H W ; KH KW CO):
 ;;;                     dx[n, c, h, w] = sum of g[row, co] * wt[fan, co]
 ;;;
 ;;; with fan = c*KH*KW + kh*KW + kw, row = n*OH*OW + oh*OW + ow,
@@ -1738,8 +1738,8 @@
          (out    (with-map out (list-ref sk 3))))
     (if (= (list-ref sk 1) 0)
         (make-seg-map (list-ref sk 0) ins (list out) (list (list-ref sk 4)))
-        (make-seg-red (list-ref sk 0) (list-ref sk 1) ins
-                      (list (make-red-result out (list-ref sk 4) (list-ref sk 5) (list-ref sk 6)))))))
+        (make-seg-reduce (list-ref sk 0) (list-ref sk 1) ins
+                         (list (make-red-result out (list-ref sk 4) (list-ref sk 5) (list-ref sk 6)))))))
 
 ;; The geometry of a convolution binding with op op and meta meta, whose
 ;; inputs had the trace-time shapes in-shapes and whose output has shape
@@ -1888,7 +1888,7 @@
            (seg-map (space ins outs bodies fallback)
              (and (= (list-ref sk 1) 0) (= (length outs) 1)
                   (equal? bodies (list (list-ref sk 4)))))
-           (seg-red (space nred ins results map-outs fallback)
+           (seg-reduce (space nred ins results map-outs fallback)
              (and (= nred (list-ref sk 1)) (= (length results) 1) (null? map-outs)
                   (let ((r (car results)))
                     (and (equal? (red-result-body r) (list-ref sk 4))
@@ -1900,7 +1900,7 @@
   "The geometry of the convolution segop sg, or #f when sg is not one."
   (let ((kinds (cases segop sg
                  (seg-map (space ins outs bodies fallback) '(im2col))
-                 (seg-red (space nred ins results map-outs fallback)
+                 (seg-reduce (space nred ins results map-outs fallback)
                    (case nred ((2) '(col2im)) ((3) '(conv-fwd conv-bwd-weights conv-bwd-data)) (else '())))
                  (else '()))))
     (any (lambda (kind)

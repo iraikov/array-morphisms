@@ -517,7 +517,7 @@ represented as *segmented operations* (segops,
 - the Scheme function it was lowered from, used to execute it on the host.
 
 There are three kinds: `seg-map` (element-wise maps, possibly with several
-outputs), `seg-red` (reductions, with a combine spec giving the operator,
+outputs), `seg-reduce` (reductions, with a combine spec giving the operator,
 neutral element, accumulator precision and summation order) and `seg-lib`
 (named library operations, such as an index function run on the host).
 Index maps cover identities, broadcasts, transposes, slices, reshapes
@@ -528,8 +528,8 @@ compile a kernel.
 The segop abstractions are inspired by and follow the design of the
 Futhark compiler [1, 2]. Futhark's internal representation expresses
 parallel code as segmented operations (`SegMap`, `SegRed` and others)
-over an iteration space, and `seg-map` and `seg-red` take their names
-and structure from them. The fusion of a map into the reduction that
+over an iteration space, and `seg-map` and `seg-reduce` take their
+structure from `SegMap` and `SegRed`. The fusion of a map into the reduction that
 reads it, with the map's value kept as an extra output when other code
 needs it, follows Futhark's *redomap* construct [3].
 
@@ -541,7 +541,7 @@ entry gives an op's parameters and formula. The combiners of
 table at compile time to generate its kernels, so all of them compute the
 same formula.
 
-`segop-interpret` executes any `seg-map` or `seg-red` directly from its
+`segop-interpret` executes any `seg-map` or `seg-reduce` directly from its
 definition. It is slow and is meant for testing.
 
 When a replay plan is compiled, every binding except zero-copy views is
@@ -550,10 +550,10 @@ lowered to a segop:
 - element-wise ops become a `seg-map` whose inputs are read through
   broadcast maps and their own strides, so transposed views are read in
   place;
-- reductions become a `seg-red`, whose combine spec records how the
+- reductions become a `seg-reduce`, whose combine spec records how the
   reduction loop rounds: f32 sums over axis 0 round after every step, sums
   over axis 1 accumulate in double precision, and so on;
-- a matrix product `A[M,K] B[K,N]` becomes a `seg-red` over `(M N K)` with
+- a matrix product `A[M,K] B[K,N]` becomes a `seg-reduce` over `(M N K)` with
   the body `(mul (in 0) (in 1))`; transposed operands are described by their
   strides. Its combine spec sums in the BLAS backend's order when the
   prepared plan calls a kernel, and otherwise in increasing k with a double
@@ -565,7 +565,7 @@ lowered to a segop:
   gather, a `seg-map` with the body `(in 0)`;
 - the convolution ops become segops over spaces with one dimension per
   loop index: `im2col` is a `seg-map` reading the image through a padded
-  map, `col2im` a `seg-red` that gathers the windows covering each pixel,
+  map, `col2im` a `seg-reduce` that gathers the windows covering each pixel,
   and the forward convolution and its two gradients are contractions like
   the matrix product. They run on the convolution kernels of the BLAS
   backend, which use a buffer for the image columns; the convolutions of a
