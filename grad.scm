@@ -77,6 +77,7 @@
    var-transpose
    var-matmul
    var-lift
+   var-scan
 
    ;; Backward pass
    backward!
@@ -664,6 +665,35 @@
       (morph-variable-grad-fn-set! out
         (lambda (g)
           (accumulate-grad! v (morph-transpose g inv-perm)))))
+    out))
+
+
+;;;; ============================================================
+;;;; Scans
+;;;; ============================================================
+
+(define (var-scan op v axis #!key (exclusive? #f) (reverse? #f) (init #f))
+  "Gradient-tracking scan along axis (see morph-scan).  init, when given,
+   is a variable.  Only sums have a gradient: dv is the cumulative sum of g
+   in the opposite direction, inclusive or exclusive as the scan, and dinit
+   the sum of g along axis.  A product, maximum, minimum or
+   combine-expression scan of a variable that requires grad is an error."
+  (let* ((rg  (grad-requires? (if init (list v init) (list v))))
+         (_   (when (and rg (not (eq? op 'sum)))
+                (error "var-scan: only sum scans have a gradient" op)))
+         (x   (var-value v))
+         (ax  (normalize-axis axis (vector-length (morph-shape x))))
+         (out (make-var (morph-scan op x ax exclusive?: exclusive? reverse?: reverse?
+                                    init: (and init (var-value init)))
+                        rg)))
+    (when rg
+      (morph-variable-parents-set! out (filter var-requires-grad? (if init (list v init) (list v))))
+      (morph-variable-grad-fn-set! out
+        (lambda (g)
+          (when (var-requires-grad? v)
+            (accumulate-grad! v (morph-scan 'sum g ax exclusive?: exclusive? reverse?: (not reverse?))))
+          (when (and init (var-requires-grad? init))
+            (accumulate-grad! init (morph-reduce 'sum g (list ax)))))))
     out))
 
 

@@ -15,6 +15,8 @@
 (import array-morphisms-structural-ops)
 (import array-morphisms-realization)
 (import array-morphisms-context)
+(import array-morphisms-ssa)
+(import (prefix array-morphisms-grad am:))
 (import array-morphisms-lift)
 (import (only array-morphisms-batch-ops batch-scan))
 
@@ -297,3 +299,109 @@
       (morph-scan 'sum m 0 neutral: 0.0))
     (test-error "an invalid combine expression"
       (morph-scan '(lambda (a b) (+ a c)) m 0))))
+
+;;;; Gradients
+
+;; The elements of concrete array m (row-major order of its shape).
+(define (sc-concrete-elements m)
+  (cases array-morphism m
+    (concrete-array (data shape strides offset dtype _ _)
+      (map (lambda (i) (typed-vector-ref data dtype
+                                         (multi-to-linear-index (linear-to-multi-index i shape)
+                                                                strides offset)))
+           (iota (shape-size shape))))
+    (else (error "sc-concrete-elements: not concrete"))))
+
+;; loss = sum(scan(X, init: I) * c) through ssa-vjp, traced then replayed:
+;; (list replayed-gradients traced-gradients joint), the gradients of X and
+;; (with init) of I as element lists.
+(define (sc-ssa-grads dt shape axis excl rev init? c-vals)
+  (let* ((X (morph-from-list (sc-vals (sc-product shape) 1 dt #f) (list->vector shape) dt))
+         (ishape (append (take shape axis) (drop shape (+ axis 1))))
+         (I (and init? (morph-from-list (sc-vals (sc-product ishape) 2 dt #f) (list->vector ishape) dt)))
+         (c (morph-from-list c-vals (list->vector shape) dt))
+         (loss (am:make-var (morph-reduce 'sum (morph* (morph-scan 'sum X axis exclusive?: excl reverse?: rev init: I) c)) #f))
+         (fwd (morphism-to-ssa loss))
+         (ps (if I (list X I) (list X)))
+         (joint (ssa-vjp fwd (map (lambda (p) (ssa-constant-id fwd p)) ps) (ssa-loss-binding-val fwd)))
+         (ctx (make-morphism-context))
+         (run (lambda ()
+                (let ((res (ssa-realize/ctx ctx joint)))
+                  (unless (eq? (context-mode ctx) 'replay) (finalize-context! ctx))
+                  (reset-context! ctx)
+                  (map sc-concrete-elements (cdr res)))))
+         (traced (run)))
+    (list (run) traced joint)))
+
+(test-group "scan gradients"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (axis)
+        (for-each
+         (lambda (flags)
+           (let* ((excl (car flags)) (rev (cadr flags)) (init? (caddr flags))
+                  (shape '(3 4 5))
+                  (c-vals (map (lambda (x) (sc-round x dt)) (sc-vals 60 7 dt #t)))
+                  (r (sc-ssa-grads dt shape axis excl rev init? c-vals))
+                  (name (sprintf "~A axis ~A~A~A~A" dt axis (if excl " exclusive" "")
+                                 (if rev " reverse" "") (if init? " init" ""))))
+             (test-assert (string-append name ": dX is the opposite scan of g, as a plain loop")
+               (sc-same? (car (car r)) (sc-ref 'sum c-vals shape axis dt excl: excl rev: (not rev))))
+             (test-assert (string-append name ": replay equals the trace")
+               (every sc-same? (car r) (cadr r)))
+             (when init?
+               (test-assert (string-append name ": dinit is the sum of g along the axis")
+                 (sc-same? (cadr (car r))
+                           (sc-elements (morph-reduce 'sum (morph-from-list c-vals (list->vector shape) dt)
+                                                      (list axis))))))))
+         '((#f #f #f) (#t #f #f) (#f #t #f) (#t #t #t) (#f #f #t))))
+      '(0 2)))
+   '(f32 f64))
+
+  ;; Every fusion policy gives the same gradients.
+  (let* ((c-vals (sc-vals 60 7 'f32 #f))
+         (run (lambda (policy)
+                (parameterize ((segop-fusion policy))
+                  (car (sc-ssa-grads 'f32 '(3 4 5) 1 #f #t #t c-vals)))))
+         (off (run #f)))
+    (test-assert "fusion on equals fusion off" (every sc-same? off (run #t)))
+    (test-assert "fusion 'all equals fusion off" (every sc-same? off (run 'all))))
+
+  ;; Eager backward! through var-scan gives the gradients of ssa-vjp.
+  (for-each
+   (lambda (dt)
+     (let* ((shape '(3 4 5)) (axis 1)
+            (c-vals (map (lambda (x) (sc-round x dt)) (sc-vals 60 7 dt #t)))
+            (xv (am:make-var (morph-from-list (sc-vals 60 1 dt #f) #(3 4 5) dt) #t))
+            (iv (am:make-var (morph-from-list (sc-vals 15 2 dt #f) #(3 5) dt) #t))
+            (cv (am:make-var (morph-from-list c-vals #(3 4 5) dt) #f))
+            (loss (am:var-sum (am:var* (am:var-scan 'sum xv axis exclusive?: #t reverse?: #t init: iv) cv))))
+       (am:backward! loss)
+       (let ((r (sc-ssa-grads dt shape axis #t #t #t c-vals)))
+         (test-assert (sprintf "~A eager dX equals ssa-vjp's" dt)
+           (sc-same? (sc-elements (am:var-grad xv)) (car (car r))))
+         (test-assert (sprintf "~A eager dinit equals ssa-vjp's" dt)
+           (sc-same? (sc-elements (am:var-grad iv)) (cadr (car r)))))))
+   '(f32 f64))
+
+  (test-error "ssa-vjp: a product scan of a parameter has no gradient"
+    (let* ((X (morph-from-list '(1.0 2.0 3.0) #(3) 'f64))
+           (fwd (morphism-to-ssa (am:make-var (morph-reduce 'sum (morph-cumprod X 0)) #f))))
+      (ssa-vjp fwd (list (ssa-constant-id fwd X)) (ssa-loss-binding-val fwd))))
+  (test-assert "ssa-vjp: a max scan of a constant needs no gradient"
+    (let* ((X (morph-from-list '(1.0 2.0 3.0) #(3) 'f64))
+           (K (morph-from-list '(3.0 1.0 2.0) #(3) 'f64))
+           (fwd (morphism-to-ssa (am:make-var (morph-reduce 'sum (morph* X (morph-scan 'max K 0))) #f))))
+      (ssa-vjp fwd (list (ssa-constant-id fwd X)) (ssa-loss-binding-val fwd))
+      #t))
+  (test-error "ssa-vjp: a combine-expression scan of a parameter has no gradient"
+    (let* ((X (morph-from-list '(1.0 2.0 3.0) #(3) 'f64))
+           (fwd (morphism-to-ssa (am:make-var (morph-reduce 'sum (morph-scan '(lambda (a b) (+ a b)) X 0)) #f))))
+      (ssa-vjp fwd (list (ssa-constant-id fwd X)) (ssa-loss-binding-val fwd))))
+  (test-error "var-scan: a combine expression of a variable that requires grad"
+    (am:var-scan '(lambda (a b) (+ a b)) (am:make-var (morph-from-list '(1.0 2.0) #(2) 'f64) #t) 0))
+  (test-error "var-scan: a product scan of a variable that requires grad"
+    (am:var-scan 'prod (am:make-var (morph-from-list '(1.0 2.0) #(2) 'f64) #t) 0))
+  (test-assert "var-scan: a max scan without grad"
+    (am:morph-variable? (am:var-scan 'max (am:make-var (morph-from-list '(1.0 2.0) #(2) 'f64) #f) 0))))

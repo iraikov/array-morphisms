@@ -2156,6 +2156,39 @@
                ((equal? op '(reduce max))
                 (void))
 
+               ;; scan(x [, init]) along an axis.  For a sum, each element of x
+               ;; reaches every output from its own position on in the scan's
+               ;; direction (from the next position on for an exclusive scan),
+               ;; so dx is the scan of g in the opposite direction, inclusive or
+               ;; exclusive as the forward scan.  The sequential order of that
+               ;; scan adds g from the far end, as the backward pass of the
+               ;; step-by-step program does.  init reaches every output: dinit
+               ;; is the sum of g along the axis.  Products, maxima, minima and
+               ;; combine expressions have no gradient rule; such a scan that
+               ;; depends on a trainable parameter is an error.
+               ((eq? op 'scan)
+                (let ((get (lambda (k) (cdr (assq k meta)))))
+                  (if (eq? (get 'scan-op) 'sum)
+                      (let* ((x-val   (list-ref inputs 0))
+                             (x-shape (val-shape x-val))
+                             (ax      (get 'axis))
+                             (dx      (emit! 'scan (list g-val) x-shape dtype
+                                             `((scan-op . sum) (axis . ,ax)
+                                               (exclusive? . ,(get 'exclusive?))
+                                               (reverse? . ,(not (get 'reverse?)))
+                                               (swapped? . #f)))))
+                        (accumulate-input-adjoint! x-val dx)
+                        (when (pair? (cdr inputs))
+                          (let* ((i-val (list-ref inputs 1))
+                                 (dinit (emit! (list 'reduce 'sum) (list g-val) (val-shape i-val) dtype
+                                               (list (cons 'axes (list ax))
+                                                     (cons 'keepdims? #f)
+                                                     (cons 'src-shape g-shape)))))
+                            (accumulate-input-adjoint! i-val dinit))))
+                      (when (any param-dependent? inputs)
+                        (error "ssa-vjp: a scan has a gradient only for op sum, and this one depends on a trainable parameter"
+                               (get 'scan-op) bid-sym)))))
+
                ;; map(x, fn) -- a user procedure has no derivative.  A map whose
                ;; input does not depend on a trainable parameter passes no
                ;; gradient on and needs none; otherwise the gradient cannot be
