@@ -4648,3 +4648,96 @@
    '(f32 f64)))
 
 (test-end)
+
+;;;; Slices and pads
+;;;; ============================================================
+
+(test-group "slices and pads in SSA"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (spec)
+        (let* ((name (car spec)) (make (cadr spec)) (r (s2-run make)))
+          (test (sprintf "~A ~A: executors agree with the interpreter" dt name) 0 (list-ref r 4))
+          (test-assert (sprintf "~A ~A: replay reproduces the trace" dt name)
+            (s2-same-lists? (cadr r) (caddr r)))
+          (test-assert (sprintf "~A ~A: values equal realize" dt name)
+            (s2-same-lists? (cadr r) (s2-values (realize (make)))))))
+      (list
+       (list "unit-step slice" (lambda () (morph-exp (morph-slice (s2-src dt '(4 6) s2-val) '(1 1) '(4 5)))))
+       (list "strided slice" (lambda () (morph-exp (morph-slice (s2-src dt '(6 5) s2-val) '(1 0) '(6 5) 2))))
+       (list "slice of a transposed array"
+             (lambda () (morph-exp (morph-slice (morph-transpose (s2-src dt '(4 6) s2-val) '(1 0)) '(2 0) '(5 3)))))
+       (list "reduction of a slice" (lambda () (morph-reduce 'sum (morph-slice (s2-src dt '(4 5) s2-val) '(1 1) '(4 5)) '(1))))
+       (list "constant pad" (lambda () (morph-exp (morph-pad (s2-src dt '(3 4) s2-val) '((1 2) (0 1))))))
+       (list "edge pad" (lambda () (morph-exp (morph-pad (s2-src dt '(3 4) s2-val) '((1 1) (2 0)) 'edge))))
+       (list "slice of a pad" (lambda () (morph-slice (morph-pad (s2-src dt '(3 4) s2-val) '((1 1) (1 1))) '(1 1) '(4 5)))))))
+   '(f32 f64))
+
+  ;; Gradients: loss = sum(op(X) * c), so the gradient of op(X) is c.
+  (for-each
+   (lambda (dt)
+     (let* ((X (morph-from-list (lt-vals 24 0.3) #(4 6) dt))
+            (grads (lambda (op c-shape)
+                     (let* ((c (morph-from-list (lt-vals (apply * c-shape) 1.7) (list->vector c-shape) dt))
+                            (loss (am:make-var (morph-reduce 'sum (morph* (op X) c)) #f))
+                            (cj (lt-compile loss (list X))))
+                       (lt-run! cj)
+                       (list (cadr (lt-run! cj)) (lt-elements (realize c))))))
+            (sl (grads (lambda (x) (morph-slice x '(1 2) '(3 5))) '(2 3)))
+            (pd (grads (lambda (x) (morph-pad x '((1 0) (2 1)))) '(5 9))))
+       (test-assert (sprintf "~A: the gradient of a slice is g padded with zeros" dt)
+         (s2-same-lists? (car sl)
+                         (map (lambda (i)
+                                (let ((r (quotient i 6)) (k (remainder i 6)))
+                                  (if (and (<= 1 r 2) (<= 2 k 4))
+                                      (list-ref (cadr sl) (+ (* 3 (- r 1)) (- k 2)))
+                                      0.0)))
+                              (iota 24))))
+       (test-assert (sprintf "~A: the gradient of a constant pad is the slice of g" dt)
+         (s2-same-lists? (car pd)
+                         (map (lambda (i)
+                                (let ((r (quotient i 6)) (k (remainder i 6)))
+                                  (list-ref (cadr pd) (+ (* 9 (+ r 1)) (+ k 2)))))
+                              (iota 24))))))
+   '(f32 f64))
+
+  ;; Stacks and concatenations: replay and gradients.
+  (for-each
+   (lambda (dt)
+     (let* ((A (morph-from-list (lt-vals 12 0.3) #(3 4) dt))
+            (B (morph-from-list (lt-vals 12 0.9) #(3 4) dt))
+            (run (lambda (op c-shape)
+                   (let* ((c (morph-from-list (lt-vals (apply * c-shape) 1.7) (list->vector c-shape) dt))
+                          (loss (am:make-var (morph-reduce 'sum (morph* (op A B) c)) #f))
+                          (cj (lt-compile loss (list A B))))
+                     (lt-run! cj)
+                     (list (cdr (lt-run! cj)) (lt-elements (realize c))))))
+            (st (run (lambda (a b) (morph-stack (list a b) 1)) '(3 2 4)))
+            (cc (run (lambda (a b) (morph-concat (list a b) 1)) '(3 8))))
+       (for-each
+        (lambda (spec)
+          (let ((r (s2-run (cadr spec))))
+            (test-assert (sprintf "~A ~A replays with the values of realize" dt (car spec))
+              (s2-same-lists? (cadr r) (s2-values (realize ((cadr spec))))))))
+        (list (list "stack" (lambda () (morph-exp (morph-stack (list (s2-src dt '(3 4) s2-val) (s2-src dt '(3 4) s2-val)) 1))))
+              (list "concat" (lambda () (morph-exp (morph-concat (list (s2-src dt '(3 4) s2-val) (s2-src dt '(3 2) s2-val)) 1))))))
+       ;; c [3 2 4] for the stack: dA = c[:, 0, :], dB = c[:, 1, :]
+       (test-assert (sprintf "~A: gradients of a stack are slices of g" dt)
+         (and (s2-same-lists? (car (car st))
+                              (map (lambda (i) (list-ref (cadr st) (+ (* 8 (quotient i 4)) (remainder i 4)))) (iota 12)))
+              (s2-same-lists? (cadr (car st))
+                              (map (lambda (i) (list-ref (cadr st) (+ (* 8 (quotient i 4)) 4 (remainder i 4)))) (iota 12)))))
+       ;; c [3 8] for the concat: dA = c[:, 0:4], dB = c[:, 4:8]
+       (test-assert (sprintf "~A: gradients of a concatenation are slices of g" dt)
+         (and (s2-same-lists? (car (car cc))
+                              (map (lambda (i) (list-ref (cadr cc) (+ (* 8 (quotient i 4)) (remainder i 4)))) (iota 12)))
+              (s2-same-lists? (cadr (car cc))
+                              (map (lambda (i) (list-ref (cadr cc) (+ (* 8 (quotient i 4)) 4 (remainder i 4)))) (iota 12)))))))
+   '(f32 f64))
+
+  (let ((X (morph-from-list (lt-vals 24 0.3) #(4 6) 'f64)))
+    (test-error "a strided slice of a parameter has no gradient"
+      (lt-compile (am:make-var (morph-reduce 'sum (morph-slice X '(0 0) '(4 6) 2)) #f) (list X)))
+    (test-error "an edge pad of a parameter has no gradient"
+      (lt-compile (am:make-var (morph-reduce 'sum (morph-pad X '((1 1) (0 0)) 'edge)) #f) (list X)))))

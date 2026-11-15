@@ -313,6 +313,16 @@
            (iota (shape-size shape))))
     (else (error "sc-concrete-elements: not concrete"))))
 
+;; The elements of the row-major list vals of shape (a list) at index pos
+;; along axis, in row-major order of the other axes.
+(define (sc-axis-at vals shape axis pos)
+  (let ((strides (vector->list (compute-strides (list->vector shape))))
+        (rest (append (take shape axis) (drop shape (+ axis 1)))))
+    (map (lambda (p)
+           (let ((idx (vector->list (linear-to-multi-index p (list->vector rest)))))
+             (list-ref vals (apply + (map * (append (take idx axis) (list pos) (drop idx axis)) strides)))))
+         (iota (sc-product rest)))))
+
 ;; loss = sum(scan(X, init: I) * c) through ssa-vjp, traced then replayed:
 ;; (list replayed-gradients traced-gradients joint), the gradients of X and
 ;; (with init) of I as element lists.
@@ -352,10 +362,10 @@
              (test-assert (string-append name ": replay equals the trace")
                (every sc-same? (car r) (cadr r)))
              (when init?
-               (test-assert (string-append name ": dinit is the sum of g along the axis")
+               (test-assert (string-append name ": dinit is the end of the reverse inclusive scan of g")
                  (sc-same? (cadr (car r))
-                           (sc-elements (morph-reduce 'sum (morph-from-list c-vals (list->vector shape) dt)
-                                                      (list axis))))))))
+                           (sc-axis-at (sc-ref 'sum c-vals shape axis dt rev: (not rev)) shape axis
+                                       (if rev (- (list-ref shape axis) 1) 0)))))))
          '((#f #f #f) (#t #f #f) (#f #t #f) (#t #t #t) (#f #f #t))))
       '(0 2)))
    '(f32 f64))
@@ -461,7 +471,7 @@
             (sc-node-count (batch-scan morph+ init (morph-from-list (sc-vals 256 1 dt #f) #(64 4) dt)))))))
    '(f32 f64))
 
-  ;; Through SSA replay, which slice-and-stack cannot run.
+  ;; Through SSA replay.
   (let* ((make (lambda () (batch-scan (lambda (acc x) (morph+ (morph* acc (morph-from-list '(0.5) #(1) 'f32)) x))
                                       (morph-from-list '(1.0 -1.0 0.0) #(3) 'f32)
                                       (morph-from-list (sc-vals 15 3 'f32 #f) #(5 3) 'f32))))
@@ -471,6 +481,15 @@
          (out (sc-concrete-elements (car (ssa-realize/ctx ctx fwd)))))
     (reset-context! ctx)
     (test-assert "a batch-scan replays and gives the values of realize"
+      (sc-same? out (sc-elements (make)))))
+  (let* ((make (lambda () (batch-scan/slices morph+ (morph-from-list '(1.0 -1.0 0.0) #(3) 'f64)
+                                             (morph-from-list (sc-vals 15 3 'f64 #t) #(5 3) 'f64))))
+         (fwd (morphism-to-ssa (am:make-var (make) #f)))
+         (ctx (make-morphism-context))
+         (_ (begin (ssa-realize/ctx ctx fwd) (finalize-context! ctx) (reset-context! ctx)))
+         (out (sc-concrete-elements (car (ssa-realize/ctx ctx fwd)))))
+    (reset-context! ctx)
+    (test-assert "batch-scan/slices replays and gives the values of realize"
       (sc-same? out (sc-elements (make)))))
 
   ;; Fallbacks: each gives the values of slice-and-stack.

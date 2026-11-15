@@ -676,7 +676,8 @@
   "Gradient-tracking scan along axis (see morph-scan).  init, when given,
    is a variable.  Only sums have a gradient: dv is the cumulative sum of g
    in the opposite direction, inclusive or exclusive as the scan, and dinit
-   the sum of g along axis.  A product, maximum, minimum or
+   the sum of g along axis, taken from the inclusive cumulative sum of g in
+   the opposite direction at its last position.  A product, maximum, minimum or
    combine-expression scan of a variable that requires grad is an error."
   (let* ((rg  (grad-requires? (if init (list v init) (list v))))
          (_   (when (and rg (not (eq? op 'sum)))
@@ -693,7 +694,16 @@
           (when (var-requires-grad? v)
             (accumulate-grad! v (morph-scan 'sum g ax exclusive?: exclusive? reverse?: (not reverse?))))
           (when (and init (var-requires-grad? init))
-            (accumulate-grad! init (morph-reduce 'sum g (list ax)))))))
+            (let* ((shape (vector->list (morph-shape x)))
+                   (pos   (if reverse? (- (list-ref shape ax) 1) 0))
+                   (whole (morph-scan 'sum g ax reverse?: (not reverse?))))
+              (accumulate-grad!
+               init
+               (morph-reshape (morph-slice whole
+                                           (map (lambda (k) (if (= k ax) pos 0)) (iota (length shape)))
+                                           (map (lambda (k d) (if (= k ax) (+ pos 1) d))
+                                                (iota (length shape)) shape))
+                              (morph-shape (var-value init)))))))))
     out))
 
 

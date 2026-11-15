@@ -96,7 +96,7 @@
           (only (scheme time) current-jiffy jiffies-per-second)
           (only (scheme base) make-parameter)
           (only srfi-1 iota fold filter map for-each append-map filter-map every any
-                take drop list-index delete-duplicates find)
+                take drop list-index delete-duplicates find make-list)
           (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
                 f32vector f32vector? f32vector-ref f32vector-set! f32vector-length
@@ -1639,11 +1639,12 @@
       (let ((in-dtypes (map val-dtype inputs)))
         (cond
          ((not (every values in-dtypes)) dtype)
-         ((memq op '(add sub mul div pow matmul batch-matmul conv2d-bwd-data conv2d-bwd-weights))
+         ((memq op '(add sub mul div pow matmul batch-matmul conv2d-bwd-data conv2d-bwd-weights
+                     stack concat))
           (fold promote-types (car in-dtypes) (cdr in-dtypes)))
          ((and (pair? op) (eq? (car op) 'reduce))
           (infer-reduction-dtype (cadr op) (car in-dtypes)))
-         ((memq op '(reshape transpose col2im map relu-deriv sigmoid-deriv tanh-deriv scan))
+         ((memq op '(reshape transpose slice pad col2im map relu-deriv sigmoid-deriv tanh-deriv scan))
           (car in-dtypes))
          ((memq op '(negate abs floor ceiling sqrt exp log sin cos tan relu sigmoid tanh))
           (infer-unary-dtype op (car in-dtypes)))
@@ -2087,6 +2088,66 @@
                         (dx      (emit! 'reshape (list g-val) x-shape dtype '())))
                    (accumulate-input-adjoint! x-val dx)))
 
+                ;; slice(x) with unit steps -- dx is g padded with zeros back to
+                ;; the shape of x.  A slice with larger steps has no rule.
+                ((eq? op 'slice)
+                 (let* ((x-val   (list-ref inputs 0))
+                        (x-shape (val-shape x-val))
+                        (start   (cdr (assq 'start meta)))
+                        (end     (cdr (assq 'end meta)))
+                        (step    (cdr (assq 'step meta))))
+                   (if (every (lambda (k) (= k 1)) step)
+                       (accumulate-input-adjoint!
+                        x-val
+                        (emit! 'pad (list g-val) x-shape dtype
+                               `((padding . ,(map (lambda (s e d) (list s (- d e)))
+                                                  start end (vector->list x-shape)))
+                                 (mode . constant) (value . 0.0))))
+                       (when (param-dependent? x-val)
+                         (error "ssa-vjp: a slice with steps above 1 has no gradient, and its input depends on a trainable parameter"
+                                step bid-sym)))))
+
+                ;; stack(x_0 ... x_n-1) along axis a -- dx_i is the slice of g at
+                ;; index i along a, without that axis; concat along a -- dx_i is
+                ;; the slice of g that holds x_i.
+                ((memq op '(stack concat))
+                 (let* ((ax     (cdr (assq 'axis meta)))
+                        (rank   (vector-length g-shape))
+                        (stack? (eq? op 'stack)))
+                   (let loop ((xs inputs) (i 0) (off 0))
+                     (unless (null? xs)
+                       (let* ((x-val   (car xs))
+                              (x-shape (val-shape x-val))
+                              (len     (if stack? 1 (vector-ref x-shape ax)))
+                              (cut-shape (list->vector (map (lambda (k) (if (= k ax) len (vector-ref g-shape k)))
+                                                            (iota rank))))
+                              (cut     (emit! 'slice (list g-val) cut-shape dtype
+                                              `((start . ,(map (lambda (k) (if (= k ax) off 0)) (iota rank)))
+                                                (end . ,(map (lambda (k) (if (= k ax) (+ off len) (vector-ref g-shape k)))
+                                                             (iota rank)))
+                                                (step . ,(make-list rank 1)))))
+                              (dx      (if stack? (emit! 'reshape (list cut) x-shape dtype '()) cut)))
+                         (accumulate-input-adjoint! x-val dx)
+                         (loop (cdr xs) (+ i 1) (+ off len)))))))
+
+                ;; pad(x) with a constant -- dx is the slice of g that holds x.
+                ;; Edge and reflect padding have no rule.
+                ((eq? op 'pad)
+                 (let* ((x-val   (list-ref inputs 0))
+                        (x-shape (val-shape x-val))
+                        (padding (cdr (assq 'padding meta))))
+                   (if (eq? (cdr (assq 'mode meta)) 'constant)
+                       (let ((start (map car padding)))
+                         (accumulate-input-adjoint!
+                          x-val
+                          (emit! 'slice (list g-val) x-shape dtype
+                                 `((start . ,start)
+                                   (end . ,(map + start (vector->list x-shape)))
+                                   (step . ,(map (lambda (p) 1) padding))))))
+                       (when (param-dependent? x-val)
+                         (error "ssa-vjp: edge and reflect padding have no gradient, and the padded input depends on a trainable parameter"
+                                (cdr (assq 'mode meta)) bid-sym)))))
+
                 ;; im2col(x) -- dx = col2im(g, shape(x), kernel, stride, padding)
                 ((eq? op 'im2col)
                  (let* ((x-val       (list-ref inputs 0))
@@ -2163,7 +2224,9 @@
                ;; exclusive as the forward scan.  The sequential order of that
                ;; scan adds g from the far end, as the backward pass of the
                ;; step-by-step program does.  init reaches every output: dinit
-               ;; is the sum of g along the axis.  Products, maxima, minima and
+               ;; is the sum of g along the axis, taken from the inclusive scan
+               ;; of g in the opposite direction at its last position, which
+               ;; adds in the same order.  Products, maxima, minima and
                ;; combine expressions have no gradient rule; such a scan that
                ;; depends on a trainable parameter is an error.
                ((eq? op 'scan)
@@ -2180,10 +2243,22 @@
                         (accumulate-input-adjoint! x-val dx)
                         (when (pair? (cdr inputs))
                           (let* ((i-val (list-ref inputs 1))
-                                 (dinit (emit! (list 'reduce 'sum) (list g-val) (val-shape i-val) dtype
-                                               (list (cons 'axes (list ax))
-                                                     (cons 'keepdims? #f)
-                                                     (cons 'src-shape g-shape)))))
+                                 (rank  (vector-length x-shape))
+                                 (pos   (if (get 'reverse?) (- (vector-ref x-shape ax) 1) 0))
+                                 (whole (if (get 'exclusive?)
+                                            (emit! 'scan (list g-val) x-shape dtype
+                                                   `((scan-op . sum) (axis . ,ax) (exclusive? . #f)
+                                                     (reverse? . ,(not (get 'reverse?)))
+                                                     (swapped? . #f)))
+                                            dx))
+                                 (one   (list->vector (map (lambda (k) (if (= k ax) 1 (vector-ref x-shape k)))
+                                                           (iota rank))))
+                                 (cut   (emit! 'slice (list whole) one dtype
+                                               `((start . ,(map (lambda (k) (if (= k ax) pos 0)) (iota rank)))
+                                                 (end . ,(map (lambda (k) (if (= k ax) (+ pos 1) (vector-ref x-shape k)))
+                                                              (iota rank)))
+                                                 (step . ,(make-list rank 1)))))
+                                 (dinit (emit! 'reshape (list cut) (val-shape i-val) dtype '())))
                             (accumulate-input-adjoint! i-val dinit))))
                       (when (any param-dependent? inputs)
                         (error "ssa-vjp: a scan has a gradient only for op sum, and this one depends on a trainable parameter"
@@ -2378,6 +2453,16 @@
          (morph-transpose (car inputs) perm)))
       ((eq? op 'reshape)
        (morph-reshape (car inputs) shp))
+      ((eq? op 'slice)
+       (morph-slice (car inputs) (cdr (assq 'start meta)) (cdr (assq 'end meta))
+                    (cdr (assq 'step meta))))
+      ((eq? op 'stack)
+       (morph-stack inputs (cdr (assq 'axis meta))))
+      ((eq? op 'concat)
+       (morph-concat inputs (cdr (assq 'axis meta))))
+      ((eq? op 'pad)
+       (morph-pad (car inputs) (cdr (assq 'padding meta)) (cdr (assq 'mode meta))
+                  (cdr (assq 'value meta))))
       ((eq? op 'add)    (morph+ (car inputs) (cadr inputs)))
       ((eq? op 'sub)    (morph- (car inputs) (cadr inputs)))
       ((eq? op 'mul)    (morph* (car inputs) (cadr inputs)))
