@@ -18,7 +18,8 @@
 (import array-morphisms-ssa)
 (import (prefix array-morphisms-grad am:))
 (import array-morphisms-lift)
-(import (only array-morphisms-batch-ops batch-scan))
+(import (only array-morphisms-batch-ops batch-scan batch-scan/slices))
+(import srfi-69)
 
 ;;;; Helpers
 
@@ -276,7 +277,7 @@
              (scan-combine-expression fn dt))
        (test-assert (sprintf "~A morph-scan/fn equals batch-scan's slice-and-stack values" dt)
          (sc-same? (sc-elements (morph-scan/fn fn m 0 init: init))
-                   (sc-elements (batch-scan fn init m))))))
+                   (sc-elements (batch-scan/slices fn init m))))))
    '(f32 f64))
   (test "operand order is kept" '(lambda (a b) (sub b a))
         (scan-combine-expression (lambda (acc x) (morph- x acc)) 'f64))
@@ -405,3 +406,99 @@
     (am:var-scan 'prod (am:make-var (morph-from-list '(1.0 2.0) #(2) 'f64) #t) 0))
   (test-assert "var-scan: a max scan without grad"
     (am:morph-variable? (am:var-scan 'max (am:make-var (morph-from-list '(1.0 2.0) #(2) 'f64) #f) 0))))
+
+;;;; batch-scan
+
+;; The number of distinct nodes of morphism m.
+(define (sc-node-count m)
+  (let ((seen (make-hash-table equal?)) (count 0))
+    (let walk ((m m))
+      (cases array-morphism m
+        (concrete-array (_ _ _ _ _ _ _) (set! count (+ count 1)))
+        (morphism-expr (id _ operands _ _ _ _ _)
+          (unless (hash-table-ref/default seen (symbol->string id) #f)
+            (hash-table-set! seen (symbol->string id) #t)
+            (set! count (+ count 1))
+            (for-each walk operands)))
+        (reduction-morphism (id _ operand _ _ _ _ _)
+          (unless (hash-table-ref/default seen (symbol->string id) #f)
+            (hash-table-set! seen (symbol->string id) #t)
+            (set! count (+ count 1))
+            (walk operand)))))
+    count))
+
+(define (sc-op-of m) (cases array-morphism m (morphism-expr (_ op _ _ _ _ _ _) op) (else #f)))
+
+;; batch-scan and batch-scan/slices give the same morphism shape, dtype,
+;; batch axis and elements.
+(define (sc-batch-same? fn init m)
+  (let ((a (batch-scan fn init m)) (b (batch-scan/slices fn init m)))
+    (and (equal? (get-morphism-shape a) (get-morphism-shape b))
+         (eq? (get-morphism-dtype a) (get-morphism-dtype b))
+         (= (get-morphism-batch-axis a) (get-morphism-batch-axis b))
+         (sc-same? (sc-elements a) (sc-elements b)))))
+
+(test-group "batch-scan as one scan"
+  (for-each
+   (lambda (dt)
+     (let* ((m (morph-from-list (sc-vals 24 1 dt #t) #(6 4) dt))
+            (init (morph-from-list (sc-vals 4 2 dt #t) #(4) dt))
+            (k (morph-from-list '(0.75) #(1) dt))
+            (steps (list (cons "morph+" morph+)
+                         (cons "morph*" morph*)
+                         (cons "the element first" (lambda (acc x) (morph+ x acc)))
+                         (cons "a moving sum" (lambda (acc x) (morph+ (morph* acc k) x)))
+                         (cons "exp and negate" (lambda (acc x) (morph- acc (morph-exp (morph-negate x))))))))
+       (for-each
+        (lambda (st)
+          (test-assert (sprintf "~A ~A: one scan node" dt (car st))
+            (eq? 'scan (sc-op-of (batch-scan (cdr st) init m))))
+          (test-assert (sprintf "~A ~A: equal to slice-and-stack" dt (car st))
+            (sc-batch-same? (cdr st) init m)))
+        steps)
+       (test-assert (sprintf "~A: as many nodes for 4 and 64 elements" dt)
+         (= (sc-node-count (batch-scan morph+ init (morph-from-list (sc-vals 16 1 dt #f) #(4 4) dt)))
+            (sc-node-count (batch-scan morph+ init (morph-from-list (sc-vals 256 1 dt #f) #(64 4) dt)))))))
+   '(f32 f64))
+
+  ;; Through SSA replay, which slice-and-stack cannot run.
+  (let* ((make (lambda () (batch-scan (lambda (acc x) (morph+ (morph* acc (morph-from-list '(0.5) #(1) 'f32)) x))
+                                      (morph-from-list '(1.0 -1.0 0.0) #(3) 'f32)
+                                      (morph-from-list (sc-vals 15 3 'f32 #f) #(5 3) 'f32))))
+         (fwd (morphism-to-ssa (am:make-var (make) #f)))
+         (ctx (make-morphism-context))
+         (_ (begin (ssa-realize/ctx ctx fwd) (finalize-context! ctx) (reset-context! ctx)))
+         (out (sc-concrete-elements (car (ssa-realize/ctx ctx fwd)))))
+    (reset-context! ctx)
+    (test-assert "a batch-scan replays and gives the values of realize"
+      (sc-same? out (sc-elements (make)))))
+
+  ;; Fallbacks: each gives the values of slice-and-stack.
+  (let* ((m (morph-from-list (sc-vals 12 4 'f64 #f) #(3 4) 'f64))
+         (init (morph-from-list '(0.0 0.0 0.0 0.0) #(4) 'f64))
+         (w (morph-from-list '(1.0 2.0 3.0 4.0) #(4) 'f64)))
+    (test-assert "a captured array of the element's shape falls back"
+      (let ((fn (lambda (acc x) (morph+ (morph* acc w) x))))
+        (and (not (eq? 'scan (sc-op-of (batch-scan fn init m)))) (sc-batch-same? fn init m))))
+    (test-assert "a morph-map step falls back"
+      (let ((fn (lambda (acc x) (morph-map (lambda (v) (* 2.0 v)) (morph+ acc x)))))
+        (and (not (eq? 'scan (sc-op-of (batch-scan fn init m)))) (sc-batch-same? fn init m))))
+    (test-assert "an init of another dtype falls back"
+      (let ((i32 (morph-from-list '(0.0 0.0 0.0 0.0) #(4) 'f32)))
+        (not (eq? 'scan (sc-op-of (batch-scan morph+ i32 m))))))
+    (test-assert "a step that reads values falls back"
+      (let ((fn (lambda (acc x) (if (> (car (sc-elements x)) 100.0) acc (morph+ acc x)))))
+        (and (not (eq? 'scan (sc-op-of (batch-scan fn init m)))) (sc-batch-same? fn init m)))))
+
+  ;; The gradient of a batch-scan with morph+ is the step 4 rule's.
+  (let* ((X (morph-from-list (sc-vals 12 1 'f64 #f) #(4 3) 'f64))
+         (init (morph-from-list '(0.0 0.0 0.0) #(3) 'f64))
+         (c-vals (sc-vals 12 7 'f64 #t))
+         (c (morph-from-list c-vals #(4 3) 'f64))
+         (fwd (morphism-to-ssa (am:make-var (morph-reduce 'sum (morph* (batch-scan morph+ init X) c)) #f)))
+         (joint (ssa-vjp fwd (list (ssa-constant-id fwd X)) (ssa-loss-binding-val fwd)))
+         (ctx (make-morphism-context))
+         (res (ssa-realize/ctx ctx joint)))
+    (test-assert "a batch-scan's gradient is the reverse scan of g"
+      (sc-same? (sc-concrete-elements (cadr res)) (sc-ref 'sum c-vals '(4 3) 0 'f64 rev: #t)))))
+

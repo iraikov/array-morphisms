@@ -9,7 +9,9 @@
 ;;; batch-map and batch-zip apply their function to all elements as one
 ;;; computation with morph-lift, so their expression has as many nodes for
 ;;; any batch size; batch-map/slices and batch-zip/slices apply it to each
-;;; element slice and stack the results.
+;;; element slice and stack the results.  batch-scan is one scan along the
+;;; batch axis (morph-scan/fn) when its step is made of element-wise ops,
+;;; and batch-scan/slices folds the slices and stacks them.
 ;;;
 ;;; Batch dimension convention:
 ;;;   Batch axis is always dimension 0 by default.  Every batched morphism
@@ -41,6 +43,7 @@
    batch-zip/slices
    batch-fold
    batch-scan
+   batch-scan/slices
 
    ;; Batch-aware arithmetic (auto-broadcasts non-batched operand)
    morph+/batch
@@ -375,6 +378,14 @@
     Like batch-fold but returns all intermediate accumulator values stacked
     into a batched morphism of the same batch size.
 
+    When init is a morphism of the shape and dtype of one element of m, and
+    fn builds its result from the accumulator, the element and one-element
+    constants with element-wise table ops (morph+, morph*, morph-exp, ...),
+    the result is one scan along axis 0 (see morph-scan/fn), whose
+    expression has as many nodes for any batch size and whose values are
+    those of applying fn step by step.  Otherwise batch-scan runs
+    batch-scan/slices.
+
     Args:
       fn:   binary function (acc morphism -> morphism)
       init: initial accumulator (used before the first element)
@@ -382,6 +393,19 @@
 
     Returns:
       Batched morphism of same shape as m holding cumulative results."
+    (let ((elem-shape (list->vector (cdr (vector->list (get-morphism-shape m))))))
+      (if (and (array-morphism? init)
+               (equal? (get-morphism-shape init) elem-shape)
+               (eq? (get-morphism-dtype init) (get-morphism-dtype m)))
+          (lift-or-else
+           (lambda () (with-batch-axis (morph-scan/fn fn m 0 init: init) 0))
+           (lambda () (batch-scan/slices fn init m)))
+          (batch-scan/slices fn init m))))
+
+  (define (batch-scan/slices fn init m)
+    "batch-scan by slicing: fn is applied to the accumulator and each element
+    along axis 0, taken as slices, in order, and the accumulators are
+    stacked."
     (let* ((N (vector-ref (get-morphism-shape m) 0))
            (results
             (let loop ((i 0) (acc init) (out '()))

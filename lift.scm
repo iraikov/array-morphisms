@@ -349,12 +349,31 @@
                          (swapped? #f))
     "Scan m along axis with the procedure fn of two morphisms as combine op:
     (morph-scan (scan-combine-expression fn dtype) m axis ...), dtype being
-    m's.  Each output is fn applied to the previous output and the next
+    m's, or the standard op sum or prod when fn adds or multiplies its two
+    arguments.  Each output is fn applied to the previous output and the next
     element, with the rounding of fn's element-wise ops; the keywords are
     those of morph-scan.  Signals a lift-unsupported condition when fn is
     not made of element-wise table ops (see scan-combine-expression)."
-    (morph-scan (scan-combine-expression fn (get-morphism-dtype m)) m axis
-                exclusive?: exclusive? reverse?: reverse? init: init neutral: neutral
-                swapped?: swapped?))
+    (let* ((e  (scan-combine-expression fn (get-morphism-dtype m)))
+           (op (and (not neutral) (standard-scan-op e))))
+      (if op
+          (morph-scan (car op) m axis exclusive?: exclusive? reverse?: reverse? init: init
+                      swapped?: (if swapped? (not (cdr op)) (cdr op)))
+          (morph-scan e m axis exclusive?: exclusive? reverse?: reverse? init: init neutral: neutral
+                      swapped?: swapped?))))
+
+  ;; (op . swapped?) when combine expression e is the step of the standard
+  ;; scan op sum or prod, (add a b) or (mul a b), or of one with its
+  ;; operands trading places; #f otherwise.  The standard op's step is the
+  ;; combiner of the same table op, so the values are the same, and the scan
+  ;; then has the gradient rule and the kernels of the standard op.
+  (define (standard-scan-op e)
+    (let ((body (caddr e)))
+      (and (pair? body) (= (length body) 3)
+           (memq (car body) '(add mul))
+           (let ((op (if (eq? (car body) 'add) 'sum 'prod)))
+             (cond ((equal? (cdr body) '(a b)) (cons op #f))
+                   ((equal? (cdr body) '(b a)) (cons op #t))
+                   (else #f))))))
 
 ) ;; end module array-morphisms-lift
