@@ -255,6 +255,10 @@ part. A slice with a step above 1, and edge or reflect padding, have no
 derivative: `ssa-vjp` raises an error when their input depends on a
 trainable parameter, as for `morph-map`.
 
+Comparisons (`morph>`, `morph<`, `morph>=`, `morph<=`, `morph=`) can also be
+part of a compiled SSA graph. Their results are 0.0 and 1.0, and they pass
+no gradient to their inputs.
+
 ## Performance Tips
 
 1. **Realize once.** Build the whole expression, then call `realize` on
@@ -706,6 +710,15 @@ after every step; `(cast f32 ...)` rounds an intermediate value. The
 elements are combined in order, so `e` does not need to be associative.
 An exclusive scan with an expression needs `init` or `neutral:`.
 
+An expression may have more than two variables. `aux:` then gives one
+array of the operand's shape per extra variable, and at each step the
+variable holds that array's element at the same position:
+
+```scheme
+;; a linear recurrence: out[r] = x[r] + c[r] * out[r-1]
+(morph-scan '(lambda (a b c) (+ b (* c a))) x 1 aux: (list c))
+```
+
 `morph-scan/fn` (`array-morphisms-lift`) takes the step as a procedure of
 two morphisms instead, and turns it into an expression:
 
@@ -734,10 +747,25 @@ also runs in compiled SSA graphs, with as many nodes as elements.
 `ssa-vjp` differentiates `sum` scans: the gradient of the scanned array is
 the scan of the incoming gradient in the opposite direction, and that of
 `init` is the incoming gradient summed along the axis, in the same order as
-the step-by-step program adds it. `var-scan`
-(`array-morphisms-grad`) does the same for `backward!`. Scans with other
-ops or with an expression have no gradient; using one on a trainable
-parameter is an error.
+the step-by-step program adds it.
+
+`prod`, `max` and `min` scans have gradients too:
+
+- **prod:** the gradient of element k is the product of the elements
+  before it times a sum over the later outputs, computed as a recurrence
+  from the end of the line. No element is divided by, so zeros in the
+  scanned array give exact gradients.
+- **max** and **min:** each element receives the incoming gradient of the
+  outputs that hold its value. When two elements are equal, the earlier
+  one keeps the running value and gets the gradient, and a NaN after the
+  first element gets none, as in the forward scan. An infinite incoming
+  gradient can give NaN at the elements that hold no output.
+
+The gradients are the exact formulas, computed in order; they can differ
+in the last bits from those of the step-by-step program, which adds the
+same terms in another order. `var-scan` (`array-morphisms-grad`) gives
+the same gradients for `backward!`. Scans with an expression have no
+gradient; using one on a trainable parameter is an error.
 
 ### Execution
 
