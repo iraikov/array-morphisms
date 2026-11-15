@@ -709,6 +709,51 @@
                      (list (make-red-result (sg-op 'f64 (vector) (identity-index-map 0)) '(in 0)
                                             (make-combine-spec '(lambda (a b) (+ a b)) #f 'f64) #f)))))
 
+(test-group "seg-scan with aux values"
+  ;; h_r = x_r + c_r * h_{r-1}: a linear recurrence over each row.
+  (let* ((rows 2) (cols 6)
+         (xs '(1.0 2.0 -1.5 0.5 3.0 -2.0 0.25 4.0 1.0 -1.0 2.5 0.0))
+         (cs '(9.0 0.5 2.0 -1.0 0.0 1.5 9.0 1.0 -0.5 3.0 0.25 2.0))
+         (m  (identity-index-map 2))
+         (rev (make-index-map (vector '(dim 0) `(+ ,(- cols 1) (* -1 (dim 1)))) #f 0.0 #f))
+         (spec (make-combine-spec '(lambda (a b c) (+ b (* c a))) #f 'f64))
+         (case (lambda (map)
+                 (make-seg-scan (vector rows cols)
+                                (list (sg-op 'f64 (vector rows cols) map) (sg-op 'f64 (vector rows cols) map))
+                                (list (make-scan-result (sg-op 'f64 (vector rows cols) map) '(in 0) spec #f #f #f
+                                                        '((in 1)))))))
+         (plain (lambda (x c)   ; one row, in scan order
+                  (let loop ((x x) (c c) (h #f) (out '()))
+                    (if (null? x) (reverse out)
+                        (let ((v (if h (+ (car x) (* (car c) h)) (car x))))
+                          (loop (cdr x) (cdr c) v (cons v out)))))))
+         (row (lambda (lst k) (take (list-tail lst (* k cols)) cols)))
+         (out (make-f64vector 12)) (outr (make-f64vector 12)))
+    (segop-interpret (case m) (list (sg-f64 xs) (sg-f64 cs)) (list out))
+    (test-assert "a linear recurrence equals a plain loop"
+      (sg-list-same? (f64vector->list out)
+                     (append (plain (row xs 0) (row cs 0)) (plain (row xs 1) (row cs 1)))))
+    (segop-interpret (case rev) (list (sg-f64 xs) (sg-f64 cs)) (list outr))
+    (test-assert "reversed, it runs from the end of each row"
+      (sg-list-same? (f64vector->list outr)
+                     (append (reverse (plain (reverse (row xs 0)) (reverse (row cs 0))))
+                             (reverse (plain (reverse (row xs 1)) (reverse (row cs 1))))))))
+  (let ((x (sg-op 'f64 (vector 4) (identity-index-map 1)))
+        (o (lambda () (sg-op 'f64 (vector 4) (identity-index-map 1)))))
+    (test-error "one variable per aux value"
+      (make-seg-scan (vector 4) (list x)
+                     (list (make-scan-result (o) '(in 0) (make-combine-spec '(lambda (a b) (+ a b)) #f 'f64)
+                                             #f #f #f '((in 0))))))
+    (test-error "a standard op takes no aux values"
+      (make-seg-scan (vector 4) (list x)
+                     (list (make-scan-result (o) '(in 0) (make-combine-spec 'add 0.0 'f64) #f #f #f '((in 0))))))
+    (test-error "aux values need the sequential order"
+      (make-seg-scan (vector 4) (list x)
+                     (list (make-scan-result (o) '(in 0) (make-combine-spec '(lambda (a b c) (+ a (* b c))) #f 'f64 'blocked 2)
+                                             #f #f #f '((in 0))))))
+    (test "three variables" 3 (combine-expression-arity '(lambda (a b c) (+ a (* b c)))))
+    (test-error "repeated variables" (make-combine-spec '(lambda (a b a) a) #f 'f64))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 6 - Construction checks
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

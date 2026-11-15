@@ -4741,3 +4741,27 @@
       (lt-compile (am:make-var (morph-reduce 'sum (morph-slice X '(0 0) '(4 6) 2)) #f) (list X)))
     (test-error "an edge pad of a parameter has no gradient"
       (lt-compile (am:make-var (morph-reduce 'sum (morph-pad X '((1 1) (0 0)) 'edge)) #f) (list X)))))
+
+;;;; Comparisons
+;;;; ============================================================
+
+(test-group "comparisons in SSA"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (spec)
+        (let* ((make (lambda () ((cadr spec) (s2-src dt '(3 4) s2-val) (s2-src dt '(3 4) (lambda (i) (- 1.0 (* 0.3 i)))))))
+               (r (s2-run make)))
+          (test-assert (sprintf "~A ~A replays with the values of realize" dt (car spec))
+            (s2-same-lists? (cadr r) (s2-values (realize (make)))))))
+      (list (list "gt" morph>) (list "lt" morph<) (list ">=" morph>=) (list "<=" morph<=) (list "=" morph=))))
+   '(f32 f64))
+  ;; loss = sum(x * (x > c)): the mask passes no gradient, so dx = mask.
+  (let* ((X (morph-from-list (lt-vals 12 0.3) #(3 4) 'f64))
+         (c (morph-from-list (lt-vals 12 0.9) #(3 4) 'f64))
+         (loss (am:make-var (morph-reduce 'sum (morph* X (morph> X c))) #f))
+         (cj (lt-compile loss (list X))))
+    (lt-run! cj)
+    (test-assert "a comparison passes no gradient"
+      (s2-same-lists? (cadr (lt-run! cj)) (lt-elements (realize (morph> X c)))))))
+

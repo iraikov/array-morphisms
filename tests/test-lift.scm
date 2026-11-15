@@ -308,3 +308,15 @@
   (test-assert "a lifted scan is one scan node"
     (= (lf-node-count (morph-lift (lambda (x) (morph-cumsum x 0)) 1 (lf-arr '(4 5) 'f64 1)))
        (lf-node-count (morph-lift (lambda (x) (morph-cumsum x 0)) 1 (lf-arr '(64 5) 'f64 1))))))
+
+(test-group "morph-lift: scans with aux arrays"
+  (for-each
+   (lambda (dt)
+     (lf-check (sprintf "~A a linear recurrence with a framed aux array" dt)
+               (lambda (x c) (morph-scan '(lambda (a b c) (+ b (* c a))) x 1 aux: (list c)))
+               2 (lf-arr '(3 4 5) dt 1) (lf-arr '(3 4 5) dt 2))
+     (lf-check (sprintf "~A a captured aux array" dt)
+               (let ((c (lf-arr '(4 5) dt 3)))
+                 (lambda (x) (morph-scan '(lambda (a b c) (- b (* c a))) x 0 aux: (list c) reverse?: #t)))
+               2 (lf-arr '(2 4 5) dt 4)))
+   '(f32 f64)))

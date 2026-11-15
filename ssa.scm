@@ -1646,6 +1646,7 @@
           (infer-reduction-dtype (cadr op) (car in-dtypes)))
          ((memq op '(reshape transpose slice pad col2im map relu-deriv sigmoid-deriv tanh-deriv scan))
           (car in-dtypes))
+         ((memq op '(gt lt ge le eq)) 'f64)
          ((memq op '(negate abs floor ceiling sqrt exp log sin cos tan relu sigmoid tanh))
           (infer-unary-dtype op (car in-dtypes)))
          (else dtype))))
@@ -1778,6 +1779,49 @@
         (hash-table-set! (ssa-program-constants fwd-prog) cid m)
         (env-builder-extend! binding-sd-eb cid (cons (vector 1) dtype))
         (const-ref cid)))
+
+    ;; emit-const! -- a constant array of the given shape and dtype, filled
+    ;; with value.
+    (define (emit-const! value shape dtype)
+      (let* ((n    (shape-size shape))
+             (data (allocate-typed-vector dtype n))
+             (_    (do ((i 0 (+ i 1))) ((= i n)) (typed-vector-set! data dtype i value)))
+             (m    (make-morphism data (vector->list shape) dtype))
+             (cid  (gensym 'cid-)))
+        (hash-table-set! (ssa-program-constants fwd-prog) cid m)
+        (env-builder-extend! binding-sd-eb cid (cons shape dtype))
+        (const-ref cid)))
+
+    ;; The operations of am:scan-gradient as bindings, for a scan along
+    ;; axis whose result has dtype dtype.
+    (define (ssa-scan-ops axis dtype)
+      (lambda (name . args)
+        (case name
+          ((scan)
+           (apply (lambda (v shape op excl? rev? init aux)
+                    (emit! 'scan (append (list v) (if init (list init) '()) aux) shape dtype
+                           (append `((scan-op . ,op) (axis . ,axis) (exclusive? . ,excl?)
+                                     (reverse? . ,rev?) (swapped? . #f))
+                                   (if (pair? aux) `((aux-count . ,(length aux)) (init? . ,(and init #t))) '()))))
+                  args))
+          ((slice)
+           (apply (lambda (v start end shape)
+                    (emit! 'slice (list v) shape dtype
+                           `((start . ,start) (end . ,end) (step . ,(map (lambda (k) 1) start)))))
+                  args))
+          ((concat) (emit! 'concat (car args) (cadr args) dtype `((axis . ,axis))))
+          ((reshape) (emit! 'reshape (list (car args)) (cadr args) dtype '()))
+          ((mul) (emit! 'mul (list (car args) (cadr args)) (caddr args) dtype
+                        `((combiner . ,(scalar-op-combiner 'mul)))))
+          ((sub) (emit! 'sub (list (car args) (cadr args)) (caddr args) dtype
+                        `((combiner . ,(scalar-op-combiner 'sub)))))
+          ((add-init) (emit! 'add (list (car args) (cadr args)) (val-shape (car args)) dtype
+                             `((combiner . ,(scalar-op-combiner 'add)))))
+          ((mask) (apply (lambda (rel a b shape)
+                           (emit! 'cast (list (emit! rel (list a b) shape 'f64 '())) shape dtype '()))
+                         args))
+          ((const) (emit-const! (car args) (cadr args) dtype))
+          (else (error "ssa-scan-ops: unknown operation" name)))))
 
     ;; Seed: dL/dL = ones-like(loss) stored as a constant
     (let* ((loss-bid    (find-fwd-binding fwd-bindings loss-bid-sym))
@@ -2226,9 +2270,10 @@
                ;; step-by-step program does.  init reaches every output: dinit
                ;; is the sum of g along the axis, taken from the inclusive scan
                ;; of g in the opposite direction at its last position, which
-               ;; adds in the same order.  Products, maxima, minima and
-               ;; combine expressions have no gradient rule; such a scan that
-               ;; depends on a trainable parameter is an error.
+               ;; adds in the same order.  Products, maxima and minima have the
+               ;; gradients of scan-gradient (grad.scm); combine expressions
+               ;; have no gradient rule, and such a scan that depends on a
+               ;; trainable parameter is an error.
                ((eq? op 'scan)
                 (let ((get (lambda (k) (cdr (assq k meta)))))
                   (if (eq? (get 'scan-op) 'sum)
@@ -2260,9 +2305,19 @@
                                                  (step . ,(make-list rank 1)))))
                                  (dinit (emit! 'reshape (list cut) (val-shape i-val) dtype '())))
                             (accumulate-input-adjoint! i-val dinit))))
-                      (when (any param-dependent? inputs)
-                        (error "ssa-vjp: a scan has a gradient only for op sum, and this one depends on a trainable parameter"
-                               (get 'scan-op) bid-sym)))))
+                      (if (memq (get 'scan-op) '(prod max min))
+                          (let* ((x-val   (list-ref inputs 0))
+                                 (x-shape (val-shape x-val))
+                                 (ax      (get 'axis))
+                                 (i-val   (and (pair? (cdr inputs)) (list-ref inputs 1)))
+                                 (d       (am:scan-gradient (ssa-scan-ops ax dtype) (get 'scan-op) x-shape dtype ax
+                                                            (get 'exclusive?) (get 'reverse?) (get 'swapped?)
+                                                            g-val x-val (binding-ref bid-sym) i-val)))
+                            (accumulate-input-adjoint! x-val (car d))
+                            (when i-val (accumulate-input-adjoint! i-val (cdr d))))
+                          (when (any param-dependent? inputs)
+                            (error "ssa-vjp: a scan with a combine expression has no gradient, and this one depends on a trainable parameter"
+                                   (get 'scan-op) bid-sym))))))
 
                ;; map(x, fn) -- a user procedure has no derivative.  A map whose
                ;; input does not depend on a trainable parameter passes no
@@ -2442,12 +2497,16 @@
       ((eq? op 'batch-matmul)
        (morph-batch-matmul (car inputs) (cadr inputs)))
       ((eq? op 'scan)
-       (let ((get (lambda (k) (cdr (assq k meta)))))
+       (let* ((get (lambda (k) (cdr (assq k meta))))
+              (k   (let ((p (assq 'aux-count meta))) (if p (cdr p) 0))))
          (morph-scan (get 'scan-op) (car inputs) (get 'axis)
                      exclusive?: (get 'exclusive?) reverse?: (get 'reverse?)
                      swapped?: (get 'swapped?)
                      neutral: (let ((p (assq 'neutral meta))) (and p (cdr p)))
-                     init: (and (pair? (cdr inputs)) (cadr inputs)))))
+                     init: (and (= (length inputs) (+ 2 k)) (cadr inputs))
+                     aux: (list-tail inputs (- (length inputs) k)))))
+      ((memq op '(gt lt ge le eq))
+       (create-comparison-morphism op (car inputs) (cadr inputs)))
       ((eq? op 'transpose)
        (let ((perm (cdr (assq 'perm meta))))
          (morph-transpose (car inputs) perm)))

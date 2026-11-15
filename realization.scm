@@ -121,7 +121,8 @@
           array-morphisms-activation-exec
           array-morphisms-micro-blas-backend
           (only array-morphisms-scalar-ops scalar-add)
-          (only array-morphisms-segop combine-expression-body scalar-expr->procedure))
+          (only array-morphisms-segop combine-expression-body combine-expression-arity
+                scalar-expr->procedure))
 
   ;; Default-backend bootstrap: register the dependency-free microBLAS
   ;; backend unless something (e.g. the system-BLAS egg backend) has
@@ -1842,25 +1843,28 @@
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
   (define (scan-step-procedure op swapped?)
-    "The step (lambda (acc x) ...) of a scan with op sum, prod, max, min or a
-    combine expression: the value so far combined with one more element,
-    before rounding.  With swapped? the two arguments of the combining
-    operation trade places."
+    "The step (lambda (acc x . aux) ...) of a scan with op sum, prod, max,
+    min or a combine expression: the value so far combined with one more
+    element (and, for a combine expression with more than two variables,
+    the elements of the aux arrays at the same position), before rounding.
+    With swapped? the accumulator and the element trade places."
     (let ((f (case op
                ((sum)  scalar-add)
                ((prod) *)
                ((max)  (lambda (acc x) (if (> x acc) x acc)))
                ((min)  (lambda (acc x) (if (< x acc) x acc)))
                (else (if (pair? op)
-                         (scalar-expr->procedure (combine-expression-body op) 2)
+                         (scalar-expr->procedure (combine-expression-body op)
+                                                 (combine-expression-arity op))
                          (error "scan: unknown op" op))))))
-      (if swapped? (lambda (acc x) (f x acc)) f)))
+      (if swapped? (lambda (acc x . aux) (apply f x acc aux)) f)))
 
   (define (execute-scan-morphism fn output-buffer shape operands dtype)
     "Fill the row-major output-buffer of the given shape with the scan
-    described by the scan-index-fn fn.  operands is (src) or (src init),
-    realized concrete arrays of any layout; init has the shape of src
-    without the scanned axis.  Each line along the axis is scanned in order
+    described by the scan-index-fn fn.  operands is (src), (src init),
+    followed by the aux arrays, realized concrete arrays of any layout; init
+    has the shape of src without the scanned axis, and each aux array the
+    shape of src.  Each line along the axis is scanned in order
     (in reverse order when the scan is reversed); every output is the
     previous one combined with one more element and rounded to dtype by
     storing it.  An exclusive scan stores init, or the neutral element,
@@ -1879,7 +1883,13 @@
            (n (vector-ref shape ax))
            (src (layout (car operands)))
            (sdata (car src)) (sstr (cadr src)) (soff (caddr src)) (sdt (cadddr src))
-           (init (and (pair? (cdr operands)) (layout (cadr operands))))
+           (k (scan-index-fn-aux-count fn))
+           (init (and (= (length operands) (+ 2 k)) (layout (cadr operands))))
+           (auxs (map layout (list-tail operands (- (length operands) k))))
+           (a-par (map (lambda (a) (map (lambda (d) (vector-ref (cadr a) d))
+                                        (filter (lambda (d) (not (= d ax))) (iota rank))))
+                       auxs))
+           (a-step (map (lambda (a) (vector-ref (cadr a) ax)) auxs))
            (ostr (compute-strides shape))
            (par-dims (filter (lambda (d) (not (= d ax))) (iota rank)))
            (par-shape (map (lambda (d) (vector-ref shape d)) par-dims))
@@ -1893,31 +1903,37 @@
       (define (rounded x)
         (typed-vector-set! cell dtype 0 x)
         (typed-vector-ref cell dtype 0))
-      (define (scan-line! sbase obase seed)
+      (define (scan-line! sbase obase seed abases)
         (let loop ((r 0) (acc seed))
           (when (< r n)
             (let* ((pos (if rev? (- n 1 r) r))
                    (x (typed-vector-ref sdata sdt (+ sbase (* pos s-step))))
+                   (xs (map (lambda (a b st) (typed-vector-ref (car a) (cadddr a) (+ b (* pos st))))
+                            auxs abases a-step))
                    (o (+ obase (* pos o-step))))
               (if excl?
                   (begin
                     (typed-vector-set! output-buffer dtype o (or acc neutral))
-                    (loop (+ r 1) (rounded (if acc (step acc x) x))))
+                    (loop (+ r 1) (rounded (if acc (apply step acc x xs) x))))
                   (begin
-                    (typed-vector-set! output-buffer dtype o (if acc (step acc x) x))
+                    (typed-vector-set! output-buffer dtype o (if acc (apply step acc x xs) x))
                     (loop (+ r 1) (typed-vector-ref output-buffer dtype o))))))))
       (unless (= n 0)
         ;; Visit every line: an odometer over the other axes, carrying the
-        ;; source, output and init positions of the line's first element.
-        (let walk ((dims par-shape) (ss s-par) (os o-par) (is i-par)
-                   (sbase soff) (obase 0) (ibase (if init (caddr init) 0)))
+        ;; source, output, init and aux positions of the line's first
+        ;; element.
+        (let walk ((dims par-shape) (ss s-par) (os o-par) (is i-par) (as a-par)
+                   (sbase soff) (obase 0) (ibase (if init (caddr init) 0))
+                   (abases (map caddr auxs)))
           (if (null? dims)
               (scan-line! sbase obase
-                          (and init (rounded (typed-vector-ref (car init) (cadddr init) ibase))))
-              (do ((k 0 (+ k 1))) ((= k (car dims)))
-                (walk (cdr dims) (cdr ss) (cdr os) (cdr is)
-                      (+ sbase (* k (car ss))) (+ obase (* k (car os)))
-                      (+ ibase (* k (car is))))))))))
+                          (and init (rounded (typed-vector-ref (car init) (cadddr init) ibase)))
+                          abases)
+              (do ((j 0 (+ j 1))) ((= j (car dims)))
+                (walk (cdr dims) (cdr ss) (cdr os) (cdr is) (map cdr as)
+                      (+ sbase (* j (car ss))) (+ obase (* j (car os)))
+                      (+ ibase (* j (car is)))
+                      (map (lambda (b st) (+ b (* j (car st)))) abases as))))))))
 
   (define (execute-col2im-morphism fn output-buffer shape operands dtype)
     "Execute col2im with accumulation for overlapping windows

@@ -96,6 +96,7 @@
    scan-index-fn-reverse?
    scan-index-fn-swapped?
    scan-index-fn-neutral
+   scan-index-fn-aux-count
 
    ;; col2im index functions (accumulation)
    col2im-index-fn?
@@ -374,7 +375,23 @@
 ;;               (op acc element).
 ;;   neutral:    for a combine expression, its neutral element or #f;
 ;;               otherwise #f (the neutral element follows from op).
-(define-record scan-index-fn op axis exclusive? reverse? swapped? neutral)
+;;   aux-count:  the number of extra arrays (the last operands) whose
+;;               elements a combine expression receives after the
+;;               accumulator and the element.
+(define-record-type scan-index-fn
+  (%make-scan-index-fn op axis exclusive? reverse? swapped? neutral aux-count)
+  scan-index-fn?
+  (op scan-index-fn-op)
+  (axis scan-index-fn-axis)
+  (exclusive? scan-index-fn-exclusive?)
+  (reverse? scan-index-fn-reverse?)
+  (swapped? scan-index-fn-swapped?)
+  (neutral scan-index-fn-neutral)
+  (aux-count scan-index-fn-aux-count))
+
+(define (make-scan-index-fn op axis exclusive? reverse? swapped? neutral #!optional (aux-count 0))
+  "A scan index function; see the record definition for the fields."
+  (%make-scan-index-fn op axis exclusive? reverse? swapped? neutral aux-count))
 
 (define-record-type col2im-index-fn
   (make-col2im-index-fn-record kernel-h kernel-w stride-h stride-w pad-h pad-w col-layout)

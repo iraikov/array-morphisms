@@ -35,7 +35,7 @@
                 srfi-4 datatype matchable
                 srfi-1 srfi-69 array-morphisms-core
                 array-morphisms-index-fn array-morphisms-scalar-ops
-                (only array-morphisms-segop combine-expression?))
+                (only array-morphisms-segop combine-expression? combine-expression-arity))
 
 ;;; ============================================================================
 ;;; Helper Functions for Binary Operations
@@ -638,7 +638,7 @@
 ;;; ============================================================================
 
 (define (morph-scan op m axis #!key (exclusive? #f) (reverse? #f) (init #f) (swapped? #f)
-                    (neutral #f))
+                    (neutral #f) (aux '()))
   "Scan m along axis: the cumulative sum, product, maximum or minimum, or a
    scan with a combine expression.
 
@@ -667,6 +667,11 @@
      neutral: for a combine expression, the value an exclusive scan without
            init gives at position 0 (#f when it has none; such a scan then
            needs init)
+     aux: a list of arrays of m's shape for a combine expression with
+           more than two variables, (lambda (a b c ...) e): at each step,
+           c ... are the elements of these arrays at the position of b.
+           (lambda (a b c) (+ b (* c a))), for example, is the linear
+           recurrence out[r] = x[r] + c[r] * out[r-1].
 
    Each output is the previous output combined with one more element and
    rounded to the result dtype, as a loop over the elements in order
@@ -688,6 +693,13 @@
     (error "morph-scan: op must be sum, prod, max, min or a combine expression" op))
   (unless (or (not neutral) (and (number? neutral) (pair? op)))
     (error "morph-scan: a neutral element is given only with a combine expression" neutral))
+  (unless (and (list? aux) (every array-morphism? aux)
+               (every (lambda (c) (equal? (get-morphism-shape c) (get-morphism-shape m))) aux))
+    (error "morph-scan: aux must be a list of arrays of the operand's shape" aux))
+  (unless (if (pair? op)
+              (= (combine-expression-arity op) (+ 2 (length aux)))
+              (null? aux))
+    (error "morph-scan: the combine expression needs one variable per aux array" op (length aux)))
   (when (and (pair? op) exclusive? (not init) (not neutral))
     (error "morph-scan: an exclusive scan with a combine expression needs init or a neutral element"
            op))
@@ -713,15 +725,16 @@
                (get-morphism-dtype init) dtype)))
     (morphism-expr (gensym 'morph-)
                    'scan
-                   (if init (list m init) (list m))
+                   (append (if init (list m init) (list m)) aux)
                    (make-scan-index-fn op ax (and exclusive? #t) (and reverse? #t) (and swapped? #t)
-                                       neutral)
+                                       neutral (length aux))
                    shape
                    dtype
                    (append
                     `((scan-op . ,op) (axis . ,ax) (exclusive? . ,(and exclusive? #t))
                       (reverse? . ,(and reverse? #t)) (swapped? . ,(and swapped? #t)))
-                    (if neutral `((neutral . ,neutral)) '()))
+                    (if neutral `((neutral . ,neutral)) '())
+                    (if (pair? aux) `((aux-count . ,(length aux)) (init? . ,(and init #t))) '()))
                    (get-morphism-batch-axis m))))
 
 (define (morph-cumsum m axis #!key (exclusive? #f) (reverse? #f) (init #f))

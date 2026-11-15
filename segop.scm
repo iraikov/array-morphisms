@@ -112,7 +112,7 @@
    combine-spec?
    combine-spec-op combine-spec-neutral combine-spec-acc-dtype
    combine-spec-order combine-spec-block-size combine-spec-procedure
-   combine-expression? combine-expression-body
+   combine-expression? combine-expression-body combine-expression-arity
    make-red-result
    red-result?
    red-result-out red-result-body red-result-combine red-result-finalize
@@ -122,7 +122,7 @@
    make-scan-result
    scan-result?
    scan-result-out scan-result-body scan-result-combine scan-result-seed
-   scan-result-exclusive? scan-result-swapped?
+   scan-result-exclusive? scan-result-swapped? scan-result-aux
 
    ;; Segops
    segop segop?
@@ -993,10 +993,11 @@
 ;; How the values of a reduction or a scan are combined.
 ;;   op:         add, mul, max, min, (opaque proc) with proc a procedure
 ;;               of the accumulator and a value, or a combine expression
-;;               (lambda (a b) e): e is a scalar expression (no (in k),
-;;               (param k), (idx d) or (reduced)) in the variables a, the
-;;               accumulator, and b, the value; it is computed in double
-;;               precision.
+;;               (lambda (a b c ...) e): e is a scalar expression (no
+;;               (in k), (param k), (idx d) or (reduced)) in the variables
+;;               a, the accumulator, b, the value, and for a scan, c ...,
+;;               the values of its extra inputs at the same position (see
+;;               scan-result); it is computed in double precision.
 ;;               max and min replace the accumulator by a value only when
 ;;               the value is greater (smaller); a NaN value never
 ;;               replaces it.  The Scheme procedures max and min, which
@@ -1027,18 +1028,24 @@
   (procedure combine-spec-procedure))
 
 (define (combine-expression? op)
-  "True when op has the form (lambda (a b) e) of a combine expression whose
-   e is a valid scalar expression in the variables a and b."
+  "True when op has the form (lambda (a b c ...) e) of a combine expression,
+   with two or more distinct variables, whose e is a valid scalar
+   expression in them."
   (and (pair? op) (eq? (car op) 'lambda) (list? op) (= (length op) 3)
        (let ((vars (cadr op)))
-         (and (list? vars) (= (length vars) 2) (every symbol? vars)
-              (not (eq? (car vars) (cadr vars)))
-              (scalar-expr-valid? `(let* ((,(car vars) 0.0) (,(cadr vars) 0.0)) ,(caddr op)) 0 0)))))
+         (and (list? vars) (>= (length vars) 2) (every symbol? vars)
+              (= (length vars) (length (delete-duplicates vars)))
+              (scalar-expr-valid? `(let* ,(map (lambda (v) (list v 0.0)) vars) ,(caddr op)) 0 0)))))
+
+(define (combine-expression-arity op)
+  "The number of variables of combine expression op."
+  (length (cadr op)))
 
 (define (combine-expression-body op)
-  "The body of combine expression op as a scalar expression of two inputs:
-   (in 0) the accumulator and (in 1) the value."
-  `(let* ((,(car (cadr op)) (in 0)) (,(cadr (cadr op)) (in 1))) ,(caddr op)))
+  "The body of combine expression op as a scalar expression whose inputs
+   are its variables in order: (in 0) the accumulator, (in 1) the value,
+   (in 2) ... the extra values."
+  `(let* ,(map (lambda (v k) (list v `(in ,k))) (cadr op) (iota (length (cadr op)))) ,(caddr op)))
 
 (define (make-combine-spec op neutral acc-dtype #!optional (order 'sequential) (block-size #f))
     "A combine spec; see the record definition for the fields."
@@ -1057,7 +1064,8 @@
       (error 'make-combine-spec "the blocked order needs a positive block size" block-size))
     (%make-combine-spec op neutral acc-dtype order (and (eq? order 'blocked) block-size)
                         (and (combine-expression? op)
-                             (scalar-expr->procedure (combine-expression-body op) 2))))
+                             (scalar-expr->procedure (combine-expression-body op)
+                                                     (combine-expression-arity op)))))
 
 ;; One reduced value of a seg-reduce.
 ;;   out:      the output operand; its map uses only the parallel dimensions.
@@ -1082,7 +1090,24 @@
 ;;               accumulator as (op value acc) rather than (op acc value).
 ;;               The two orders give the same number, but when both are
 ;;               NaN they may give different NaN payloads.
-(define-record scan-result out body combine seed exclusive? swapped?)
+;;   aux:        a list of expressions over the inputs, read at each
+;;               point like body: the extra values a combine expression
+;;               with more than two variables receives after the
+;;               accumulator and the value.  Empty for every other op.
+(define-record-type scan-result
+  (%make-scan-result out body combine seed exclusive? swapped? aux)
+  scan-result?
+  (out scan-result-out)
+  (body scan-result-body)
+  (combine scan-result-combine)
+  (seed scan-result-seed)
+  (exclusive? scan-result-exclusive?)
+  (swapped? scan-result-swapped?)
+  (aux scan-result-aux))
+
+(define (make-scan-result out body combine seed exclusive? swapped? #!optional (aux '()))
+  "A scan result; see the record definition for the fields."
+  (%make-scan-result out body combine seed exclusive? swapped? aux))
 
 
 ;;;; ============================================================
@@ -1241,6 +1266,19 @@
        (unless (scan-result? r) (error 'make-seg-scan "not a scan-result" r))
        (unless (combine-spec? (scan-result-combine r))
          (error 'make-seg-scan "not a combine spec" (scan-result-combine r)))
+       (let* ((spec (scan-result-combine r))
+              (op   (combine-spec-op spec))
+              (aux  (scan-result-aux r)))
+         (unless (list? aux) (error 'make-seg-scan "aux must be a list of expressions" aux))
+         (if (combine-expression? op)
+             (unless (= (combine-expression-arity op) (+ 2 (length aux)))
+               (error 'make-seg-scan "the combine expression needs one variable per aux value"
+                      op (length aux)))
+             (unless (null? aux)
+               (error 'make-seg-scan "only a combine expression takes aux values" op)))
+         (when (and (pair? aux) (eq? (combine-spec-order spec) 'blocked))
+           (error 'make-seg-scan "a scan with aux values runs in the sequential order"))
+         (for-each (lambda (e) (check-body 'make-seg-scan e (length ins) rank #f)) aux))
        (when (and (scan-result-exclusive? r) (not (scan-result-seed r))
                   (not (combine-spec-neutral (scan-result-combine r))))
          (error 'make-seg-scan "an exclusive scan without a seed needs a neutral element"
@@ -1357,14 +1395,14 @@
   (let ((idx (apply-index-map (segop-operand-map o) coords)))
     (typed-vector-set! buf (segop-operand-dtype o) (operand-flat o idx) v)))
 
-(define (combine-step spec acc v)
+(define (combine-step spec acc v . aux)
   (let ((r (case (combine-spec-op spec)
              ((add) (+ acc v))
              ((mul) (* acc v))
              ((max) (if (> v acc) v acc))
              ((min) (if (< v acc) v acc))
              (else (if (combine-spec-procedure spec)
-                       ((combine-spec-procedure spec) acc v)
+                       (apply (combine-spec-procedure spec) acc v aux)
                        ((cadr (combine-spec-op spec)) acc v))))))
     (round-to-dtype r (combine-spec-acc-dtype spec))))
 
@@ -1466,9 +1504,19 @@
                (lambda (res buf)
                  (let* ((spec (scan-result-combine res))
                         (dt   (combine-spec-acc-dtype spec))
-                        (step (if (scan-result-swapped? res)
-                                  (lambda (acc v) (combine-step spec v acc))
-                                  (lambda (acc v) (combine-step spec acc v))))
+                        (aux  (scan-result-aux res))
+                        (aux-at (lambda (r)
+                                  (let ((c (coords-at r)))
+                                    (map (lambda (e) (eval-scalar-expr e (reader c) params: params coords: c))
+                                         aux))))
+                        ;; the step at position r (the aux values of that
+                        ;; position follow the accumulator and the value)
+                        (step-at (lambda (r)
+                                   (let ((xs (aux-at r)))
+                                     (if (scan-result-swapped? res)
+                                         (lambda (acc v) (apply combine-step spec v acc xs))
+                                         (lambda (acc v) (apply combine-step spec acc v xs))))))
+                        (step (step-at 0))
                         (seed (and (scan-result-seed res)
                                    (round-to-dtype
                                     (eval-scalar-expr (scan-result-seed res) (reader (coords-at 0))
@@ -1480,7 +1528,7 @@
                                                      params: params coords: c))))
                         ;; push: the accumulator after one more value; #f
                         ;; stands for an empty accumulator.
-                        (push (lambda (acc v) (if acc (step acc v) (round-to-dtype v dt))))
+                        (push (lambda (acc v r) (if acc ((step-at r) acc v) (round-to-dtype v dt))))
                         (incl (make-vector n #f)))
                    ;; incl[r] is the inclusive scan at r, seed included.
                    (if (eq? (combine-spec-order spec) 'blocked)
@@ -1490,13 +1538,13 @@
                              (let ((end (min n (+ start b))))
                                (let loop ((r start) (local #f))
                                  (when (< r end)
-                                   (let ((l (push local (value r))))
+                                   (let ((l (push local (value r) r)))
                                      (vector-set! incl r (if carry (step carry l) l))
                                      (loop (+ r 1) l))))
                                (chunk end (vector-ref incl (- end 1)))))))
                        (let loop ((r 0) (acc seed))
                          (when (< r n)
-                           (let ((a (push acc (value r))))
+                           (let ((a (push acc (value r) r)))
                              (vector-set! incl r a)
                              (loop (+ r 1) a)))))
                    (do ((r 0 (+ r 1))) ((= r n))

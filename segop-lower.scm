@@ -978,8 +978,9 @@
 
 (define (lower-scan-binding meta in-traces in-refs pool-idx shape strides dtype)
   "The seg-scan of a scan binding with meta meta (scan-op, axis,
-   exclusive?, reverse?, swapped?), whose source (and init, when there is
-   one) had the trace-time arrays in-traces and are found at in-refs,
+   exclusive?, reverse?, swapped?, and aux-count when the scan has aux
+   arrays), whose source (then init, when there is one, then the aux
+   arrays) had the trace-time arrays in-traces and are found at in-refs,
    writing pool slot pool-idx of the given shape, strides and dtype."
   (let* ((get  (lambda (k) (cdr (assq k meta))))
          (op   (get 'scan-op))
@@ -1000,18 +1001,24 @@
                     (cases array-morphism tr
                       (concrete-array (_ s st off dt _ _) (make-segop-operand ref dt s st off m))
                       (else (error "lower-scan-binding: input not concrete" tr)))))
+         (k    (let ((p (assq 'aux-count meta))) (if p (cdr p) 0)))
          (src  (operand (car in-traces) (car in-refs) axis-map))
-         (init (and (pair? (cdr in-traces))
+         (init (and (= (length in-traces) (+ 2 k))
                     (operand (cadr in-traces) (cadr in-refs) (identity-index-map npar))))
+         (auxs (map (lambda (tr ref) (operand tr ref axis-map))
+                    (list-tail in-traces (- (length in-traces) k))
+                    (list-tail in-refs (- (length in-refs) k))))
+         (aux-base (if init 2 1))
          (neutral (if (symbol? op)
                       (reduction-neutral op dtype)
                       (let ((p (assq 'neutral meta))) (and p (cdr p)))))
          (spec (make-combine-spec (scan-combine-op op) neutral dtype)))
     (make-seg-scan space
-                   (if init (list src init) (list src))
+                   (append (if init (list src init) (list src)) auxs)
                    (list (make-scan-result (make-segop-operand pool-idx dtype shape strides 0 axis-map)
                                            '(in 0) spec (and init '(in 1))
-                                           (get 'exclusive?) (get 'swapped?))))))
+                                           (get 'exclusive?) (get 'swapped?)
+                                           (map (lambda (j) `(in ,(+ aux-base j))) (iota k)))))))
 
 (define (compile-scan-segop meta in-traces in-refs pool-idx shape strides dtype)
   "The ri-segop instruction of a scan binding (see lower-scan-binding)."
@@ -1019,8 +1026,9 @@
                          pool-idx shape strides dtype)
       (error "compile-scan-segop: no backend accepts the scan" meta)))
 
-;; The step (acc x) -> value of combine spec spec, before rounding, the
-;; arguments trading places when swapped?.  It is the step of combine-step.
+;; The step (acc x . aux) -> value of combine spec spec, before rounding,
+;; the accumulator and the element trading places when swapped?; aux are
+;; the values a combine expression with more than two variables receives.  It is the step of combine-step.
 (define (scan-step spec swapped?)
   (let* ((cop (combine-spec-op spec))
          (f (case cop
@@ -1030,7 +1038,7 @@
               ((min) (lambda (acc x) (if (< x acc) x acc)))
               (else (or (combine-spec-procedure spec)
                         (lambda (acc x) ((cadr cop) acc x)))))))
-    (if swapped? (lambda (acc x) (f x acc)) f)))
+    (if swapped? (lambda (acc x . aux) (apply f x acc aux)) f)))
 
 ;; The parts of a seg-scan the executors below share: the parallel space,
 ;; the linear forms of every operand over it (inputs, then the output), the
@@ -1185,6 +1193,9 @@
                 ((n-res) (length results))
                 ((bodies) (list->vector (map (lambda (r) (scalar-expr->procedure (scan-result-body r) n-in))
                                              results)))
+                ((auxs) (list->vector (map (lambda (r) (map (lambda (e) (scalar-expr->procedure e n-in))
+                                                            (scan-result-aux r)))
+                                           results)))
                 ((seeds) (list->vector (map (lambda (r) (and (scan-result-seed r)
                                                              (scalar-expr->procedure (scan-result-seed r) n-in)))
                                             results)))
@@ -1217,7 +1228,8 @@
                         (dt   (combine-spec-acc-dtype spec))
                         (acc  (vector-ref accs j))
                         (v    (apply (vector-ref bodies j) xs))
-                        (next (round-to-dtype (if acc ((vector-ref steps-of j) acc v) v) dt))
+                        (ax   (map (lambda (p) (apply p xs)) (vector-ref auxs j)))
+                        (next (round-to-dtype (if acc (apply (vector-ref steps-of j) acc v ax) v) dt))
                         (o    (vector-ref offs* (+ n-in j))))
                    (typed-vector-set! (vector-ref bufs j) (vector-ref odts j) o
                                       (if (scan-result-exclusive? res)
