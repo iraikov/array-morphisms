@@ -247,6 +247,14 @@ whose derivative is not computed. A `morph-map` runs like any element-wise
 op, but its procedure has no derivative: `ssa-vjp` raises an error when
 the input of a map depends on a trainable parameter.
 
+Slices, constant pads, stacks and concatenations can be part of a compiled
+SSA graph, and their gradients go back to their inputs: a slice passes back
+the incoming gradient padded with zeros, a pad passes back the part of it
+that holds the input, and a stack or concatenation gives each input its
+part. A slice with a step above 1, and edge or reflect padding, have no
+derivative: `ssa-vjp` raises an error when their input depends on a
+trainable parameter, as for `morph-map`.
+
 ## Performance Tips
 
 1. **Realize once.** Build the whole expression, then call `realize` on
@@ -685,7 +693,8 @@ over; `min` likewise.
 
 A combining expression `(lambda (a b) e)` gives the step: `a` is the
 value so far and `b` the next element. `e` uses the ops of the scalar-op
-table, numbers and `cast`:
+table, numbers, `cast`, and `if` with a comparison (`<`, `>`, `<=`, `>=`,
+`=`) as its test:
 
 ```scheme
 ;; an exponential moving sum: out[r] = 0.9 * out[r-1] + x[r]
@@ -717,13 +726,15 @@ condition. A step that adds or multiplies its two arguments becomes the
 batch axis: the result is one scan, with as many nodes for any batch
 size. When the step cannot be turned into an expression, or `init` is not
 an array of one element's shape and dtype, it runs `batch-scan/slices`,
-which applies the step to each slice and stacks the results.
+which applies the step to each slice and stacks the results; that version
+also runs in compiled SSA graphs, with as many nodes as elements.
 
 ### Gradients
 
 `ssa-vjp` differentiates `sum` scans: the gradient of the scanned array is
 the scan of the incoming gradient in the opposite direction, and that of
-`init` is the incoming gradient summed along the axis. `var-scan`
+`init` is the incoming gradient summed along the axis, in the same order as
+the step-by-step program adds it. `var-scan`
 (`array-morphisms-grad`) does the same for `backward!`. Scans with other
 ops or with an expression have no gradient; using one on a trainable
 parameter is an error.
