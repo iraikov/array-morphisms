@@ -42,6 +42,18 @@
 ;;;     strides (Scheme vectors) and the offset of its first element, into
 ;;;     dst in row-major order.
 ;;;
+;;;   * Scans, (op . dtype) -> (outer n inner src seed out flags), where op
+;;;     is sum, prod, max or min.  src and out are row-major arrays of
+;;;     outer * n * inner elements read and written from element 0: the
+;;;     array [outer, n, inner] is scanned along its middle axis, which is
+;;;     how a row-major array of any rank is scanned along one of its axes
+;;;     (outer and inner being the products of the extents before and after
+;;;     it).  The bits of flags are 1 for an exclusive scan, 2 for a
+;;;     reversed one, 4 when seed, a row-major [outer, inner] array, holds
+;;;     the values the lines start from, and 8 when each step combines the
+;;;     element with the value so far as (op element acc).  A kernel must
+;;;     give the values of execute-scan-morphism bit for bit.
+;;;
 ;;;   * Fused kernels, (body . dtype) -> (size ins out), each computing a
 ;;;     whole scalar body (see segop.scm) at every element: out[i] is the
 ;;;     body applied to element i of the vectors in the list ins, which
@@ -106,7 +118,11 @@
 
    ;; Fused column-sum kernels
    activation-backend-add-colsum-kernel!
-   lookup-colsum-kernel)
+   lookup-colsum-kernel
+
+   ;; Scan kernels
+   activation-backend-add-scan-kernel!
+   lookup-scan-kernel)
 
   (import scheme (chicken base))
   (import (only srfi-69
@@ -123,10 +139,11 @@
   ;; reduction and strided-copy kernels in the same way.
   ;; broadcast-table holds the broadcast binary kernels, fused-table the
   ;; fused kernels and colsum-table the fused column-sum kernels, both
-  ;; keyed by (body . dtype).
+  ;; keyed by (body . dtype).  scan-table holds the scan kernels, keyed by
+  ;; (op . dtype).
   (define-record-type activation-backend
     (%make-activation-backend name table binary-table reduction-table copy-table
-                              broadcast-table fused-table colsum-table)
+                              broadcast-table fused-table colsum-table scan-table)
     activation-backend?
     (name            activation-backend-name)
     (table           activation-backend-table)
@@ -135,14 +152,15 @@
     (copy-table      activation-backend-copy-table)
     (broadcast-table activation-backend-broadcast-table)
     (fused-table     activation-backend-fused-table)
-    (colsum-table    activation-backend-colsum-table))
+    (colsum-table    activation-backend-colsum-table)
+    (scan-table      activation-backend-scan-table))
 
   (define (make-activation-backend name)
     "Create an activation backend called name (a symbol) with no kernels."
     (%make-activation-backend name (make-hash-table equal?) (make-hash-table equal?)
                               (make-hash-table equal?) (make-hash-table equal?)
                               (make-hash-table equal?) (make-hash-table equal?)
-                              (make-hash-table equal?)))
+                              (make-hash-table equal?) (make-hash-table equal?)))
 
   (define (check-kernel who dtype kernel)
     (unless (memq dtype '(f32 f64))
@@ -243,6 +261,20 @@
     dtype arrays, or #f."
     (and bkend
          (hash-table-ref/default (activation-backend-colsum-table bkend) (cons body dtype) #f)))
+
+  (define (activation-backend-add-scan-kernel! bkend op dtype kernel)
+    "Installs kernel, a procedure (outer n inner src seed out flags) -> void,
+    as the backend's scan with op (sum, prod, max or min) of dtype arrays
+    (see the module header for the arguments)."
+    (check-kernel 'activation-backend-add-scan-kernel! dtype kernel)
+    (unless (memq op '(sum prod max min))
+      (error 'activation-backend-add-scan-kernel! "unsupported scan op" op))
+    (hash-table-set! (activation-backend-scan-table bkend) (cons op dtype) kernel))
+
+  (define (lookup-scan-kernel bkend op dtype)
+    "The scan kernel bkend holds for op on dtype arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-scan-table bkend) (cons op dtype) #f)))
 
   (define (activation-backend-fused-patterns bkend)
     "The (body . dtype) pairs of the fused kernels bkend holds."

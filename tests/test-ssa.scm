@@ -4359,6 +4359,66 @@
         '(#t all))))
    '(f32 f64)))
 
+;;;; Scan kernels of an activation backend
+;;;; ============================================================
+
+;; A scan kernel that follows the kernel contract by running
+;; execute-scan-morphism on the [outer, n, inner] array; it counts its
+;; calls.
+(define sk-calls 0)
+(define (sk-kernel op dt)
+  (lambda (outer n inner src seed out flags)
+    (set! sk-calls (+ sk-calls 1))
+    (let* ((shape (vector outer n inner))
+           (bit (lambda (b) (odd? (quotient flags b))))
+           (x (concrete-array src shape (compute-strides shape) 0 dt -1 -1))
+           (s (and (bit 4) (concrete-array seed (vector outer inner) (vector inner 1) 0 dt -1 -1))))
+      (execute-scan-morphism (make-scan-index-fn op 1 (bit 1) (bit 2) (bit 8) #f)
+                             out shape (if s (list x s) (list x)) dt))))
+
+(test-group "scan kernels of an activation backend"
+  (let ((be (make-activation-backend 'scan-test))
+        (saved (active-activation-backend)))
+    (for-each (lambda (op) (for-each (lambda (dt) (activation-backend-add-scan-kernel! be op dt (sk-kernel op dt)))
+                                     '(f32 f64)))
+              '(sum prod max min))
+    (register-activation-backend! be)
+    (for-each
+     (lambda (dt)
+       (for-each
+        (lambda (op)
+          (for-each
+           (lambda (axis)
+             (for-each
+              (lambda (flags)
+                (let* ((excl (car flags)) (rev (cadr flags)) (init? (caddr flags))
+                       (shape '(3 4 5))
+                       (make (lambda ()
+                               (let* ((x (s2-src dt shape s2-val))
+                                      (ishape (append (take shape axis) (drop shape (+ axis 1))))
+                                      (init (and init? (s2-src dt ishape (lambda (i) (- (* 0.5 i) 1.0))))))
+                                 (morph-scan op x axis exclusive?: excl reverse?: rev init: init))))
+                       (_ (set! sk-calls 0))
+                       (r (s2-run make))
+                       (name (sprintf "kernel ~A ~A axis ~A~A~A~A" dt op axis (if excl " exclusive" "")
+                                      (if rev " reverse" "") (if init? " init" ""))))
+                  (test-assert (string-append name ": segop/scan-kernel")
+                    (and (memq 'segop/scan-kernel (s2-tags (car r))) (> sk-calls 0)))
+                  (test (string-append name ": executors agree with the interpreter") 0 (list-ref r 4))
+                  (test-assert (string-append name ": values equal realize")
+                    (s2-same-lists? (cadr r) (s2-values (realize (make)))))))
+              '((#f #f #f) (#t #t #t) (#t #f #t) (#f #t #f))))
+           '(0 1 2)))
+        '(sum prod max min)))
+     '(f32 f64))
+    (let ((r (s2-run (lambda () (morph-cumsum (morph-transpose (s2-src 'f32 '(4 6) s2-val) '(1 0)) 1)))))
+      (test-assert "a transposed source keeps segop/scan" (memq 'segop/scan (s2-tags (car r)))))
+    (let ((r (s2-run (lambda () (morph-scan '(lambda (a b) (+ a b)) (s2-src 'f64 '(4 6) s2-val) 1)))))
+      (test-assert "a combine expression keeps segop/strided-scan" (memq 'segop/strided-scan (s2-tags (car r)))))
+    (register-activation-backend! saved)
+    (let ((r (s2-run (lambda () (morph-cumsum (s2-src 'f64 '(4 6) s2-val) 1)))))
+      (test-assert "without the backend: segop/scan" (memq 'segop/scan (s2-tags (car r)))))))
+
 ;;;; Lifted programs
 ;;;; ============================================================
 

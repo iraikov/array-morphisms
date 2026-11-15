@@ -1109,6 +1109,70 @@
                   (cons 'segop/scan (scan-executor space ins res))))))
     (else #f)))
 
+;; A scan of the active activation backend (tag segop/scan-kernel): a scan
+;; with one result, body (in 0), an optional seed (in 1) and a table op,
+;; over f32 or f64 operands of one dtype, in the form lower-scan-binding
+;; gives a scan of a row-major source: the source, the output and the seed
+;; row-major from element 0, the source and the output read through the
+;; same map, which sends each space dimension back to its axis.
+(define (registry-scan-select sg)
+  (cases segop sg
+    (seg-scan (space ins results fallback)
+      (and (= (length results) 1)
+           (let* ((res  (car results))
+                  (out  (scan-result-out res))
+                  (dt   (segop-operand-dtype out))
+                  (spec (scan-result-combine res))
+                  (rop  (case (combine-spec-op spec)
+                          ((add) 'sum) ((mul) 'prod) ((max) 'max) ((min) 'min) (else #f)))
+                  (kernel (and rop (memq dt '(f32 f64))
+                               (lookup-scan-kernel (active-activation-backend) rop dt)))
+                  (rank (vector-length space))
+                  (npar (- rank 1))
+                  (n    (vector-ref space npar))
+                  (src  (car ins))
+                  (seed (and (pair? (cdr ins)) (cadr ins)))
+                  (exprs (index-map-exprs (segop-operand-map out)))
+                  (ax   (and exprs (list-index (lambda (e) (memv npar (index-expr-dims e)))
+                                               (vector->list exprs))))
+                  (flat? (lambda (o) (and (= (segop-operand-offset o) 0)
+                                          (equal? (segop-operand-strides o)
+                                                  (compute-strides (segop-operand-shape o)))))))
+             (and kernel ax
+                  (eq? (combine-spec-acc-dtype spec) dt)
+                  (memq (combine-spec-order spec) '(sequential unspecified))
+                  (equal? (scan-result-body res) '(in 0))
+                  (if seed
+                      (and (= (length ins) 2) (equal? (scan-result-seed res) '(in 1))
+                           (flat? seed)
+                           (equal? (segop-operand-shape seed) (subvector space 0 npar))
+                           (index-map-equal? (segop-operand-map seed) (identity-index-map npar)))
+                      (= (length ins) 1))
+                  (every (lambda (o) (eq? (segop-operand-dtype o) dt)) ins)
+                  (flat? src) (flat? out)
+                  (equal? (segop-operand-shape src) (segop-operand-shape out))
+                  (index-map-equal? (segop-operand-map src) (segop-operand-map out))
+                  (let ((rev? (not (equal? (vector-ref exprs ax) `(dim ,npar)))))
+                    (and (or (not rev?)
+                             (equal? (vector-ref exprs ax) `(+ ,(- n 1) (* -1 (dim ,npar)))))
+                         (every (lambda (k)
+                                  (equal? (vector-ref exprs k) `(dim ,(if (< k ax) k (- k 1)))))
+                                (filter (lambda (k) (not (= k ax))) (iota rank)))
+                         (let* ((shape (segop-operand-shape out))
+                                (outer (fold * 1 (take (vector->list shape) ax)))
+                                (inner (fold * 1 (drop (vector->list shape) (+ ax 1))))
+                                (flags (+ (if (scan-result-exclusive? res) 1 0) (if rev? 2 0)
+                                          (if seed 4 0) (if (scan-result-swapped? res) 8 0)))
+                                (x-ref (segop-operand-slot src))
+                                (s-ref (and seed (segop-operand-slot seed)))
+                                (dummy (allocate-typed-vector dt 1)))
+                           (cons 'segop/scan-kernel
+                                 (lambda (deref buf #!optional (extra-bufs '()))
+                                   (kernel outer n inner (operand-data 'scan-kernel (deref x-ref))
+                                           (if s-ref (operand-data 'scan-kernel (deref s-ref)) dummy)
+                                           buf flags))))))))))
+    (else #f)))
+
 ;; Executor of any seg-scan in the sequential order whose operands all have
 ;; linear forms: bodies and seeds are compiled procedures.
 (define (strided-scan-executor space ins results)
@@ -2265,7 +2329,7 @@
       (registry-elementwise-select sg)
       (select-standard-reduction sg '(axis0 axis1))
       (registry-gather-select sg)
-      (scan-select sg)))
+      (registry-scan-select sg)))
 
 (define (scheme-select sg)
   (or (scheme-gemm-select sg)
