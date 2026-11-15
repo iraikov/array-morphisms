@@ -490,7 +490,7 @@
       (let ((fn (lambda (acc x) (if (> (car (sc-elements x)) 100.0) acc (morph+ acc x)))))
         (and (not (eq? 'scan (sc-op-of (batch-scan fn init m)))) (sc-batch-same? fn init m)))))
 
-  ;; The gradient of a batch-scan with morph+ is the step 4 rule's.
+  ;; The gradient of a batch-scan with morph+ is the reverse cumulative sum of g.
   (let* ((X (morph-from-list (sc-vals 12 1 'f64 #f) #(4 3) 'f64))
          (init (morph-from-list '(0.0 0.0 0.0) #(3) 'f64))
          (c-vals (sc-vals 12 7 'f64 #t))

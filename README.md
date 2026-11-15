@@ -11,6 +11,7 @@ A CHICKEN Scheme library for numerical arrays. Operations build expressions that
 - **Buffer reuse**: a computation that runs many times plans its buffers once and reuses them.
 - **BLAS**: matrix products and convolutions run on a pluggable BLAS backend.
 - **Kernel backends**: pluggable whole-array kernels for activations, arithmetic, reductions and copies, which give the same results as the Scheme loops they replace.
+- **Scans**: cumulative sums, products, maxima and minima along an axis, and scans with your own combining expression; each value equals that of a plain loop.
 - **Frame lifting**: apply a function to every cell of a frame (every example of a batch, or every attention head) as one computation; each cell gets exactly the values it would get on its own.
 - **Element types**: f64, f32, s64 and s32.
 - **Category-theoretic model**: array computations as morphisms, maps that preserve the structure of arrays.
@@ -179,6 +180,11 @@ order:
 ;; and each cell is reduced exactly as it would be on its own (see Frame
 ;; Lifting)
 (morph-reduce 'sum arr '(2) #f 1) ; [F M N] -> [F M]: the row sums of each [M N] cell
+
+;; Scan along an axis (see Scans)
+(morph-cumsum arr 0)                         ; running sums down axis 0
+(morph-scan 'max arr 1 reverse?: #t)         ; running maxima from the right
+(morph-scan '(lambda (a b) (+ (* a 0.9) b)) arr 1)   ; your own combining step
 
 ;; Fold and scan over the batch axis
 (batch-fold fn init batched-m)
@@ -361,6 +367,7 @@ one per op and dtype (f32 or f64), for:
   `relu-deriv`, `sigmoid-deriv` and `tanh-deriv` that the backward pass emits;
 - the binary ops `add`, `sub`, `mul` and `div`;
 - reductions of row-major 2-D arrays over axis 0 or 1;
+- scans (sum, prod, max, min) of row-major arrays along any axis;
 - copies of strided views into row-major order.
 
 When an SSA replay plan is compiled, each element-wise binding is lowered
@@ -516,10 +523,12 @@ represented as *segmented operations* (segops,
   rounds a value as storing it in an f32 array would;
 - the Scheme function it was lowered from, used to execute it on the host.
 
-There are three kinds: `seg-map` (element-wise maps, possibly with several
+There are four kinds: `seg-map` (element-wise maps, possibly with several
 outputs), `seg-reduce` (reductions, with a combine spec giving the operator,
-neutral element, accumulator precision and summation order) and `seg-lib`
-(named library operations, such as an index function run on the host).
+neutral element, accumulator precision and summation order), `seg-scan`
+(scans along the last dimension of the space, with a combine spec, an
+optional seed, and inclusive or exclusive results) and `seg-lib` (named
+library operations, such as an index function run on the host).
 Index maps cover identities, broadcasts, transposes, slices, reshapes
 (with `floordiv` and `mod`) and padded reads (with a guard and a fill
 value). Bodies and maps are data, so a code generator can read them and
@@ -527,9 +536,9 @@ compile a kernel.
 
 The segop abstractions are inspired by and follow the design of the
 Futhark compiler [1, 2]. Futhark's internal representation expresses
-parallel code as segmented operations (`SegMap`, `SegRed` and others)
-over an iteration space, and `seg-map` and `seg-reduce` take their
-structure from `SegMap` and `SegRed`. The fusion of a map into the reduction that
+parallel code as segmented operations (`SegMap`, `SegRed`, `SegScan` and
+others) over an iteration space, and `seg-map`, `seg-reduce` and
+`seg-scan` take their structure from `SegMap`, `SegRed` and `SegScan`. The fusion of a map into the reduction that
 reads it, with the map's value kept as an extra output when other code
 needs it, follows Futhark's *redomap* construct [3].
 
@@ -541,8 +550,8 @@ entry gives an op's parameters and formula. The combiners of
 table at compile time to generate its kernels, so all of them compute the
 same formula.
 
-`segop-interpret` executes any `seg-map` or `seg-reduce` directly from its
-definition. It is slow and is meant for testing.
+`segop-interpret` executes any `seg-map`, `seg-reduce` or `seg-scan`
+directly from its definition. It is slow and is meant for testing.
 
 When a replay plan is compiled, every binding except zero-copy views is
 lowered to a segop:
@@ -561,6 +570,9 @@ lowered to a segop:
   (an activation, or a bias add) of the same shape and dtype is fused as
   the reduction's finalize, applied to the stored product
   (`(sigmoid (cast f32 (reduced)))`);
+- a scan becomes a `seg-scan` whose space lists the other axes and then
+  the scanned one; a reversed scan reads and writes the scanned axis
+  from its end;
 - materialized views (such as a reshape of a transposed array) become a
   gather, a `seg-map` with the body `(in 0)`;
 - the convolution ops become segops over spaces with one dimension per
@@ -588,8 +600,8 @@ instruction. The backends in use are the value of the parameter
 
 Two backends are always present. `registry` runs the patterns that have
 kernels: matrix products on the BLAS backend, through prepared GEMM plans,
-and element-wise ops, reductions over axis 0 or 1 of a row-major matrix
-and strided copies on the activation backend. `scheme` runs the rest with
+and element-wise ops, reductions over axis 0 or 1 of a row-major matrix,
+scans of row-major arrays and strided copies on the activation backend. `scheme` runs the rest with
 Scheme loops, and as a last resort evaluates a segop with the reference
 interpreter. Every replay gives the same values, bit for bit, as the
 first (traced) run.
@@ -631,13 +643,108 @@ each segop instruction by its pattern:
   epilogue run on the host) and `segop/gemm-batched` (a batched product);
 - convolutions: `segop/im2col`, `segop/col2im`, `segop/conv-fwd`,
   `segop/conv-bwd-data` and `segop/conv-bwd-weights`;
+- scans: `segop/scan-kernel` (a kernel of the activation backend),
+  `segop/scan` (a Scheme loop for the standard ops on f32 and f64) and
+  `segop/strided-scan` (any other scan);
 - `segop/gather` for materialized views, `segop/host-index-fn` for index
   functions run on the host, and `segop/interpreted`;
 - generated kernels, with the code generator of `array-morphisms-crunch`:
-  `segop/codegen-map`, `segop/codegen-red` and `segop/codegen-epilogue`.
+  `segop/codegen-map`, `segop/codegen-red`, `segop/codegen-epilogue` and
+  `segop/codegen-scan`.
 
 `replay-plan-stats` also reports `conv-scratch-bytes`, the size of the
 image-column buffers that the plan's convolutions share.
+
+## Scans
+
+A scan computes running results along one axis: element `r` of the
+output combines the elements `0` to `r` of its line.
+
+```scheme
+(morph-scan op m axis #!key exclusive? reverse? init neutral)
+(morph-cumsum m axis ...)     ; (morph-scan 'sum m axis ...)
+(morph-cumprod m axis ...)    ; (morph-scan 'prod m axis ...)
+```
+
+- `op` is `sum`, `prod`, `max`, `min`, or a combining expression (below).
+- `exclusive?: #t` shifts the results by one position: element `r`
+  combines the elements before `r`, and element 0 is `init` or the
+  neutral element (0, 1, or the lowest or highest value of the dtype).
+- `reverse?: #t` scans from the last element down to the first.
+- `init` is an array with the shape of `m` without the scanned axis: the
+  value each line starts from.
+
+Each output is the previous output combined with one more element and
+rounded to the result's dtype, exactly as a loop over the elements in
+order computes it. The first output is the first element itself, so a
+first element `-0.0` or NaN is kept. `max` replaces the running value
+only by a greater element, so a NaN after the first element is passed
+over; `min` likewise.
+
+### Your own combining step
+
+A combining expression `(lambda (a b) e)` gives the step: `a` is the
+value so far and `b` the next element. `e` uses the ops of the scalar-op
+table, numbers and `cast`:
+
+```scheme
+;; an exponential moving sum: out[r] = 0.9 * out[r-1] + x[r]
+(morph-scan '(lambda (a b) (+ (* a 0.9) b)) x 1)
+```
+
+`e` is computed in double precision and rounded to the result's dtype
+after every step; `(cast f32 ...)` rounds an intermediate value. The
+elements are combined in order, so `e` does not need to be associative.
+An exclusive scan with an expression needs `init` or `neutral:`.
+
+`morph-scan/fn` (`array-morphisms-lift`) takes the step as a procedure of
+two morphisms instead, and turns it into an expression:
+
+```scheme
+(import array-morphisms-lift)
+(morph-scan/fn (lambda (acc x) (morph+ (morph* acc k) x)) m 0 init: m0)  ; k a one-element array
+```
+
+The procedure may use element-wise ops of its two arguments and of
+one-element constants. Each intermediate result is rounded as storing it
+would round it, so the scan gives the values of applying the procedure
+step by step. A procedure that does something else (`morph-map`, a
+reduction, an array captured from outside) signals the `lift-unsupported`
+condition. A step that adds or multiplies its two arguments becomes the
+`sum` or `prod` scan.
+
+`batch-scan` (`array-morphisms-batch-ops`) uses `morph-scan/fn` along the
+batch axis: the result is one scan, with as many nodes for any batch
+size. When the step cannot be turned into an expression, or `init` is not
+an array of one element's shape and dtype, it runs `batch-scan/slices`,
+which applies the step to each slice and stacks the results.
+
+### Gradients
+
+`ssa-vjp` differentiates `sum` scans: the gradient of the scanned array is
+the scan of the incoming gradient in the opposite direction, and that of
+`init` is the incoming gradient summed along the axis. `var-scan`
+(`array-morphisms-grad`) does the same for `backward!`. Scans with other
+ops or with an expression have no gradient; using one on a trainable
+parameter is an error.
+
+### Execution
+
+Scans are never fused with their neighbours. A replay runs each scan on
+the first of these that applies:
+
+- a kernel of the activation backend (`segop/scan-kernel`), for the
+  standard ops on row-major f32 or f64 arrays; the crunch backends have
+  one;
+- a kernel generated by the code generator of `array-morphisms-crunch`
+  (`segop/codegen-scan`), for expressions, strided arrays and integer
+  dtypes, with the lines split across threads;
+- Scheme loops (`segop/scan`, `segop/strided-scan`).
+
+All of them give the same values. Measured on f32 and f64 cumulative sums
+of up to 1024 x 4096 elements, the crunch kernel runs about 30 to 125 times
+faster than the Scheme loop; for an exponential moving sum, a generated
+kernel runs 250 to 1000 times faster than the Scheme loop.
 
 ## Frame Lifting
 
@@ -664,8 +771,8 @@ and widens the expression `fn` builds by the frame:
 - element-wise operations stay one element-wise node;
 - a reduction becomes one reduction with a frame rank;
 - a matrix product becomes one batched matrix product;
-- transposes, reshapes, slices, padding, stacks and concatenations keep
-  the frame axes in front;
+- transposes, reshapes, slices, padding, stacks, concatenations and scans
+  keep the frame axes in front;
 - attention takes the frame as leading axes (up to rank 4 in all), and
   `im2col` and `col2im` fold it into the image axis.
 
@@ -800,7 +907,7 @@ Key modules:
 - `array-morphisms-realization` - Materialization and execution
 - `array-morphisms-context` - Memory reuse contexts
 - `array-morphisms-batch-ops` - Batch operations and combinators
-- `array-morphisms-lift` - Frame lifting (`morph-lift`)
+- `array-morphisms-lift` - Frame lifting (`morph-lift`) and scans with a procedure as step (`morph-scan/fn`)
 - `array-morphisms-blas-exec` - BLAS backend records, registration and dispatch
 - `array-morphisms-micro-blas-backend` - Default dependency-free BLAS backend
 - `array-morphisms-activation-exec` - Element-wise kernel backend records and registration
