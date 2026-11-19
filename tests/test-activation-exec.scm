@@ -1,6 +1,6 @@
 ;;; tests/test-activation-exec.scm
 ;;; Test suite for the activation-kernel registry (activation-exec.scm) and
-;;; its use by the SSA replay engine (ri-activation-unary in ssa.scm,
+;;; its use by the SSA replay engine (the activation-unary segop pattern in ssa.scm,
 ;;; execute-activation-unary-compute in realization.scm).
 ;;;
 ;;; The kernels registered here are plain Scheme procedures standing in for
@@ -180,7 +180,25 @@
         (register-activation-backend! #f)
         (list was (active-activation-backend)))))
   (test-error "register-activation-backend! rejects other values"
-    (register-activation-backend! 'not-a-backend)))
+    (register-activation-backend! 'not-a-backend))
+  (test "fused kernels are found by canonical body and dtype, misses give #f"
+    '(#t #f #f #f)
+    (let* ((be   (make-activation-backend 'fused))
+           (body '(mul (in 0) (cast f32 (relu-deriv (in 1)))))
+           (k    (lambda (n ins out) #f)))
+      (activation-backend-add-fused-kernel! be body 'f32 k)
+      (list (eq? k (lookup-fused-kernel be body 'f32))
+            (lookup-fused-kernel be body 'f64)
+            (lookup-fused-kernel be '(mul (in 0) (relu-deriv (in 1))) 'f32)
+            (lookup-fused-kernel #f body 'f32))))
+  (test "the fused patterns of a backend are listed"
+    '(((add (in 0) (in 1)) . f64))
+    (let ((be (make-activation-backend 'fused2)))
+      (activation-backend-add-fused-kernel! be '(add (in 0) (in 1)) 'f64 (lambda (n ins out) #f))
+      (activation-backend-fused-patterns be)))
+  (test-error "only f32 and f64 fused kernels are accepted"
+    (activation-backend-add-fused-kernel! (make-activation-backend 'x) '(in 0) 's32
+                                          (lambda (n ins out) #f))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 2 - execute-activation-unary-compute: kernel use and fallback
@@ -261,37 +279,45 @@
 (test-group "replay plan: instruction selection"
   (register-activation-backend! #f)
 
-  (test "relu forward and relu-deriv compile to ri-activation-unary"
+  (test "relu forward and relu-deriv compile to the activation-unary pattern"
     2
     (let* ((xv (param-var '(-2.0 -1.0 0.0 1.0 2.0) '(5) 'f64))
            (loss (am:var-mean (am:var-relu xv))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
-        (plan-count joint 'ri-activation-unary))))
+        (plan-count joint 'segop/activation-unary))))
 
-  (test "sigmoid forward and sigmoid-deriv compile to ri-activation-unary"
+  (test "sigmoid forward and sigmoid-deriv compile to the activation-unary pattern"
     2
     (let* ((xv (param-var '(1.0 2.0) '(2) 'f64))
            (loss (am:var-mean (am:var-sigmoid xv))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
-        (plan-count joint 'ri-activation-unary))))
+        (plan-count joint 'segop/activation-unary))))
 
-  (test "a non-activation unary op still compiles to ri-flat-unary"
+  (test "a non-activation unary op still compiles to the flat-unary pattern"
     '(0 #t)
     (let* ((xv (param-var '(1.0 2.0 3.0) '(3) 'f64))
            (loss (am:var-mean (am:var-exp xv))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
-        (list (plan-count joint 'ri-activation-unary)
-              (> (plan-count joint 'ri-flat-unary) 0)))))
+        (list (plan-count joint 'segop/activation-unary)
+              (> (plan-count joint 'segop/flat-unary) 0)))))
 
-  (test "sigmoid fused with its producer is not an ri-activation-unary"
-    ;; negate's output feeds only sigmoid, so the fusion pass merges the
-    ;; two into one binding with op sigmoid and combiner sigmoid(-x).
-    ;; Only the backward sigmoid-deriv may use the activation instruction.
-    1
+  (test "sigmoid after negate keeps its activation-unary segop"
+    ;; Under the default fusion policy nothing is fused on the host, so
+    ;; sigmoid and the backward sigmoid-deriv both use the activation
+    ;; instruction.
+    2
     (let* ((xv (param-var '(0.5 -1.0 2.0) '(3) 'f64))
            (loss (am:var-mean (am:var-sigmoid (am:var-negate xv)))))
       (let-values (((joint _) (trace-and-replay loss (list xv))))
-        (plan-count joint 'ri-activation-unary))))
+        (plan-count joint 'segop/activation-unary))))
+
+  (test "under the fusion policy all, sigmoid(-x) and sigmoid-deriv are fused"
+    0
+    (let* ((xv (param-var '(0.5 -1.0 2.0) '(3) 'f64))
+           (loss (am:var-mean (am:var-sigmoid (am:var-negate xv)))))
+      (let-values (((joint _) (parameterize ((segop-fusion 'all))
+                                (trace-and-replay loss (list xv)))))
+        (plan-count joint 'segop/activation-unary))))
 
   (test "an activation right after a matmul is still a GEMM epilogue"
     '(#t 1)
@@ -302,8 +328,8 @@
            (Wv (param-var '(0.1 -0.2 0.3 0.4 -0.5 0.6) '(3 2) 'f64))
            (loss (am:var-mean (am:var-sigmoid (am:var-matmul xv Wv)))))
       (let-values (((joint _) (trace-and-replay loss (list Wv))))
-        (list (> (plan-count joint 'ri-gemm-epilogue) 0)
-              (plan-count joint 'ri-activation-unary))))))
+        (list (> (plan-count joint 'segop/gemm-epilogue) 0)
+              (plan-count joint 'segop/activation-unary))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 4 - Replay through registered kernels
@@ -374,8 +400,8 @@
       (list (equal? without with)
             (> (count-of counts 'tanh-deriv) 0))))
 
-  (test "matmul with a sigmoid epilogue: results unchanged with kernels"
-    '(#t 0 1)
+  (test "matmul with a sigmoid epilogue: the epilogue runs the kernel, results unchanged"
+    '(#t #t 1)
     (let* ((r (replay-both
                (lambda ()
                  (let ((xv (am:make-var (morph-from-list '(1.0 -2.0 3.0 -4.0 5.0 -6.0)
@@ -385,11 +411,12 @@
                                      (list Wv))))))
            (without (car r)) (with (cadr r)) (counts (caddr r)))
       (list (equal? without with)
-            (count-of counts 'sigmoid)
+            (> (count-of counts 'sigmoid) 0)
             (count-of counts 'sigmoid-deriv))))
 
-  (test "fused sigmoid(-x) is computed by its combiner, not the sigmoid kernel"
+  (test "sigmoid(-x) keeps the sigmoid kernel when the backend has one"
     #t
+    ;; negate is not fused into sigmoid, so the kernel computes sigmoid
     (let* ((xs '(0.5 -1.0 2.0))
            (r (replay-both
                (lambda ()
@@ -398,9 +425,9 @@
                                      (list xv))))))
            (without (car r)) (with (cadr r)) (counts (caddr r))
            (expected-loss (/ (apply + (map (lambda (x) (ae-sigmoid (- x))) xs)) 3.0)))
-      (and (equal? without with)
-           (= 0 (count-of counts 'sigmoid))
-           (ae-approx= (car (car with)) expected-loss))))
+      (and (= 1 (count-of counts 'sigmoid))
+           (ae-approx= (car (car with)) expected-loss)
+           (ae-approx= (car (car without)) expected-loss))))
 
   (test "the kernel's output is what the replay returns"
     ;; With the marker backend, relu's forward values all become 42.0.
@@ -439,18 +466,18 @@
   (test-assert "no binary op names are registered by default"
     (not (binary-op-registered? 'mul)))
 
-  (test "an unregistered mul compiles to ri-flat-binary"
+  (test "an unregistered mul compiles to the flat-binary pattern"
     0
     (let-values (((joint _) (mul-loss)))
-      (plan-count joint 'ri-activation-binary)))
+      (plan-count joint 'segop/activation-binary)))
 
   (register-binary-op! 'mul)
 
-  (test-assert "a registered mul compiles to ri-activation-binary"
+  (test-assert "a registered mul compiles to the activation-binary pattern"
     (let-values (((joint _) (mul-loss)))
-      (> (plan-count joint 'ri-activation-binary) 0)))
+      (> (plan-count joint 'segop/activation-binary) 0)))
 
-  (test "without a backend, ri-activation-binary gives the combiner's results"
+  (test "without a backend, the activation-binary pattern gives the combiner's results"
     (let-values (((_ results) (begin (unregister-binary-op! 'mul) (mul-loss))))
       results)
     (begin (register-binary-op! 'mul)

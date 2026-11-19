@@ -2,6 +2,7 @@
 (repo git "git://github.com/iraikov/array-morphisms.git")
 (uri targz "https://github.com/iraikov/array-morphisms/tarball/{egg-release}")
 
+(release "3.0" )
 (release "2.1" )
 (release "2.0" )
 (release "1.2" )

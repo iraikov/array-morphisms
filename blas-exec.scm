@@ -67,6 +67,10 @@
    blas-backend-conv-fwd-nhwc-im2col-f32
    blas-backend-conv-bwd-data-nhwc-im2col-f32
    blas-backend-conv-bwd-weights-nhwc-im2col-f32
+   blas-backend-gemm-offset-f64
+   blas-backend-gemm-offset-f32
+   blas-backend-dot-offset-f64
+   blas-backend-dot-offset-f32
 
    ;; Backend registration and inspection
    register-blas-backend!
@@ -82,6 +86,7 @@
 
    ;; Morphism constructors
    morph-matmul
+   morph-batch-matmul
    morph-matvec
    morph-dot
    morph-axpy
@@ -104,6 +109,7 @@
 
    ;; High-level morphism-expr dispatch (used by realization engine)
    execute-blas-operation
+   promote-blas-operands
 
    ;; In-place variants: write result into caller-supplied typed-vector.
    ;; Used by realize-morphism-expr/ctx
@@ -116,15 +122,25 @@
 
    ;; Prepared GEMM: operand checks done once, for repeated products
    gemm-plan?
+   gemm-plan-uses-kernel?
    prepare-blas-gemm/into
    prepare-blas-gemm-strided/into
    execute-gemm-plan/into!
+
+   ;; Batched GEMM: one prepared plan for all cells of a batched product
+   batch-matmul-concrete?
+   batched-gemm-plan?
+   batched-gemm-plan-cell
+   prepare-batched-gemm
+   execute-batched-gemm-plan/into!
+   execute-blas-batch-matmul/into!
 
    ;; Re-exported from blas-compat for convenience
    array->gemm-blas-params)
 
   (import scheme (chicken base))
   (import (only srfi-1 every))
+  (import (only (chicken memory) move-memory!))
   (import datatype)
   (import array-morphisms-core)
   (import array-morphisms-blas-compat)
@@ -146,28 +162,80 @@
   ;; array-morphisms-blas-egg-backend.scm) bridge any concrete library into
   ;; this interface.  This means blas-exec.scm carries no direct dependency
   ;; on the 'blas' egg, CUDA bindings, or chicken-crunch.
-  (define-record blas-backend
-    name              ; symbol: backend identity
-   gemm-f64          ; (M N K alpha data-A data-B beta data-C) -> void, or #f
-   gemm-f32          ; (M N K alpha data-A data-B beta data-C) -> void, or #f
-   gemm-strided-f64  ; (M N K alpha data-A lda-A transa data-B ldb-B transb beta data-C) -> void, or #f
-   gemm-strided-f32  ; (M N K alpha data-A lda-A transa data-B ldb-B transb beta data-C) -> void, or #f
-   gemv-f64          ; (M N alpha data-A data-x beta data-y) -> void, or #f
-   gemv-f32          ; (M N alpha data-A data-x beta data-y) -> void, or #f
-   dot-f64           ; (N data-x data-y) -> number, or #f
-   dot-f32           ; (N data-x data-y) -> number, or #f
-   axpy-f64          ; (N alpha data-x data-y) -> void, or #f
-   axpy-f32          ; (N alpha data-x data-y) -> void, or #f
-   conv-fwd-im2col-f32         ; (out bias col src weight M N K out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
-   conv-bwd-data-im2col-f32    ; (dx col g wt M K N out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
-   conv-bwd-weights-im2col-f32 ; (dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
-   ;; NHWC counterparts: identical signatures to the slots above, but the
-   ;; im2col/col2im step reads/writes src/dx in NHWC layout [N,H,W,C]
-   ;; instead of NCHW. The col/weight/output layouts are unchanged (always
-   ;; the layout-independent matmul-ready [.., C*KH*KW] / [.., out_ch] form).
-   conv-fwd-nhwc-im2col-f32
-   conv-bwd-data-nhwc-im2col-f32
-   conv-bwd-weights-nhwc-im2col-f32)
+  ;;
+  ;; Four optional fields hold GEMM and DOT kernels that read and write
+  ;; their operands at element offsets into the vectors:
+  ;;   gemm-offset-f64/f32 :
+  ;;     (M N K alpha data-A off-A lda transa data-B off-B ldb transb beta
+  ;;      data-C off-C) -> void
+  ;;   dot-offset-f64/f32 : (N data-x off-x data-y off-y) -> number
+  ;; They compute what the strided GEMM kernel and the DOT kernel compute
+  ;; for operands stored from those offsets; C is row-major with leading
+  ;; dimension N.  A backend without them leaves the fields #f.
+  (define-record-type blas-backend
+    (%make-blas-backend name
+                        gemm-f64 gemm-f32 gemm-strided-f64 gemm-strided-f32
+                        gemv-f64 gemv-f32 dot-f64 dot-f32 axpy-f64 axpy-f32
+                        conv-fwd-im2col-f32 conv-bwd-data-im2col-f32
+                        conv-bwd-weights-im2col-f32
+                        conv-fwd-nhwc-im2col-f32 conv-bwd-data-nhwc-im2col-f32
+                        conv-bwd-weights-nhwc-im2col-f32
+                        gemm-offset-f64 gemm-offset-f32
+                        dot-offset-f64 dot-offset-f32)
+    blas-backend?
+    (name              blas-backend-name)     ; symbol: backend identity
+    (gemm-f64          blas-backend-gemm-f64) ; (M N K alpha data-A data-B beta data-C) -> void, or #f
+    (gemm-f32          blas-backend-gemm-f32) ; (M N K alpha data-A data-B beta data-C) -> void, or #f
+    ;; (M N K alpha data-A lda-A transa data-B ldb-B transb beta data-C) -> void, or #f
+    (gemm-strided-f64  blas-backend-gemm-strided-f64)
+    (gemm-strided-f32  blas-backend-gemm-strided-f32)
+    (gemv-f64          blas-backend-gemv-f64) ; (M N alpha data-A data-x beta data-y) -> void, or #f
+    (gemv-f32          blas-backend-gemv-f32)
+    (dot-f64           blas-backend-dot-f64)  ; (N data-x data-y) -> number, or #f
+    (dot-f32           blas-backend-dot-f32)
+    (axpy-f64          blas-backend-axpy-f64) ; (N alpha data-x data-y) -> void, or #f
+    (axpy-f32          blas-backend-axpy-f32)
+    ;; (out bias col src weight M N K out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
+    (conv-fwd-im2col-f32         blas-backend-conv-fwd-im2col-f32)
+    ;; (dx col g wt M K N out-ch Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
+    (conv-bwd-data-im2col-f32    blas-backend-conv-bwd-data-im2col-f32)
+    ;; (dwt col src g fan-in out-ch M Nbatch C H W KH KW SH SW PH PW OH OW) -> void, or #f
+    (conv-bwd-weights-im2col-f32 blas-backend-conv-bwd-weights-im2col-f32)
+    ;; col is a scratch buffer of M * C*KH*KW elements that other calls also
+    ;; use, so a hook writes all of it before reading it, zeros included.
+    ;; NHWC counterparts: identical signatures to the slots above, but the
+    ;; im2col/col2im step reads/writes src/dx in NHWC layout [N,H,W,C]
+    ;; instead of NCHW. The col/weight/output layouts are unchanged (always
+    ;; the layout-independent matmul-ready [.., C*KH*KW] / [.., out_ch] form).
+    (conv-fwd-nhwc-im2col-f32         blas-backend-conv-fwd-nhwc-im2col-f32)
+    (conv-bwd-data-nhwc-im2col-f32    blas-backend-conv-bwd-data-nhwc-im2col-f32)
+    (conv-bwd-weights-nhwc-im2col-f32 blas-backend-conv-bwd-weights-nhwc-im2col-f32)
+    (gemm-offset-f64   blas-backend-gemm-offset-f64)
+    (gemm-offset-f32   blas-backend-gemm-offset-f32)
+    (dot-offset-f64    blas-backend-dot-offset-f64)
+    (dot-offset-f32    blas-backend-dot-offset-f32))
+
+  (define (make-blas-backend name
+                             gemm-f64 gemm-f32 gemm-strided-f64 gemm-strided-f32
+                             gemv-f64 gemv-f32 dot-f64 dot-f32 axpy-f64 axpy-f32
+                             conv-fwd-im2col-f32 conv-bwd-data-im2col-f32
+                             conv-bwd-weights-im2col-f32
+                             conv-fwd-nhwc-im2col-f32 conv-bwd-data-nhwc-im2col-f32
+                             conv-bwd-weights-nhwc-im2col-f32
+                             #!optional (gemm-offset-f64 #f) (gemm-offset-f32 #f)
+                             (dot-offset-f64 #f) (dot-offset-f32 #f))
+    "Make a blas-backend record from its kernels, in the order of the fields
+    above; each is a procedure or #f.  The offset GEMM and DOT kernels are
+    optional."
+    (%make-blas-backend name
+                        gemm-f64 gemm-f32 gemm-strided-f64 gemm-strided-f32
+                        gemv-f64 gemv-f32 dot-f64 dot-f32 axpy-f64 axpy-f32
+                        conv-fwd-im2col-f32 conv-bwd-data-im2col-f32
+                        conv-bwd-weights-im2col-f32
+                        conv-fwd-nhwc-im2col-f32 conv-bwd-data-nhwc-im2col-f32
+                        conv-bwd-weights-nhwc-im2col-f32
+                        gemm-offset-f64 gemm-offset-f32
+                        dot-offset-f64 dot-offset-f32))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Configuration
@@ -261,6 +329,9 @@
     (unless (array-morphism? B) (error "morph-matmul: B must be a morphism" B))
     (let* ((sa (get-morphism-shape A))
            (sb (get-morphism-shape B)))
+     (if (batched-matmul-ranks? (vector-length sa) (vector-length sb))
+      (morph-batch-matmul A B)
+      (begin
       (unless (= 2 (vector-length sa))
         (error "morph-matmul: A must be 2-D" sa))
       (unless (= 2 (vector-length sb))
@@ -279,7 +350,59 @@
          (vector M N)
          dtype
          `((k-dim . ,K))
-         -1))))
+         -1))))))
+
+  ;; True when operands of ranks ra and rb make a batched product: both of
+  ;; rank 2 or more, and one of rank 3 or more.
+  (define (batched-matmul-ranks? ra rb)
+    (and (>= ra 2) (>= rb 2) (or (> ra 2) (> rb 2))))
+
+  (define (morph-batch-matmul A B)
+    "Batched matrix multiply morphism: F ++ (M,K) x F ++ (K,N) -> F ++ (M,N).
+
+    The leading dimensions F of an operand of rank 3 or more are its frame;
+    each cell of the frame is an M x K (or K x N) matrix, and the result
+    holds the product of the corresponding cells.  One operand may be a
+    plain matrix, which is then shared by every cell (B shared: frame form
+    a; A shared: frame form b; both framed: frame form both).  The frames of
+    two framed operands must be equal.  Two matrices give the plain matmul
+    morphism of morph-matmul.
+
+    Creates a morphism-expr with op 'batch-matmul, an identity-fn
+    placeholder, the promoted dtype of the operands, batch-axis 0, and the
+    metadata k-dim, frame (a vector) and frame-form."
+    (unless (array-morphism? A) (error "morph-batch-matmul: A must be a morphism" A))
+    (unless (array-morphism? B) (error "morph-batch-matmul: B must be a morphism" B))
+    (let* ((sa (get-morphism-shape A))
+           (sb (get-morphism-shape B))
+           (ra (vector-length sa))
+           (rb (vector-length sb)))
+      (unless (and (>= ra 2) (>= rb 2))
+        (error "morph-batch-matmul: operands must have rank 2 or more" sa sb))
+      (if (and (= ra 2) (= rb 2))
+          (morph-matmul A B)
+          (let* ((fa    (subvector sa 0 (- ra 2)))
+                 (fb    (subvector sb 0 (- rb 2)))
+                 (form  (cond ((= rb 2) 'a) ((= ra 2) 'b) (else 'both)))
+                 (frame (if (eq? form 'b) fb fa))
+                 (M     (vector-ref sa (- ra 2)))
+                 (K     (vector-ref sa (- ra 1)))
+                 (K-b   (vector-ref sb (- rb 2)))
+                 (N     (vector-ref sb (- rb 1))))
+            (when (and (eq? form 'both) (not (equal? fa fb)))
+              (error "morph-batch-matmul: frames must be equal" fa fb))
+            (unless (= K K-b)
+              (error "morph-batch-matmul: inner dimensions must match" K K-b))
+            (morphism-expr
+             (gensym 'morph-) 'batch-matmul (list A B)
+             (identity-fn)
+             (vector-append frame (vector M N))
+             (promote-types (get-morphism-dtype A) (get-morphism-dtype B))
+             `((k-dim . ,K) (frame . ,frame) (frame-form . ,form))
+             0)))))
+
+  (define (vector-append u v)
+    (list->vector (append (vector->list u) (vector->list v))))
 
   (define (morph-matvec A v)
     "Matrix-vector multiply morphism: (M,N) x (N,) -> (M,).
@@ -762,6 +885,11 @@
     M N K
     lda transa ldb transb)   ; strided kernel arguments; unused otherwise
 
+  (define (gemm-plan-uses-kernel? plan)
+    "True when plan calls a backend GEMM kernel; false when its products
+    are computed by the execute-blas-* procedure it falls back to."
+    (and (gemm-plan-kernel plan) #t))
+
   (define (prepare-blas-gemm/into A B)
     "Check A and B once for execute-gemm-plan/into!.  Returns a gemm-plan
     that computes what (execute-blas-gemm/into! A B result-data) computes,
@@ -836,6 +964,258 @@
           (if (gemm-plan-strided? plan)
               (execute-blas-gemm-strided/into! A B result-data)
               (execute-blas-gemm/into! A B result-data)))))
+
+  ;; -- Batched GEMM ---------------------------------------------------------
+  ;; A batched product multiplies the cells of framed operands (see
+  ;; morph-batch-matmul).  Each cell is computed as the 2-D product of that
+  ;; cell stored on its own would be: the cell's gemm-plan is prepared from
+  ;; an array with the cell's shape and strides that starts at the cell's
+  ;; first element.  When that plan calls a kernel of a backend that has
+  ;; an offset GEMM kernel, the kernel reads the cell in place.  Otherwise
+  ;; the cell is copied, strides and all, into a scratch buffer, the plan
+  ;; runs on the copy, and the product is copied into place.
+  ;;
+  ;; A cell whose rows (or columns) are contiguous but lie further apart
+  ;; than its width (or height), as when frame axes come between its axes,
+  ;; is a padded cell.  Its own array is the contiguous one in the same
+  ;; orientation: its plan is prepared for that layout, an offset kernel
+  ;; reads the cell in place with its actual leading dimension, and the
+  ;; copy path packs it row by row (or column by column).
+
+  (define-record batched-gemm-plan
+    cell        ; gemm-plan of one cell
+    dtype
+    M N
+    a-shared?   ; #t when A is a plain matrix used by every cell
+    b-shared?
+    a-layout    ; layout array of an A cell copy (offset = -lo), or A itself when shared
+    b-layout
+    a-lo b-lo   ; offset of a cell's lowest element from its first element
+    a-span b-span ; elements spanned by one cell
+    a-offs b-offs ; vector: offset of each cell's first element from the array's offset
+    a-pad b-pad   ; #f, or (rows . ld) or (cols . ld) for a padded cell
+    scratch)    ; #f, or vector of the scratch buffers for A, B and C
+
+  (define (dtype-bytes dtype)
+    (if (eq? dtype 'f64) 8 4))
+
+  ;; The lowest and highest offset, relative to its first element, that a
+  ;; matrix of the given shape and strides reads.
+  (define (matrix-extent shape strides)
+    (let loop ((i 0) (lo 0) (hi 0))
+      (if (= i (vector-length shape))
+          (values lo hi)
+          (let ((n (vector-ref shape i)) (st (vector-ref strides i)))
+            (if (= n 0)
+                (values 0 -1)
+                (let ((d (* (- n 1) st)))
+                  (loop (+ i 1) (+ lo (min 0 d)) (+ hi (max 0 d)))))))))
+
+  ;; The offsets of the cells of frame, in row-major order, for frame
+  ;; strides fstrides.
+  (define (frame-offsets frame fstrides)
+    (let* ((r (vector-length frame))
+           (n (let loop ((i 0) (n 1))
+                (if (= i r) n (loop (+ i 1) (* n (vector-ref frame i))))))
+           (offs (make-vector n 0))
+           (idx  (make-vector r 0)))
+      (do ((c 0 (+ c 1)))
+          ((= c n) offs)
+        (let loop ((i 0) (o 0))
+          (if (= i r)
+              (vector-set! offs c o)
+              (loop (+ i 1) (+ o (* (vector-ref idx i) (vector-ref fstrides i))))))
+        (let carry ((i (- r 1)))
+          (when (>= i 0)
+            (let ((v (+ 1 (vector-ref idx i))))
+              (if (< v (vector-ref frame i))
+                  (vector-set! idx i v)
+                  (begin (vector-set! idx i 0) (carry (- i 1))))))))))
+
+  (define (batch-matmul-concrete? A B)
+    "True when concrete arrays A and B, of rank 2 or more and one of rank 3
+    or more, have one dtype, f32 or f64, and shapes that morph-batch-matmul
+    accepts."
+    (and (concrete-array? A) (concrete-array? B)
+         (let* ((sa (get-morphism-shape A)) (sb (get-morphism-shape B))
+                (ra (vector-length sa)) (rb (vector-length sb))
+                (da (get-morphism-dtype A)))
+           (and (batched-matmul-ranks? ra rb)
+                (memq da '(f32 f64))
+                (eq? da (get-morphism-dtype B))
+                (= (vector-ref sa (- ra 1)) (vector-ref sb (- rb 2)))
+                (or (= ra 2) (= rb 2)
+                    (equal? (subvector sa 0 (- ra 2)) (subvector sb 0 (- rb 2))))))))
+
+  (define (prepare-batched-gemm A B)
+    "Check concrete arrays A and B once for execute-batched-gemm-plan/into!.
+    Returns a batched-gemm-plan that multiplies A by B, and any later
+    arrays with the same shapes, strides and dtype, cell by cell; or #f
+    when batch-matmul-concrete? does not hold.  Only the shapes, strides,
+    offsets and dtypes of A and B are read."
+    (and
+     (batch-matmul-concrete? A B)
+     (let ()
+       (define (cell-of m)
+         ;; (shared? layout lo span fstrides frame pad) for operand m.
+         (cases array-morphism m
+           (concrete-array (_ shape strides offset dtype _ _)
+             (let ((r (vector-length shape)))
+               (if (= r 2)
+                   (list #t m 0 0 #f #f #f)
+                   (let* ((cs  (subvector shape (- r 2) r))
+                          (cst (subvector strides (- r 2) r))
+                          (R   (vector-ref cs 0)) (C (vector-ref cs 1))
+                          (s0  (vector-ref cst 0)) (s1 (vector-ref cst 1))
+                          (pad (cond ((and (= s1 1) (> R 1) (> s0 C)) (cons 'rows s0))
+                                     ((and (= s0 1) (> C 1) (> s1 R)) (cons 'cols s1))
+                                     (else #f)))
+                          (fst (subvector strides 0 (- r 2)))
+                          (frm (subvector shape 0 (- r 2))))
+                     (if pad
+                         (list #f
+                               (concrete-array (allocate-typed-vector dtype 0) cs
+                                               (if (eq? (car pad) 'rows) (vector C 1) (vector 1 R))
+                                               0 dtype -1 -1)
+                               0 (* R C) fst frm pad)
+                         (let-values (((lo hi) (matrix-extent cs cst)))
+                           (list #f
+                                 (concrete-array (allocate-typed-vector dtype 0) cs cst (- lo)
+                                                 dtype -1 -1)
+                                 lo (max 0 (+ 1 (- hi lo)))
+                                 fst frm #f)))))))
+           (else (error "prepare-batched-gemm: operand not concrete" m))))
+       (let* ((a  (cell-of A))
+              (b  (cell-of B))
+              (al (cadr a))
+              (bl (cadr b))
+              (frame (or (list-ref a 5) (list-ref b 5)))
+              (cell (cond ((blas-compatible-matmul? al bl) (prepare-blas-gemm/into al bl))
+                          (else (prepare-blas-gemm-strided/into al bl))))
+              (dtype (get-morphism-dtype A)))
+         (make-batched-gemm-plan
+          cell dtype
+          (vector-ref (get-morphism-shape al) 0) (vector-ref (get-morphism-shape bl) 1)
+          (car a) (car b) al bl
+          (caddr a) (caddr b) (cadddr a) (cadddr b)
+          (if (car a) #f (frame-offsets frame (list-ref a 4)))
+          (if (car b) #f (frame-offsets frame (list-ref b 4)))
+          (list-ref a 6) (list-ref b 6)
+          #f)))))
+
+  (define (batched-gemm-plan-cells plan)
+    (vector-length (or (batched-gemm-plan-a-offs plan) (batched-gemm-plan-b-offs plan))))
+
+  ;; The offset GEMM kernel that runs a cell of plan in place, or #f.
+  (define (batched-offset-kernel plan)
+    (let* ((cell    (batched-gemm-plan-cell plan))
+           (backend (gemm-plan-backend cell)))
+      (and (gemm-plan-kernel cell)
+           *blas-enabled*
+           (eq? *active-backend* backend)
+           (%select-kernel backend (batched-gemm-plan-dtype plan)
+                           blas-backend-gemm-offset-f64
+                           blas-backend-gemm-offset-f32))))
+
+  (define (batched-scratch plan)
+    (or (batched-gemm-plan-scratch plan)
+        (let* ((dt (batched-gemm-plan-dtype plan))
+               (s  (vector (allocate-typed-vector dt (batched-gemm-plan-a-span plan))
+                           (allocate-typed-vector dt (batched-gemm-plan-b-span plan))
+                           (allocate-typed-vector dt (* (batched-gemm-plan-M plan)
+                                                        (batched-gemm-plan-N plan))))))
+          (batched-gemm-plan-scratch-set! plan s)
+          s)))
+
+  (define (execute-batched-gemm-plan/into! plan A B result-data)
+    "Multiply A by B cell by cell into result-data, row-major with the
+    frame dimensions first, as prepared by plan.  A and B must have the
+    shapes, strides and dtype of the arrays the plan was made for."
+    (let* ((n      (batched-gemm-plan-cells plan))
+           (cell   (batched-gemm-plan-cell plan))
+           (M      (batched-gemm-plan-M plan))
+           (N      (batched-gemm-plan-N plan))
+           (MN     (* M N))
+           (kernel (and (> n 0) (> MN 0) (batched-offset-kernel plan))))
+      (cases array-morphism A
+        (concrete-array (data-A _ _ off-A _ _ _)
+          (cases array-morphism B
+            (concrete-array (data-B _ _ off-B _ _ _)
+              (cond
+               ((or (= n 0) (= MN 0)) (void))
+               (kernel
+                (let ((a-offs (batched-gemm-plan-a-offs plan))
+                      (b-offs (batched-gemm-plan-b-offs plan))
+                      (K      (gemm-plan-K cell)))
+                  (let*-values (((lda ta ldb tb)
+                                 (if (gemm-plan-strided? cell)
+                                     (values (gemm-plan-lda cell) (gemm-plan-transa cell)
+                                             (gemm-plan-ldb cell) (gemm-plan-transb cell))
+                                     (values K 'no-trans N 'no-trans)))
+                                ((a-pad) (batched-gemm-plan-a-pad plan))
+                                ((b-pad) (batched-gemm-plan-b-pad plan))
+                                ((lda) (if a-pad (cdr a-pad) lda))
+                                ((ldb) (if b-pad (cdr b-pad) ldb)))
+                    (do ((c 0 (+ c 1)))
+                        ((= c n))
+                      (kernel M N K 1.0
+                              data-A (if a-offs (+ off-A (vector-ref a-offs c)) off-A) lda ta
+                              data-B (if b-offs (+ off-B (vector-ref b-offs c)) off-B) ldb tb
+                              0.0 result-data (* c MN))))))
+               (else
+                (let* ((dt      (batched-gemm-plan-dtype plan))
+                       (bytes   (dtype-bytes dt))
+                       (scratch (batched-scratch plan))
+                       (c-buf   (vector-ref scratch 2)))
+                  ;; The cell of operand m at cell index c, as an array with
+                  ;; the plan's cell layout.  A padded cell is packed row by
+                  ;; row (or column by column).
+                  (define (cell-array m data off shared? layout lo span offs buf c pad)
+                    (if shared?
+                        m
+                        (let ((first (+ off (vector-ref offs c) lo)))
+                          (cases array-morphism layout
+                            (concrete-array (_ cs cst loff _ _ _)
+                              (cond
+                               (pad
+                                (let* ((rows? (eq? (car pad) 'rows))
+                                       (n     (vector-ref cs (if rows? 0 1)))
+                                       (len   (vector-ref cs (if rows? 1 0))))
+                                  (do ((i 0 (+ i 1))) ((= i n))
+                                    (move-memory! data buf (* len bytes)
+                                                  (* (+ first (* i (cdr pad))) bytes)
+                                                  (* i len bytes)))
+                                  (concrete-array buf cs cst 0 dt -1 -1)))
+                               ((= first 0)
+                                (concrete-array data cs cst loff dt -1 -1))
+                               (else
+                                (move-memory! data buf (* span bytes) (* first bytes) 0)
+                                (concrete-array buf cs cst loff dt -1 -1))))
+                            (else m)))))
+                  (do ((c 0 (+ c 1)))
+                      ((= c n))
+                    (let ((a (cell-array A data-A off-A (batched-gemm-plan-a-shared? plan)
+                                         (batched-gemm-plan-a-layout plan)
+                                         (batched-gemm-plan-a-lo plan)
+                                         (batched-gemm-plan-a-span plan)
+                                         (batched-gemm-plan-a-offs plan)
+                                         (vector-ref scratch 0) c
+                                         (batched-gemm-plan-a-pad plan)))
+                          (b (cell-array B data-B off-B (batched-gemm-plan-b-shared? plan)
+                                         (batched-gemm-plan-b-layout plan)
+                                         (batched-gemm-plan-b-lo plan)
+                                         (batched-gemm-plan-b-span plan)
+                                         (batched-gemm-plan-b-offs plan)
+                                         (vector-ref scratch 1) c
+                                         (batched-gemm-plan-b-pad plan))))
+                      (if (= c 0)
+                          (execute-gemm-plan/into! cell a b result-data)
+                          (begin
+                            (execute-gemm-plan/into! cell a b c-buf)
+                            (move-memory! c-buf result-data (* MN bytes) 0
+                                          (* c MN bytes))))))))))
+            (else (error "execute-batched-gemm-plan/into!: B must be a concrete array" B))))
+        (else (error "execute-batched-gemm-plan/into!: A must be a concrete array" A)))))
 
   (define (execute-blas-gemm-strided A B)
     "Execute strided matrix-matrix multiply; returns a fresh concrete-array.
@@ -1110,6 +1490,51 @@ this is a bug (compat predicates should have rejected it)" m)))
   ;;; Called by the realization engine after operand realization.
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+  ;; -- Operand dtype promotion -----------------------------------------------
+  ;; morph-matmul, morph-matvec and morph-dot give their expression the
+  ;; promoted dtype of the two operands, but the GEMM, GEMV and DOT kernels
+  ;; read both operands with a single dtype.  When the operand dtypes
+  ;; differ, each operand whose dtype is not the expression dtype is copied
+  ;; into a contiguous row-major array of that dtype before dispatch.
+
+  (define (%convert-concrete-dtype m dtype)
+    "Copy concrete-array m into a new contiguous array of the given dtype."
+    (cases array-morphism m
+      (concrete-array (data shape strides offset src-dtype alloc-id batch-axis)
+        (let* ((n   (shape-size shape))
+               (out (allocate-typed-vector dtype n)))
+          (do ((i 0 (+ i 1)))
+              ((= i n))
+            (let ((phys (multi-to-linear-index
+                         (linear-to-multi-index i shape) strides offset)))
+              (typed-vector-set! out dtype i
+                                 (exact->inexact
+                                  (typed-vector-ref data src-dtype phys)))))
+          (concrete-array out shape (compute-strides shape) 0 dtype -1
+                          batch-axis)))
+      (else (error "%convert-concrete-dtype: expected a concrete array" m))))
+
+  (define (promote-blas-operands op operands dtype)
+    "Return operands with every concrete operand converted to dtype.
+
+    Applies only to the linear-algebra ops matmul, batch-matmul, matvec and
+    dot, and only
+    when dtype is f32 or f64; other operand lists are returned unchanged.
+
+    Args:
+      op:       the morphism-expr op symbol
+      operands: list of realized operands
+      dtype:    the dtype of the morphism-expr"
+    (if (and (memq op '(matmul matvec dot batch-matmul))
+             (memq dtype '(f32 f64)))
+        (map (lambda (m)
+               (if (and (concrete-array? m)
+                        (not (eq? (get-morphism-dtype m) dtype)))
+                   (%convert-concrete-dtype m dtype)
+                   m))
+             operands)
+        operands))
+
   (define (execute-blas-operation morphism)
     "Attempt to execute morphism via a registered BLAS backend.
 
@@ -1122,7 +1547,17 @@ this is a bug (compat predicates should have rejected it)" m)))
       2. Construct a fresh morphism-expr with concrete operands.
       3. Call (execute-blas-operation updated-expr).
       4. If #f, fall back to standard execute-index-fn path."
-    (let ((info (blas-compatible-operation? morphism)))
+    (let ((info (and (not (eq? (morphism-op morphism) 'batch-matmul))
+                     (blas-compatible-operation? morphism))))
+      (if (eq? (morphism-op morphism) 'batch-matmul)
+          (let* ((ops (morphism-operands morphism))
+                 (A   (car ops))
+                 (B   (cadr ops))
+                 (shape (get-morphism-shape morphism))
+                 (dtype (get-morphism-dtype morphism))
+                 (result-data (allocate-typed-vector dtype (shape-size shape))))
+            (and (execute-blas-batch-matmul/into! A B result-data)
+                 (concrete-array result-data shape (compute-strides shape) 0 dtype -1 0)))
       (if info
           (let* ((blas-op  (car info))
                  (ops      (cdr info)))
@@ -1132,6 +1567,25 @@ this is a bug (compat predicates should have rejected it)" m)))
               ((gemv)        (execute-blas-gemv    (car ops) (cadr ops)))
               ((dot)         (execute-blas-dot     (car ops) (cadr ops)))
               (else          #f)))
-          #f)))
+          #f))))
+
+  (define (morphism-op m)
+    (cases array-morphism m
+      (morphism-expr (_ op _ _ _ _ _ _) op)
+      (else #f)))
+
+  (define (morphism-operands m)
+    (cases array-morphism m
+      (morphism-expr (_ _ operands _ _ _ _ _) operands)
+      (else '())))
+
+  (define (execute-blas-batch-matmul/into! A B result-data)
+    "Multiply concrete arrays A and B cell by cell, as morph-batch-matmul
+    describes, into result-data (row-major, frame dimensions first).
+    Returns #t, or #f without writing when batch-matmul-concrete? does not
+    hold for A and B."
+    (let ((plan (prepare-batched-gemm A B)))
+      (and plan
+           (begin (execute-batched-gemm-plan/into! plan A B result-data) #t))))
 
 ) ;; end module array-morphisms-blas-exec

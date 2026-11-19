@@ -6,16 +6,22 @@
 ;;; lazy morphism expression trees that are realized only when `realize` is
 ;;; called -- no eager execution occurs in this module.
 ;;;
+;;; batch-map and batch-zip apply their function to all elements as one
+;;; computation with morph-lift, so their expression has as many nodes for
+;;; any batch size; batch-map/slices and batch-zip/slices apply it to each
+;;; element slice and stack the results.  batch-scan is one scan along the
+;;; batch axis (morph-scan/fn) when its step is made of element-wise ops,
+;;; and batch-scan/slices folds the slices and stacks them.
+;;;
 ;;; Batch dimension convention:
 ;;;   Batch axis is always dimension 0 by default.  Every batched morphism
 ;;;   carries batch-axis >= 0 in its internal field.
 ;;;
-;;; BLAS compatibility:
+;;; Batched matrix multiply:
 ;;;
-;;;   morph-batch-matmul decomposes into N calls to morph-matmul (2-D
-;;;   slices), which the realization engine automatically routes to
-;;;   BLAS.  The realization engine also ensures that trace/replay
-;;;   contexts benefit from BLAS for any matmul in the tree.
+;;;   morph-batch-matmul, from array-morphisms-blas-exec and exported here
+;;;   as well, builds one batch-matmul morphism whose cells the realization
+;;;   engine multiplies with the BLAS backend.
 
 (module array-morphisms-batch-ops
 
@@ -31,10 +37,13 @@
 
    ;; Core batch combinators
    batch-map
+   batch-map/slices
    batch-reduce
    batch-zip
+   batch-zip/slices
    batch-fold
    batch-scan
+   batch-scan/slices
 
    ;; Batch-aware arithmetic (auto-broadcasts non-batched operand)
    morph+/batch
@@ -42,16 +51,17 @@
    morph*/batch
    morph-div/batch
 
-   ;; Batched matrix multiply (BLAS-compatible)
+   ;; Batched matrix multiply (from array-morphisms-blas-exec)
    morph-batch-matmul)
 
-  (import scheme (chicken base))
-  (import (only srfi-1 iota every any fold take drop))
+  (import scheme (chicken base) (chicken condition))
+  (import (only srfi-1 iota every any fold take drop remove))
   (import datatype)
   (import array-morphisms-core)
   (import array-morphisms-basic-ops)
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-exec)
+  (import array-morphisms-lift)
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Batch Dimension Management
@@ -219,12 +229,33 @@
   ;; tree has O(N) depth, which is acceptable for typical batch sizes (32-512).
   ;; Everything stays lazy until `realize` is called.
 
+  ;; m with its batch-axis field set to axis.
+  (define (with-batch-axis m axis)
+    (cases array-morphism m
+      (morphism-expr (mid op operands index-fn shape dtype metadata _)
+        (morphism-expr mid op operands index-fn shape dtype metadata axis))
+      (reduction-morphism (mid op operand axes index-fn shape dtype _)
+        (reduction-morphism mid op operand axes index-fn shape dtype axis))
+      (concrete-array (data shape strides offset dtype alloc-id _)
+        (concrete-array data shape strides offset dtype alloc-id axis))))
+
+  ;; The value of thunk, or the value of fallback when thunk signals an
+  ;; error: an op morph-lift cannot widen, or an fn that fails on the
+  ;; placeholder cells morph-lift calls it with.
+  (define (lift-or-else thunk fallback)
+    (let ((r (condition-case (list (thunk)) ((exn) #f))))
+      (if r (car r) (fallback))))
+
   (define (batch-map fn m #!optional (batch-axis 0))
     "Apply fn to each element along the batch dimension.
 
-    fn must be a function morphism -> morphism.  It is applied to each
-    non-batched element slice and the results are stacked back into a batched
-    morphism at the same batch-axis position.
+    fn must be a function morphism -> morphism.  It is applied to every
+    non-batched element as one computation (see morph-lift), and the
+    results form a batched morphism with the batch axis at batch-axis.
+    Each element of the result has the values fn gives for that element
+    stored on its own.  When fn cannot be lifted (it uses an op morph-lift
+    cannot widen, or fails on placeholder elements), batch-map runs
+    batch-map/slices instead.
 
     Args:
       fn:         function morphism -> morphism
@@ -233,6 +264,33 @@
 
     Returns:
       Batched morphism of same batch size with fn applied per element."
+    (let* ((shape (get-morphism-shape m))
+           (rank  (vector-length shape)))
+      (unless (and (>= batch-axis 0) (< batch-axis rank))
+        (error "batch-map: batch axis out of range" batch-axis rank))
+      (lift-or-else
+       (lambda ()
+         (let* ((front (if (= batch-axis 0)
+                           m
+                           (morph-transpose m (cons batch-axis
+                                                    (remove (lambda (k) (= k batch-axis))
+                                                            (iota rank))))))
+                (r     (morph-lift fn (- rank 1) front))
+                (rr    (vector-length (get-morphism-shape r))))
+           (when (> batch-axis (- rr 1))
+             (error "batch-map: batch axis beyond the result rank" batch-axis))
+           (with-batch-axis
+            (if (= batch-axis 0)
+                r
+                (morph-transpose r (append (iota batch-axis 1) (list 0)
+                                           (iota (- rr batch-axis 1) (+ batch-axis 1)))))
+            batch-axis)))
+       (lambda () (batch-map/slices fn m batch-axis)))))
+
+  (define (batch-map/slices fn m #!optional (batch-axis 0))
+    "batch-map by slicing: fn is applied to each element of m along
+    batch-axis, taken as a slice, and the results are stacked at
+    batch-axis.  The expression has one fn subtree per element."
     (let* ((N       (vector-ref (get-morphism-shape m) batch-axis))
            (results (map (lambda (i) (fn (extract-batch-element m i batch-axis)))
                          (iota N))))
@@ -256,8 +314,10 @@
   (define (batch-zip fn m1 m2)
     "Apply binary fn element-wise across two batched morphisms.
 
-    Both morphisms must have matching batch sizes.  For each batch index i,
-    computes (fn m1[i] m2[i]) and stacks the results.
+    Both morphisms must have matching batch sizes along axis 0.  For each
+    batch index i, the result holds (fn m1[i] m2[i]), computed for all i
+    as one computation (see morph-lift), with batch axis 0.  When fn
+    cannot be lifted, batch-zip runs batch-zip/slices instead.
 
     Args:
       fn:     binary function morphism morphism -> morphism
@@ -265,6 +325,19 @@
 
     Returns:
       Batched morphism of same batch size with fn applied per pair."
+    (let ((N  (vector-ref (get-morphism-shape m1) 0))
+          (r1 (vector-length (get-morphism-shape m1)))
+          (r2 (vector-length (get-morphism-shape m2))))
+      (unless (= N (vector-ref (get-morphism-shape m2) 0))
+        (error "batch-zip: batch size mismatch"
+               N (vector-ref (get-morphism-shape m2) 0)))
+      (lift-or-else
+       (lambda () (with-batch-axis (morph-lift fn (list (- r1 1) (- r2 1)) m1 m2) 0))
+       (lambda () (batch-zip/slices fn m1 m2)))))
+
+  (define (batch-zip/slices fn m1 m2)
+    "batch-zip by slicing: fn is applied to each pair of elements along
+    axis 0, taken as slices, and the results are stacked."
     (let ((N (vector-ref (get-morphism-shape m1) 0)))
       (unless (= N (vector-ref (get-morphism-shape m2) 0))
         (error "batch-zip: batch size mismatch"
@@ -305,6 +378,14 @@
     Like batch-fold but returns all intermediate accumulator values stacked
     into a batched morphism of the same batch size.
 
+    When init is a morphism of the shape and dtype of one element of m, and
+    fn builds its result from the accumulator, the element and one-element
+    constants with element-wise table ops (morph+, morph*, morph-exp, ...),
+    the result is one scan along axis 0 (see morph-scan/fn), whose
+    expression has as many nodes for any batch size and whose values are
+    those of applying fn step by step.  Otherwise batch-scan runs
+    batch-scan/slices.
+
     Args:
       fn:   binary function (acc morphism -> morphism)
       init: initial accumulator (used before the first element)
@@ -312,6 +393,19 @@
 
     Returns:
       Batched morphism of same shape as m holding cumulative results."
+    (let ((elem-shape (list->vector (cdr (vector->list (get-morphism-shape m))))))
+      (if (and (array-morphism? init)
+               (equal? (get-morphism-shape init) elem-shape)
+               (eq? (get-morphism-dtype init) (get-morphism-dtype m)))
+          (lift-or-else
+           (lambda () (with-batch-axis (morph-scan/fn fn m 0 init: init) 0))
+           (lambda () (batch-scan/slices fn init m)))
+          (batch-scan/slices fn init m))))
+
+  (define (batch-scan/slices fn init m)
+    "batch-scan by slicing: fn is applied to the accumulator and each element
+    along axis 0, taken as slices, in order, and the accumulators are
+    stacked."
     (let* ((N (vector-ref (get-morphism-shape m) 0))
            (results
             (let loop ((i 0) (acc init) (out '()))
@@ -364,61 +458,5 @@
   (define morph-/batch    (make-batch-aware-binop morph-))
   (define morph*/batch    (make-batch-aware-binop morph*))
   (define morph-div/batch (make-batch-aware-binop morph/))
-
-  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  ;;; Batched Matrix Multiply
-  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-  (define (morph-batch-matmul A B)
-    "Batched matrix multiply.
-
-    Supported shapes:
-      A (M, K), B (K, P)       -- non-batched: plain morph-matmul
-      A (N, M, K), B (K, P)    -- shared weight: batch-map morph-matmul over A
-      A (N, M, K), B (N, K, P) -- per-batch weight: batch-zip morph-matmul
-
-    In all batched cases, each slice is a 2-D matrix multiply routed through
-    morph-matmul, which the realization engine dispatches to BLAS (when
-    available) via execute-blas-operation.
-
-    Args:
-      A: matrix or batched-matrix morphism
-      B: matrix or batched-matrix morphism
-
-    Returns:
-      Matrix or batched-matrix morphism of appropriate shape."
-    (let* ((A-shape (get-morphism-shape A))
-           (B-shape (get-morphism-shape B))
-           (A-rank  (vector-length A-shape))
-           (B-rank  (vector-length B-shape)))
-      (cond
-        ;; Both non-batched: delegate directly.
-        ((and (= A-rank 2) (= B-rank 2))
-         (morph-matmul A B))
-
-        ;; A rank-3 (N,M,K), B rank-2 (K,P): map matmul over N.
-        ;; A may carry batch-axis=-1 when built from morph-from-list.
-        ((and (= A-rank 3) (= B-rank 2))
-         (let ((K-a (vector-ref A-shape 2))
-               (K-b (vector-ref B-shape 0)))
-           (unless (= K-a K-b)
-             (error "morph-batch-matmul: inner dimensions must match" K-a K-b)))
-         (batch-map (lambda (a) (morph-matmul a B)) A 0))
-
-        ;; A rank-3 (N,M,K), B rank-3 (N,K,P): per-element weight.
-        ((and (= A-rank 3) (= B-rank 3))
-         (let ((N-a (vector-ref A-shape 0))
-               (N-b (vector-ref B-shape 0)))
-           (unless (= N-a N-b)
-             (error "morph-batch-matmul: batch size mismatch" N-a N-b)))
-         (let ((K-a (vector-ref A-shape 2))
-               (K-b (vector-ref B-shape 1)))
-           (unless (= K-a K-b)
-             (error "morph-batch-matmul: inner dimensions must match" K-a K-b)))
-         (batch-zip morph-matmul A B))
-
-        (else
-         (error "morph-batch-matmul: unsupported shape combination"
-                A-shape B-shape)))))
 
 ) ;; end module array-morphisms-batch-ops

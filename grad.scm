@@ -76,13 +76,16 @@
    var-reshape
    var-transpose
    var-matmul
+   var-lift
+   var-scan
+   scan-gradient
 
    ;; Backward pass
    backward!
    topo-sort)
 
   (import scheme (chicken base))
-  (import (only srfi-1 iota any filter every map fold))
+  (import (only srfi-1 iota any filter every map fold take drop make-list))
   (import (only srfi-4
                 f32vector? f64vector? s32vector? s64vector?
                 f32vector-length f64vector-length
@@ -100,6 +103,7 @@
   (import array-morphisms-basic-ops)
   (import array-morphisms-structural-ops)
   (import array-morphisms-blas-exec)
+  (import array-morphisms-lift)
 
 
 ;;;; ============================================================
@@ -158,8 +162,14 @@
 (define (accumulate-grad! v g)
   "Add lazy morphism g to v's accumulated gradient.
    First call: sets gradient directly.
-   Subsequent calls: combines via morph+ (lazy, no realization)."
-  (let ((existing (morph-variable-grad v)))
+   Subsequent calls: combines via morph+ (lazy, no realization).
+   g is first given the gradient dtype of v's value, so that the
+   gradient of an f32 variable stays f32 even when the backward rule
+   mixes in f64 terms."
+  (let* ((existing (morph-variable-grad v))
+         (dtype    (effective-grad-dtype
+                    (morph-dtype (morph-variable-value v))))
+         (g        (if (eq? (morph-dtype g) dtype) g (morph-cast g dtype))))
     (morph-variable-grad-set!
      v (if existing (morph+ existing g) g))))
 
@@ -402,7 +412,8 @@
           (let ((x1 (var-value v1))
                 (x2 (var-value v2)))
             (when (var-requires-grad? v1)
-              (let* ((one (morph-from-list '(1.0) '(1) 'f64))
+              (let* ((one (morph-from-list '(1.0) '(1)
+                                           (effective-grad-dtype (morph-dtype x2))))
                      (dx1 (morph* g (morph* x2 (morph-pow x1 (morph- x2 one))))))
                 (accumulate-grad! v1 (reduce-sum-to dx1 (morph-shape x1)))))
             (when (var-requires-grad? v2)
@@ -434,7 +445,9 @@
         (lambda (g)
           (let* ((x-now   (var-value v))
                  (out-now (morph-sqrt x-now))
-                 (two     (morph-from-list '(2.0) '(1) 'f64))
+                 (two     (morph-from-list '(2.0) '(1)
+                                               (effective-grad-dtype
+                                                (morph-dtype x-now))))
                  (dx      (morph/ g (morph* two out-now))))
             (accumulate-grad! v dx)))))
     out))
@@ -605,7 +618,8 @@
                         (iota x-rank)
                         (map (lambda (a) (normalize-axis a x-rank)) axes)))
          (n        (compute-reduction-n x-shape norm-axes))
-         (n-morph  (morph-from-list (list (exact->inexact n)) '(1) 'f64))
+         (n-morph  (morph-from-list (list (exact->inexact n)) '(1)
+                                    (effective-grad-dtype (morph-dtype x))))
          (rg  (var-requires-grad? v))
          (out (make-var (morph-reduce 'mean x axes keepdims?) rg)))
     (when rg
@@ -654,6 +668,157 @@
           (accumulate-grad! v (morph-transpose g inv-perm)))))
     out))
 
+
+;;;; ============================================================
+;;;; Scans
+;;;; ============================================================
+
+(define (var-scan op v axis #!key (exclusive? #f) (reverse? #f) (init #f))
+  "Gradient-tracking scan along axis (see morph-scan).  init, when given,
+   is a variable.  For a sum, dv is the cumulative sum of g in the opposite
+   direction, inclusive or exclusive as the scan, and dinit the sum of g
+   along axis, taken from the inclusive cumulative sum of g in the opposite
+   direction at its last position.  Products, maxima and minima have the
+   gradients of scan-gradient.  A combine-expression scan of a variable
+   that requires grad is an error."
+  (let* ((rg  (grad-requires? (if init (list v init) (list v))))
+         (_   (when (and rg (not (memq op '(sum prod max min))))
+                (error "var-scan: a scan with a combine expression has no gradient" op)))
+         (x   (var-value v))
+         (ax  (normalize-axis axis (vector-length (morph-shape x))))
+         (out (make-var (morph-scan op x ax exclusive?: exclusive? reverse?: reverse?
+                                    init: (and init (var-value init)))
+                        rg)))
+    (when rg
+      (morph-variable-parents-set! out (filter var-requires-grad? (if init (list v init) (list v))))
+      (morph-variable-grad-fn-set! out
+        (lambda (g)
+         (if (not (eq? op 'sum))
+          (let ((d (scan-gradient (eager-scan-ops ax (morph-dtype x)) op (morph-shape x) (morph-dtype x)
+                                  ax exclusive? reverse? #f g x (var-value out)
+                                  (and init (var-value init)))))
+            (when (var-requires-grad? v) (accumulate-grad! v (car d)))
+            (when (and init (var-requires-grad? init)) (accumulate-grad! init (cdr d))))
+          (begin
+          (when (var-requires-grad? v)
+            (accumulate-grad! v (morph-scan 'sum g ax exclusive?: exclusive? reverse?: (not reverse?))))
+          (when (and init (var-requires-grad? init))
+            (let* ((shape (vector->list (morph-shape x)))
+                   (pos   (if reverse? (- (list-ref shape ax) 1) 0))
+                   (whole (morph-scan 'sum g ax reverse?: (not reverse?))))
+              (accumulate-grad!
+               init
+               (morph-reshape (morph-slice whole
+                                           (map (lambda (k) (if (= k ax) pos 0)) (iota (length shape)))
+                                           (map (lambda (k d) (if (= k ax) (+ pos 1) d))
+                                                (iota (length shape)) shape))
+                              (morph-shape (var-value init)))))))))))
+    out))
+
+;; The operations of scan-gradient on morphisms, for a scan along axis
+;; whose result has dtype dtype.
+(define (eager-scan-ops axis dtype)
+  (lambda (name . args)
+    (case name
+      ((scan) (apply (lambda (v shape op excl? rev? init aux)
+                       (morph-scan op v axis exclusive?: excl? reverse?: rev? init: init aux: aux))
+                     args))
+      ((slice) (apply (lambda (v start end shape) (morph-slice v start end)) args))
+      ((concat) (morph-concat (car args) axis))
+      ((reshape) (morph-reshape (car args) (cadr args)))
+      ((mul) (morph* (car args) (cadr args)))
+      ((sub) (morph- (car args) (cadr args)))
+      ((add-init) (morph+ (car args) (cadr args)))
+      ((mask) (apply (lambda (rel a b shape) (morph-cast ((if (eq? rel 'gt) morph> morph<) a b) dtype)) args))
+      ((const) (apply (lambda (value shape)
+                        (morph-from-list (make-list (fold * 1 (vector->list shape)) value) shape dtype))
+                      args))
+      (else (error "eager-scan-ops: unknown operation" name)))))
+
+
+;; The gradients of a prod, max or min scan, written once over a set of
+;; operations so that the eager and the SSA backward passes compute the
+;; same formulas.  ops is a procedure called as
+;;   (ops 'scan v shape op exclusive? reverse? init aux)  a scan of v
+;;   (ops 'slice v start end shape)                       v[start, end)
+;;   (ops 'concat vs shape)                               along the scan's axis
+;;   (ops 'reshape v shape)
+;;   (ops 'mul a b shape) and (ops 'sub a b shape)
+;;   (ops 'mask rel a b shape)  1 where (rel a b) holds and 0 elsewhere,
+;;                              rel gt or lt, in the scan's dtype
+;;   (ops 'const value shape)   an array filled with value
+;;   (ops 'add-init a b)        a + b, two arrays of the seed's shape
+;; where shapes are vectors and start and end lists.
+;;
+;; For an inclusive forward scan y of x with seed s:
+;;   prod:    dx = E * S, E the exclusive product scan of x (from s), and
+;;            S_k = g_k + x_{k+1} S_{k+1} (a recurrence run from the end),
+;;            so no element is divided by; ds = x_0 S_0.
+;;   max/min: m_k = 1 when element k replaces the running value (x_k > y_{k-1}
+;;            for max, as the forward step decides; 1 for the first element
+;;            without a seed), T_k the sum of g over the positions element k
+;;            holds (T_k = g_k + T_{k+1} while element k+1 does not replace
+;;            it, else g_k), dx = m T, ds = (1 - m_0) T_0.
+;; An exclusive scan is an inclusive one shifted by one position: g moves
+;; back by one, and the seed also receives the first element of g.  A
+;; reversed scan reverses every shift.
+(define (scan-gradient ops op shape dtype axis excl? rev? swapped? g x y init)
+  "The gradients (dx . dinit) of the scan with op prod, max or min, the
+   given flags and the incoming gradient g, of the operand x, its output y
+   and the seed init (#f when there is none; dinit is then #f)."
+  (let* ((rank   (vector-length shape))
+         (n      (vector-ref shape axis))
+         (first  (if rev? (- n 1) 0))
+         (dims   (vector->list shape))
+         (along  (lambda (len) (list->vector (map (lambda (k d) (if (= k axis) len d)) (iota rank) dims))))
+         (lshape (along 1))
+         (ishape (list->vector (append (take dims axis) (drop dims (+ axis 1)))))
+         (sl     (lambda (v s e)
+                   (ops 'slice v (map (lambda (k) (if (= k axis) s 0)) (iota rank))
+                        (map (lambda (k d) (if (= k axis) e d)) (iota rank) dims)
+                        (along (- e s)))))
+         (cat    (lambda (a b) (ops 'concat (list a b) shape)))
+         (line   (lambda (v pos) (sl v pos (+ pos 1))))
+         (lconst (lambda (val) (ops 'const val lshape)))
+         ;; v at the next position in the scan's order, fill at the last
+         (to-next (lambda (v fill)
+                    (cond ((= n 1) fill)
+                          (rev? (cat fill (sl v 0 (- n 1))))
+                          (else (cat (sl v 1 n) fill)))))
+         ;; v at the previous position, fill at the first
+         (from-prev (lambda (v fill)
+                      (cond ((= n 1) fill)
+                            (rev? (cat (sl v 1 n) fill))
+                            (else (cat fill (sl v 0 (- n 1)))))))
+         ;; v with its first line replaced by fill
+         (set-first (lambda (v fill)
+                      (cond ((= n 1) fill)
+                            (rev? (cat (sl v 0 (- n 1)) fill))
+                            (else (cat fill (sl v 1 n))))))
+         (gp     (if excl? (to-next g (lconst 0.0)) g))
+         ;; the recurrence h_k = gp_k + c_k h_{k+1}, run against the scan
+         (recur  (lambda (c expr) (ops 'scan gp shape expr #f (not rev?) #f (list c))))
+         (to-init (lambda (v) (ops 'reshape v ishape))))
+    (case op
+      ((prod)
+       (let* ((E  (ops 'scan x shape 'prod #t rev? init '()))
+              (S  (recur (to-next x (lconst 1.0)) '(lambda (a b c) (+ b (* c a)))))
+              (dx (ops 'mul E S shape))
+              (di (and init (ops 'mul (line x first) (line S first) lshape))))
+         (cons dx (and init (if excl? (ops 'add-init (to-init di) (to-init (line g first))) (to-init di))))))
+      ((max min)
+       (let* ((rel   (if (eq? op 'max) 'gt 'lt))
+              (prev  (if excl? y (from-prev y (if init (ops 'reshape init lshape) (lconst 0.0)))))
+              (raw   (if swapped?
+                         (ops 'sub (ops 'const 1.0 shape) (ops 'mask rel prev x shape) shape)
+                         (ops 'mask rel x prev shape)))
+              (m     (if init raw (set-first raw (lconst 1.0))))
+              (keep  (ops 'sub (ops 'const 1.0 shape) m shape))
+              (T     (recur (to-next keep (lconst 0.0)) '(lambda (a b c) (if (> c 0.5) (+ b a) b))))
+              (dx    (ops 'mul m T shape))
+              (di    (and init (ops 'mul (line keep first) (line T first) lshape))))
+         (cons dx (and init (if excl? (ops 'add-init (to-init di) (to-init (line g first))) (to-init di))))))
+      (else (error "scan-gradient: no gradient rule for op" op)))))
 
 ;;;; ============================================================
 ;;;; Linear Algebra
@@ -722,6 +887,29 @@
             (hash-table-set! visited (var-name v) #t)
             (cons v (fold visit order (morph-variable-parents v))))))
     (visit root '())))
+
+;;;; ============================================================
+;;;; var-lift
+;;;; ============================================================
+
+(define (var-lift fn cell-ranks . vs)
+  "Gradient-tracking frame lifting: a variable whose value is
+   (morph-lift fn cell-ranks (var-value v) ...).
+
+   fn maps cell morphisms to a morphism, as for morph-lift; weights it
+   uses are taken from their variables with var-value.  The gradients of
+   a lifted computation are derived from the morphism by ssa-vjp, which
+   am-training-step/ssa uses.  backward! does not differentiate through
+   it: the variable always requires grad, and its backward closure
+   signals an error, so that a weight fn captures cannot silently miss
+   its gradient."
+  (let ((out (make-var (apply morph-lift fn cell-ranks (map var-value vs)) #t)))
+    (morph-variable-parents-set! out (filter var-requires-grad? vs))
+    (morph-variable-grad-fn-set!
+     out
+     (lambda (g)
+       (error "var-lift: backward! cannot differentiate a lifted computation; train it with am-training-step/ssa (ssa-vjp)")))
+    out))
 
 (define (backward! var #!optional seed)
   "Run reverse-mode automatic differentiation from var.

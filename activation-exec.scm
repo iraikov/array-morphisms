@@ -42,6 +42,26 @@
 ;;;     strides (Scheme vectors) and the offset of its first element, into
 ;;;     dst in row-major order.
 ;;;
+;;;   * Scans, (op . dtype) -> (outer n inner src seed out flags), where op
+;;;     is sum, prod, max or min.  src and out are row-major arrays of
+;;;     outer * n * inner elements read and written from element 0: the
+;;;     array [outer, n, inner] is scanned along its middle axis, which is
+;;;     how a row-major array of any rank is scanned along one of its axes
+;;;     (outer and inner being the products of the extents before and after
+;;;     it).  The bits of flags are 1 for an exclusive scan, 2 for a
+;;;     reversed one, 4 when seed, a row-major [outer, inner] array, holds
+;;;     the values the lines start from, and 8 when each step combines the
+;;;     element with the value so far as (op element acc).  A kernel must
+;;;     give the values of execute-scan-morphism bit for bit.
+;;;
+;;;   * Fused kernels, (body . dtype) -> (size ins out), each computing a
+;;;     whole scalar body (see segop.scm) at every element: out[i] is the
+;;;     body applied to element i of the vectors in the list ins, which
+;;;     are read as the body's inputs (in 0), (in 1), ...  body is in the
+;;;     canonical form of canonical-scalar-body, under which the fusion
+;;;     pass and the segop registry look kernels up.  A kernel must round
+;;;     exactly as the body's casts and its output dtype say.
+;;;
 ;;; This registry is separate from the blas-backend record of blas-exec.scm
 ;;; because the set of activation ops is open-ended and every kernel has the
 ;;; same calling convention, whereas blas-backend is a fixed record whose
@@ -89,7 +109,20 @@
 
    ;; Strided copy kernels
    activation-backend-add-copy-kernel!
-   lookup-copy-kernel)
+   lookup-copy-kernel
+
+   ;; Fused kernels
+   activation-backend-add-fused-kernel!
+   lookup-fused-kernel
+   activation-backend-fused-patterns
+
+   ;; Fused column-sum kernels
+   activation-backend-add-colsum-kernel!
+   lookup-colsum-kernel
+
+   ;; Scan kernels
+   activation-backend-add-scan-kernel!
+   lookup-scan-kernel)
 
   (import scheme (chicken base))
   (import (only srfi-69
@@ -104,23 +137,30 @@
   ;; equal?, so they hash by content rather than by address.
   ;; binary-table, reduction-table and copy-table hold the binary,
   ;; reduction and strided-copy kernels in the same way.
-  ;; broadcast-table holds the broadcast binary kernels.
+  ;; broadcast-table holds the broadcast binary kernels, fused-table the
+  ;; fused kernels and colsum-table the fused column-sum kernels, both
+  ;; keyed by (body . dtype).  scan-table holds the scan kernels, keyed by
+  ;; (op . dtype).
   (define-record-type activation-backend
     (%make-activation-backend name table binary-table reduction-table copy-table
-                              broadcast-table)
+                              broadcast-table fused-table colsum-table scan-table)
     activation-backend?
     (name            activation-backend-name)
     (table           activation-backend-table)
     (binary-table    activation-backend-binary-table)
     (reduction-table activation-backend-reduction-table)
     (copy-table      activation-backend-copy-table)
-    (broadcast-table activation-backend-broadcast-table))
+    (broadcast-table activation-backend-broadcast-table)
+    (fused-table     activation-backend-fused-table)
+    (colsum-table    activation-backend-colsum-table)
+    (scan-table      activation-backend-scan-table))
 
   (define (make-activation-backend name)
     "Create an activation backend called name (a symbol) with no kernels."
     (%make-activation-backend name (make-hash-table equal?) (make-hash-table equal?)
                               (make-hash-table equal?) (make-hash-table equal?)
-                              (make-hash-table equal?)))
+                              (make-hash-table equal?) (make-hash-table equal?)
+                              (make-hash-table equal?) (make-hash-table equal?)))
 
   (define (check-kernel who dtype kernel)
     (unless (memq dtype '(f32 f64))
@@ -148,7 +188,8 @@
     out[i, j] = op(a[.], b[.]); the mode of an operand says how it is
     indexed: 0, a rows x cols array (index i*cols + j); 1, one value per
     row (index i); 2, one value per column (index j); 3, a single value
-    (index 0).  out is distinct from a and b."
+    (index 0).  out may be an operand of mode 0, which is then updated
+    in place; otherwise it is distinct from a and b."
     (check-kernel 'activation-backend-add-broadcast-kernel! dtype kernel)
     (unless (memq op '(add sub mul div))
       (error 'activation-backend-add-broadcast-kernel! "unsupported op" op))
@@ -189,6 +230,55 @@
     "The strided copy kernel bkend holds for dtype arrays, or #f."
     (and bkend
          (hash-table-ref/default (activation-backend-copy-table bkend) dtype #f)))
+
+  (define (activation-backend-add-fused-kernel! bkend body dtype kernel)
+    "Installs kernel, a procedure (size ins out) -> void computing the
+    scalar body body at each of the first size elements, as the backend's
+    fused kernel for body on dtype arrays.  ins is the list of input
+    vectors, read as (in 0), (in 1), ...; body must be in canonical form
+    (see canonical-scalar-body in segop.scm)."
+    (check-kernel 'activation-backend-add-fused-kernel! dtype kernel)
+    (hash-table-set! (activation-backend-fused-table bkend) (cons body dtype) kernel))
+
+  (define (lookup-fused-kernel bkend body dtype)
+    "The fused kernel bkend holds for the canonical body body on dtype
+    arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-fused-table bkend) (cons body dtype) #f)))
+
+  (define (activation-backend-add-colsum-kernel! bkend body dtype kernel)
+    "Installs kernel, a procedure (rows cols ins mo out) -> void, as the
+    backend's column-sum kernel for body on dtype arrays.  ins lists the
+    inputs, row-major rows x cols arrays read as (in 0), (in 1), ....  The
+    kernel stores body's value at each element in mo, a rows x cols array,
+    and the sum of each column in out, adding the rows in order.  body must
+    be in canonical form (see canonical-scalar-body in segop.scm)."
+    (check-kernel 'activation-backend-add-colsum-kernel! dtype kernel)
+    (hash-table-set! (activation-backend-colsum-table bkend) (cons body dtype) kernel))
+
+  (define (lookup-colsum-kernel bkend body dtype)
+    "The fused column-sum kernel bkend holds for the canonical body body on
+    dtype arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-colsum-table bkend) (cons body dtype) #f)))
+
+  (define (activation-backend-add-scan-kernel! bkend op dtype kernel)
+    "Installs kernel, a procedure (outer n inner src seed out flags) -> void,
+    as the backend's scan with op (sum, prod, max or min) of dtype arrays
+    (see the module header for the arguments)."
+    (check-kernel 'activation-backend-add-scan-kernel! dtype kernel)
+    (unless (memq op '(sum prod max min))
+      (error 'activation-backend-add-scan-kernel! "unsupported scan op" op))
+    (hash-table-set! (activation-backend-scan-table bkend) (cons op dtype) kernel))
+
+  (define (lookup-scan-kernel bkend op dtype)
+    "The scan kernel bkend holds for op on dtype arrays, or #f."
+    (and bkend
+         (hash-table-ref/default (activation-backend-scan-table bkend) (cons op dtype) #f)))
+
+  (define (activation-backend-fused-patterns bkend)
+    "The (body . dtype) pairs of the fused kernels bkend holds."
+    (hash-table-keys (activation-backend-fused-table bkend)))
 
   (define (activation-backend-add-kernel! bkend op dtype kernel)
     "Installs kernel, a procedure (size in out) -> void, as the backend's

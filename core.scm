@@ -71,6 +71,7 @@
    reduction-index-fn-reduce-axes
    reduction-index-fn-reducer
    reduction-index-fn-keepdims?
+   reduction-index-fn-frame-rank
    
    ;; Batch map index functions (per-batch-element operations)
    batch-map-index-fn?
@@ -85,6 +86,17 @@
    batch-reduce-index-fn-reducer
    batch-reduce-index-fn-batch-axis
    batch-reduce-index-fn-keepdims?
+
+   ;; Scan index functions (cumulative sums, products, maxima, minima)
+   scan-index-fn?
+   make-scan-index-fn
+   scan-index-fn-op
+   scan-index-fn-axis
+   scan-index-fn-exclusive?
+   scan-index-fn-reverse?
+   scan-index-fn-swapped?
+   scan-index-fn-neutral
+   scan-index-fn-aux-count
 
    ;; col2im index functions (accumulation)
    col2im-index-fn?
@@ -337,7 +349,8 @@
   source-fn     ; Input index function
   reduce-axes   ; Axes to reduce (list)
   reducer       ; Reduction operation (procedure)
-  keepdims?)    ; Keep reduced dimensions?
+  keepdims?     ; Keep reduced dimensions?
+  frame-rank)   ; Number of leading frame axes (0 for an ordinary reduction)
 
 ;; Batch operations
 (define-record batch-map-index-fn
@@ -349,6 +362,36 @@
   reducer       ; Reduction across batch
   batch-axis    ; Batch dimension
   keepdims?)    ; Keep batch dimension?
+
+;; Scan along one axis (cumulative sum, product, maximum, minimum, or a
+;; scan with a combine expression).
+;;   op:         sum, prod, max, min, or a combine expression (lambda (a b) e)
+;;               (see segop.scm).
+;;   axis:       the scanned axis.
+;;   exclusive?: #f when the output at position r combines the elements at
+;;               0 to r; #t when it combines those at 0 to r - 1.
+;;   reverse?:   #t to scan from the last position down to the first.
+;;   swapped?:   #t when each step is (op element acc) rather than
+;;               (op acc element).
+;;   neutral:    for a combine expression, its neutral element or #f;
+;;               otherwise #f (the neutral element follows from op).
+;;   aux-count:  the number of extra arrays (the last operands) whose
+;;               elements a combine expression receives after the
+;;               accumulator and the element.
+(define-record-type scan-index-fn
+  (%make-scan-index-fn op axis exclusive? reverse? swapped? neutral aux-count)
+  scan-index-fn?
+  (op scan-index-fn-op)
+  (axis scan-index-fn-axis)
+  (exclusive? scan-index-fn-exclusive?)
+  (reverse? scan-index-fn-reverse?)
+  (swapped? scan-index-fn-swapped?)
+  (neutral scan-index-fn-neutral)
+  (aux-count scan-index-fn-aux-count))
+
+(define (make-scan-index-fn op axis exclusive? reverse? swapped? neutral #!optional (aux-count 0))
+  "A scan index function; see the record definition for the fields."
+  (%make-scan-index-fn op axis exclusive? reverse? swapped? neutral aux-count))
 
 (define-record-type col2im-index-fn
   (make-col2im-index-fn-record kernel-h kernel-w stride-h stride-w pad-h pad-w col-layout)
@@ -383,6 +426,7 @@
       (batch-map-index-fn? obj)
       (batch-reduce-index-fn? obj)
       (col2im-index-fn? obj)
+      (scan-index-fn? obj)
       (stack-index-fn? obj)    
       (concat-index-fn? obj)   
       (procedure? obj)

@@ -28,17 +28,19 @@
 
   (;; Data-type predicates/accessors
    ssa-value?
+   binding-ref const-ref
    ssa-binding-ref? ssa-const-ref?
    ssa-value-id
 
    ;; SSA records
+   make-ssa-binding
    ssa-binding?
    ssa-binding-name ssa-binding-op ssa-binding-inputs
    ssa-binding-shape ssa-binding-dtype ssa-binding-meta
-   ssa-program?
+   make-ssa-program ssa-program?
    ssa-program-constants ssa-program-morph-to-val
    ssa-program-bindings ssa-program-outputs ssa-program-n-params
-   ssa-program-replay-plan
+   ssa-program-replay-plan ssa-program-fused?
 
    ;; Compilation
    morphism-to-ssa
@@ -56,17 +58,26 @@
    replay-ref?
    rr-val rr-const
    replay-instruction replay-instruction?
-   ri-gemm ri-gemm-strided ri-index ri-reduce ri-view
-   ri-flat-unary ri-flat-binary ri-flat-bias-broadcast ri-flat-broadcast ri-flat-ternary
-   ri-activation-unary ri-activation-binary
-   ri-gemm-epilogue ri-alias
-   ri-im2col ri-col2im
-   ri-conv-fwd ri-conv-bwd-data ri-conv-bwd-weights
+   ri-view
+   ri-segop
 
-   ;; Fusion pass
-   ssa-compute-use-counts
-   ssa-fusion-eligible?
-   ssa-element-wise-fusion-pass
+   ;; Segop fusion
+   segop-fusion
+   ssa-segop-fusion-pass
+   ssa-fusion-graph
+   segop-fusion-max-rounds
+   ssa-fusion-pass-stats
+   make-fused-ssa-binding
+   fused-red-binding?
+   binding-out-names
+
+   ;; Segop lowering
+   binding-scalar-body
+   standard-reduction
+   standard-gemm
+   lower-conv-binding
+   conv-segop-geom
+   conv-geom-kind
 
    ;; Replay plan compilation and execution
    compile-replay-plan
@@ -80,13 +91,16 @@
     replay-timing-results)
 
   (import scheme (chicken base) (chicken time) (chicken format)
-          (only (chicken fixnum) fx+ fx* fx=)
+          (only (chicken fixnum) fx+ fx- fx* fx= fx< fx>=)
           (only (chicken flonum) fp+ fp- fp* fp/ fp= fpexpt)
           (only (scheme time) current-jiffy jiffies-per-second)
-          (only srfi-1 iota fold filter map for-each append-map filter-map every)
+          (only (scheme base) make-parameter)
+          (only srfi-1 iota fold filter map for-each append-map filter-map every any
+                take drop list-index delete-duplicates find make-list)
           (only srfi-4
                 f64vector f64vector? f64vector-ref f64vector-set! f64vector-length
-                f32vector f32vector? f32vector-ref f32vector-set! f32vector-length)
+                f32vector f32vector? f32vector-ref f32vector-set! f32vector-length
+                make-f32vector s32vector-set! s64vector-set!)
           (only srfi-69
                 make-hash-table
                 hash-table-ref
@@ -112,6 +126,8 @@
           array-morphisms-realization
           array-morphisms-context
           array-morphisms-morph-env
+          array-morphisms-scalar-ops
+          array-morphisms-segop
           (prefix array-morphisms-grad am:))
           
 
@@ -159,11 +175,34 @@
 ;;   outputs     : list of ssa-value  (loss first, then param grads)
 ;;   n-params    : count of trainable parameter constants
 ;;   replay-plan   : #f until compiled; vector of replay-instruction (one per binding)
-;;   trace-info    : #f until trace; morph-env bid-sym -> (concrete-array . is-pool?)
-;;   output-specs  : #f until compiled; list of (integer | concrete-array) per output
-;;                   integer = index into vals vector; concrete-array = const-ref value
-(define-record ssa-program constants morph-to-val bindings outputs n-params
-               replay-plan trace-info output-specs)
+;;   trace-info    : #f until trace; morph-env bid-sym -> (concrete-array . is-pool?);
+;;                   released (#f again) once the replay-plan is compiled
+;;   output-specs  : #f until compiled; list of (integer | (pos . buffer) | concrete-array)
+;;                   per output: integer = index into vals vector; (pos . buffer) = the
+;;                   same, copied into buffer when strided; concrete-array = const-ref value
+;;   fused?        : true once the fusion policy has been applied to the bindings
+;;                   (by ssa-vjp, or by ssa-realize/ctx at the first trace)
+;;   plan-notes    : alist of statistics returned by the plan finalizers of the
+;;                   compiled replay plan (see segop-plan-add-finalizer!)
+(define-record-type ssa-program
+  (%make-ssa-program constants morph-to-val bindings outputs n-params
+                     replay-plan trace-info output-specs fused? plan-notes)
+  ssa-program?
+  (constants    ssa-program-constants)
+  (morph-to-val ssa-program-morph-to-val)
+  (bindings     ssa-program-bindings ssa-program-bindings-set!)
+  (outputs      ssa-program-outputs)
+  (n-params     ssa-program-n-params)
+  (replay-plan  ssa-program-replay-plan ssa-program-replay-plan-set!)
+  (trace-info   ssa-program-trace-info ssa-program-trace-info-set!)
+  (output-specs ssa-program-output-specs ssa-program-output-specs-set!)
+  (fused?       ssa-program-fused? ssa-program-fused?-set!)
+  (plan-notes   ssa-program-plan-notes ssa-program-plan-notes-set!))
+
+(define (make-ssa-program constants morph-to-val bindings outputs n-params
+                          replay-plan trace-info output-specs #!optional (fused? #f))
+  (%make-ssa-program constants morph-to-val bindings outputs n-params
+                     replay-plan trace-info output-specs fused? '()))
 
 
 ;;; ============================================================
@@ -180,286 +219,37 @@
   (rr-val   (val-idx integer?))
   (rr-const (cid symbol?)))
 
-;; Predicate for SRFI-4 float typed vectors (col scratch buffers).
-(define (typed-float-vec? x) (or (f32vector? x) (f64vector? x)))
-
 ;; One pre-compiled instruction per SSA binding.
 (define-datatype replay-instruction replay-instruction?
-
-  ;; Row-major matmul: strides pre-computed at compile time.  The operands
-  ;; are checked at compile time; plan holds the result (see
-  ;; prepare-blas-gemm/into in blas-exec.scm).
-  (ri-gemm
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?)
-    (plan         gemm-plan?))
-
-  ;; Strided matmul (at least one input is a transposed zero-copy view).
-  (ri-gemm-strided
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?)
-    (plan         gemm-plan?))
-
-  ;; Element-wise / general index-fn op: strides pre-computed at compile time.
-  (ri-index
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (index-fn     index-fn?)
-    (in-refs      list?))
-
-  ;; Reduction (sum, mean, max, ...): strides pre-computed at compile time.
-  (ri-reduce
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (src-dtype    symbol?)
-    (rop          symbol?)
-    (reduce-axes  list?)
-    (reducer      procedure?)
-    (keepdims?    boolean?)
-    (in-ref       replay-ref?))
 
   ;; Zero-copy view (transpose, reshape, slice): shares pool buffer with source.
   (ri-view
     (view-fn  procedure?)
     (in-ref   replay-ref?))
 
-  ;; Element-wise unary: output[i] = combiner(A[i])
-  ;; Emitted when: 1 operand, operand and output both row-major with same shape.
-  (ri-flat-unary
+  ;; A binding lowered to a segop (see segop-lower.scm).  executor
+  ;; computes the output into the pool buffer out-pool-idx; segop is the
+  ;; segop it was selected for, and tag names the backend pattern, for
+  ;; timing profiles and replay-plan-stats.  extra-outs lists the outputs
+  ;; after the first of a fused binding with several results, each a
+  ;; vector #(val-idx pool-idx shape strides dtype): its position in the
+  ;; vector of values and its pool buffer.  The executor of such a segop
+  ;; takes their buffers as a third argument, a list.
+  (ri-segop
     (out-pool-idx integer?)
     (out-shape    vector?)
     (out-strides  vector?)
     (out-dtype    symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?))
-
-  ;; Element-wise activation: output[i] = op(A[i]), where op is one of the
-  ;; activation op names of array-morphisms-activation-exec.
-  ;; Emitted under the same layout conditions as ri-flat-unary.  At
-  ;; execution time the active activation backend's kernel for op, if any,
-  ;; replaces the per-element combiner loop; combiner is the fallback and
-  ;; computes the same values.
-  (ri-activation-unary
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (op           symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?))
-
-  ;; Element-wise binary same-shape: output[i] = combiner(A[i], B[i])
-  ;; Emitted when: 2 operands, all row-major with identical shape.
-  (ri-flat-binary
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?))
-
-  ;; Element-wise binary op: output[i] = op(A[i], B[i]), where op is one of
-  ;; the binary op names of array-morphisms-activation-exec.  Emitted under
-  ;; the same layout conditions as ri-flat-binary.  At execution time the
-  ;; active backend's binary kernel for op, if any, replaces the
-  ;; per-element combiner loop; combiner is the fallback.
-  (ri-activation-binary
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (op           symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?))
-
-  ;; Bias broadcast: output[i] = combiner(A[i], B[i mod N])
-  ;; Emitted when: A row-major = output shape; B row-major shape [N] = last dim of output.
-  ;; N baked in at compile time.
-  (ri-flat-bias-broadcast
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (combiner     procedure?)
-    (bias-N       integer?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?))
-
-  ;; General broadcast of a binary op on an output viewed as [M, N]
-  ;; (N the last dimension): output[i, j] = combiner(A[i*rsA + j*csA],
-  ;; B[i*rsB + j*csB]).  Each operand is row-major and either has the
-  ;; output's shape (rs N, cs 1), broadcasts along the last axis ([..., 1]:
-  ;; rs 1, cs 0), along the leading axes ([N]: rs 0, cs 1), or is a
-  ;; single element (rs 0, cs 0).  Covers the row broadcasts of
-  ;; normalizations and softmax and the scalar constants of activations.
-  (ri-flat-broadcast
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (combiner     procedure?)
-    (op-kind      symbol?)      ; add sub mul div pow, or generic
-    (rows         integer?)
-    (cols         integer?)
-    (steps        vector?)      ; #(rsA csA rsB csB)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?))
-
-  ;; Element-wise op of three same-shape row-major operands (a fused
-  ;; binding): output[i] = combiner(A[i], B[i], C[i]).
-  (ri-flat-ternary
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (combiner     procedure?)
-    (in-A         replay-ref?)
-    (in-B         replay-ref?)
-    (in-C         replay-ref?))
-
-  ;; GEMM with in-place element-wise epilogue: one buffer, one combined kernel.
-  ;; BLAS GEMM writes out-pool-idx buffer C[M,N] = A[M,K]*B[K,N],
-  ;; then epilogue applied in-place to C.
-  ;; epilogue-kind: 'unary | 'bias-broadcast
-  ;; epilogue-N:    bias length for 'bias-broadcast; 0 for 'unary
-  ;; bias-ref:      unused sentinel for 'unary; bias replay-ref for 'bias-broadcast
-  (ri-gemm-epilogue
-    (out-pool-idx  integer?)
-    (out-shape     vector?)
-    (out-strides   vector?)
-    (out-dtype     symbol?)
-    (in-A          replay-ref?)
-    (in-B          replay-ref?)
-    (epilogue-kind symbol?)
-    (epilogue-comb procedure?)
-    (epilogue-N    integer?)
-    (bias-ref      replay-ref?)
-    (plan          gemm-plan?))
-
-  ;; Alias for the epilogue binding position after ri-gemm-epilogue.
-  ;; Advances alloc-ctr to stay in sync with trace-time pool allocation.
-  ;; Returns the already-computed epilogue result from in-ref (the GEMM step).
-  (ri-alias
-    (pool-idx  integer?)
-    (shape     vector?)
-    (strides   vector?)
-    (dtype     symbol?)
-    (in-ref    replay-ref?))
-
-  ;; Fast im2col: all index parameters baked in at compile time from morph meta.
-  ;; col-layout: 'nchw-standard (unbatched), 'nchw-classic (batched NCHW), 'nhwc-classic (batched NHWC).
-  (ri-im2col
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (src-ref      replay-ref?)
-    (N            integer?)
-    (C            integer?)
-    (H            integer?)
-    (W            integer?)
-    (KH           integer?)
-    (KW           integer?)
-    (SH           integer?)
-    (SW           integer?)
-    (PH           integer?)
-    (PW           integer?)
-    (OH           integer?)
-    (OW           integer?)
-    (col-layout   symbol?))
-
-  ;; Fast col2im: all index parameters baked in at compile time from VJP meta.
-  ;; col-layout: 'nchw-standard (unbatched), 'nchw-classic (batched NCHW), 'nhwc-classic (batched NHWC).
-  (ri-col2im
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (col-ref      replay-ref?)
-    (N            integer?)
-    (C            integer?)
-    (H            integer?)
-    (W            integer?)
-    (KH           integer?)
-    (KW           integer?)
-    (SH           integer?)
-    (SW           integer?)
-    (PH           integer?)
-    (PW           integer?)
-    (col-layout   symbol?))
-
-  ;; Implicit GEMM forward: fused im2col+GEMM+bias, no col buffer.
-  ;; src: [N,C,H,W] or [N,H,W,C]; wt: [fan_in, out_ch]; b: [out_ch]
-  ;; out: [N*OH_OW, out_ch]
-  (ri-conv-fwd
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (src-ref      replay-ref?)
-    (wt-ref       replay-ref?)
-    (b-ref        replay-ref?)
-    (col-buf      typed-float-vec?)
-    (N   integer?) (C   integer?) (H   integer?) (W   integer?)
-    (KH  integer?) (KW  integer?) (SH  integer?) (SW  integer?)
-    (PH  integer?) (PW  integer?) (OH  integer?) (OW  integer?)
-    (out-ch     integer?)
-    (col-layout symbol?))
-
-  ;; Backward w.r.t. input: dX = scatter(g x WT), no col buffer.
-  ;; g: [N*OH_OW, out_ch]; wt: [fan_in, out_ch]; out: x-shape
-  (ri-conv-bwd-data
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (g-ref        replay-ref?)
-    (wt-ref       replay-ref?)
-    (col-buf      typed-float-vec?)
-    (N   integer?) (C   integer?) (H   integer?) (W   integer?)
-    (KH  integer?) (KW  integer?) (SH  integer?) (SW  integer?)
-    (PH  integer?) (PW  integer?) (OH  integer?) (OW  integer?)
-    (out-ch     integer?)
-    (col-layout symbol?))
-
-  ;; Backward w.r.t. weights: dWT = outer product sum, no col buffer.
-  ;; g: [N*OH_OW, out_ch]; src: x-shape; out: [fan_in, out_ch]
-  (ri-conv-bwd-weights
-    (out-pool-idx integer?)
-    (out-shape    vector?)
-    (out-strides  vector?)
-    (out-dtype    symbol?)
-    (g-ref        replay-ref?)
-    (src-ref      replay-ref?)
-    (col-buf      typed-float-vec?)
-    (N   integer?) (C   integer?) (H   integer?) (W   integer?)
-    (KH  integer?) (KW  integer?) (SH  integer?) (SW  integer?)
-    (PH  integer?) (PW  integer?) (OH  integer?) (OW  integer?)
-    (out-ch     integer?)
-    (col-layout symbol?)))
+    (segop        segop?)
+    (executor     procedure?)
+    (tag          symbol?)
+    (extra-outs   list?)))
 
 
 ;;; ============================================================
-;;; SSA Fusion Helpers (element-wise fusion pass)
+;;; Binding helpers
 ;;;
-;;; Implements MoA's psi-composition theorem at the SSA IR level:
-;;;   Psi(f, Psi(g, A)) = Psi(f o g, A)
-;;; Two adjacent element-wise bindings with use-count=1 are collapsed
-;;; into a single binding whose combiner is the composition of theirs.
+;;; Queries on element-wise bindings, for the segop fusion pass.
 ;;; ============================================================
 
 (define (ssa-binding-combiner b)
@@ -476,33 +266,6 @@
               (error "ssa-binding-combiner: no combiner in meta"
                      (ssa-binding-name b) (ssa-binding-op b)))))))
 
-(define (ssa-binding-elementwise? b)
-  "True when b is an element-wise compute op (not matmul, reduce, or structural)."
-  (let ((op (ssa-binding-op b)))
-    (and (not (eq? op 'matmul))
-         (not (and (pair? op) (eq? (car op) 'reduce)))
-         (not (memq op '(reshape transpose broadcast-expand slice))))))
-
-(define (ssa-compute-use-counts bindings)
-  "Return hash-table: binding-name-sym -> integer (number of consuming bindings)."
-  (let ((counts (make-hash-table)))
-    (for-each (lambda (b)
-                (hash-table-set! counts (ssa-binding-name b) 0))
-              bindings)
-    (for-each
-     (lambda (b)
-       (for-each
-        (lambda (v)
-          (cases ssa-value v
-            (binding-ref (bid)
-              (when (hash-table-ref/default counts bid #f)
-                (hash-table-set! counts bid
-                  (+ 1 (hash-table-ref counts bid)))))
-            (const-ref (_) #f)))
-        (ssa-binding-inputs b)))
-     bindings)
-    counts))
-
 (define (ssa-binding-has-combiner? b)
   "True when b carries an extractable element-wise combiner in meta."
   (let ((meta (ssa-binding-meta b)))
@@ -510,103 +273,1178 @@
         (let ((ip (assq 'index-fn meta)))
           (and ip (compute-index-fn? (cdr ip)))))))
 
-(define (ssa-fusion-eligible? producer consumer use-counts)
-  "True when producer and consumer can be fused by MoA psi-composition.
-   Requires: use-count(producer)=1, consumer's first input is producer's output,
-   same shape, both element-wise, both have extractable combiners."
-  (let* ((p-name  (ssa-binding-name producer))
-         (p-count (hash-table-ref/default use-counts p-name 0))
-         (c-in0   (and (pair? (ssa-binding-inputs consumer))
-                       (car (ssa-binding-inputs consumer)))))
-    (and (= p-count 1)
-         (cases ssa-value c-in0
-           (binding-ref (bid) (eq? bid p-name))
-           (else #f))
-         (equal? (ssa-binding-shape producer) (ssa-binding-shape consumer))
-         (ssa-binding-elementwise? producer)
-         (ssa-binding-elementwise? consumer)
-         (ssa-binding-has-combiner? producer)
-         (ssa-binding-has-combiner? consumer))))
+;; The fusion policy of ssa-vjp and ssa-realize/ctx: #t (the default)
+;; fuses the bindings whose fusion is expected to be faster, all fuses
+;; every pair that may legally be fused, and #f runs no fusion pass.  Fusion does not change results,
+;; so a program run with all and with #f gives the same values, which
+;; tests use as an oracle.
+(define segop-fusion
+  (make-parameter #t (lambda (x) (cond ((eq? x 'all) 'all) (x #t) (else #f)))))
 
-(define (fuse-two-ssa-bindings producer consumer)
-  "Fuse producer into consumer via combiner composition.
-   The fused binding inherits consumer's name (preserving downstream refs).
-   Producer's intermediate buffer is eliminated."
-  (let* ((p-inputs (ssa-binding-inputs producer))
-         (c-inputs (ssa-binding-inputs consumer))
-         (c-other  (cdr c-inputs))
-         (fused-inputs (append p-inputs c-other))
-         (p-comb  (ssa-binding-combiner producer))
-         (c-comb  (ssa-binding-combiner consumer))
-         (p-nargs (length p-inputs))
-         (fused-comb (compose-flat-combiners p-comb p-nargs c-comb (length c-other)))
-         (base-meta (filter (lambda (kv)
-                                 (not (memq (car kv) '(combiner index-fn fused?))))
-                               (ssa-binding-meta consumer)))
-         (fused-meta (cons `(combiner . ,fused-comb)
-                           (cons `(fused? . #t) base-meta))))
-    (make-ssa-binding (ssa-binding-name consumer)
-                      (ssa-binding-op consumer)
-                      fused-inputs
-                      (ssa-binding-shape consumer)
-                      (ssa-binding-dtype consumer)
-                      fused-meta)))
+;;; ============================================================
+;;; Segop fusion
+;;;
+;;; Fuses map bindings into the map bindings that consume them, before
+;;; the program is traced: ssa-vjp runs the pass on the joint program it
+;;; builds, and ssa-realize/ctx on a forward program at its first trace.
+;;; A fused binding has op fused and computes its
+;;; members in one seg-map, described by a fusion template (see
+;;; segop-lower.scm); it takes the place of its last member, the
+;;; consumer, whose name and result it keeps.
+;;;
+;;; The pass works on a graph of uses.  Every read of a binding's value is
+;;; an edge from the reader, with a kind: fusible when a map binding reads
+;;; the value at the iteration point itself (the value has the reader's
+;;; shape), infusible for any other read, and result when the value is a
+;;; program output.  A producer P is fused into a consumer C when P is a
+;;; map binding with a single output, its only use is a fusible edge from
+;;; C, and C's body reads it once.  The value of P then never exists: every
+;;; point of the fused binding computes it, once, from P's inputs, which
+;;; are read at C's position.  Either binding may read inputs that
+;;; broadcast to its shape; the fused binding reads them through their
+;;; broadcast maps.
+;;;
+;;; The fused body is C's body with P's body in place of its reads of P,
+;;; rounded to P's dtype as storing P's value would round it, so fusion
+;;; never changes a result.  Inputs read by both bindings are read once.
+;;;
+;;; Legality (the graph conditions, the shapes of the inputs, bounds on
+;;; the number of inputs and the size of the body) is decided apart from
+;;; profitability.  The host executors of fused segops run the compiled
+;;; body as Scheme procedures, and measured slower than the separate passes
+;;; they replace (whose loops are specialized for each op, or run on
+;;; backend kernels).  Under the default policy a fusion is therefore made
+;;; only when some segop backend reports that it would run the fused segop
+;;; natively, such as a catalogue of compiled fused kernels; the query is
+;;; asked of a layout-free template, with each input's layout predicted
+;;; (values of bindings that allocate, and reshapes of them, are expected
+;;; to be flat; other views are not).  The policy all (see segop-fusion)
+;;; fuses every legal pair.
+;;;
+;;; The driver visits the bindings from last to first and fuses into each
+;;; consumer until nothing more fuses, so a chain collapses in one visit.
+;;; Each round fuses maps into maps first, then fuses with reductions, then
+;;; makes the multi-output and horizontal fusions (see below).  Rounds are
+;;; repeated while they fuse something, at most (segop-fusion-max-rounds)
+;;; times.
+;;; ============================================================
 
-(define (ssa-element-wise-fusion-pass prog)
-  "Apply MoA psi-composition to eligible adjacent binding pairs.
-   Greedy left-to-right scan: whenever a producer P has use-count=1 and
-   its only consumer C immediately follows, fuse them into one binding F.
-   Chains of length > 2 are handled by re-presenting F as the new producer.
-   Safety constraint: fusion is only applied when ALL of producer's inputs
-   have the same shape as the producer's output (flat/non-broadcasting ops),
-   ensuring identity index functions are valid in the fused binding."
-  (let* ((bindings    (ssa-program-bindings prog))
-         (use-counts  (ssa-compute-use-counts bindings))
-         ;; Shape lookup: id-sym -> shape vector (bindings + constants)
-         (shape-of-eb (make-env-builder))
-         ;; Eliminated-binding membership set: id-sym -> #t
-         (elim-eb     (make-env-builder)))
+;; The largest number of rounds of the fusion driver.  Stopping at this
+;; bound leaves a correct, less fused program; ssa-fusion-pass-stats
+;; reports it.
+(define segop-fusion-max-rounds
+  (make-parameter 16 (lambda (n)
+                       (if (and (integer? n) (exact? n) (> n 0))
+                           n
+                           (error 'segop-fusion-max-rounds "not a positive integer" n)))))
+
+;; Statistics of the last run of ssa-segop-fusion-pass.
+(define *fusion-pass-stats* '())
+
+(define (ssa-fusion-pass-stats)
+  "An alist describing the last run of ssa-segop-fusion-pass: rounds (the
+   rounds run), fusions (the fusions made), bound-reached? (true when the
+   last round still fused and the round bound stopped the pass); kept,
+   horizontal and dead-outputs (the fusions that kept a producer as a
+   second output, the horizontal fusions, and the outputs removed for
+   having no uses); classes, an alist from fusion class (see segop
+   templates) to the number of fusions of that class made; candidates, the bodies of the fused seg-maps made, each a list
+   (canonical-body dtype count elements): how many bindings have that
+   body and dtype, and their total number of elements; red-candidates,
+   the fused seg-reduces made, each a list (canonical-body combine-op path
+   map-output? dtype count elements), elements counting the reduced
+   values (combine-op and path are gemm for a GEMM epilogue); and missed, an alist from reason to the number of pairs the
+   last round left unfused for that reason:
+     not-native           no backend runs the fused segop natively
+     broadcast-input      the same, for a fused segop with a broadcast input
+     size-cap             the fused body or its inputs exceed the bounds
+     view                 the producer is read through a reshape or a
+                          transpose, or a reduction's source is a view
+     reduction-order      the reduction's order is left to its backend
+     multi-use-reduction  a reduction result has other uses, or is read twice
+     placement            no position fits a fused binding: a finalize's
+                          inputs come after a reduction that keeps a map
+                          output, or a kept producer has a use before its
+                          consumer, whose inputs come after it
+     horizontal-placement no position fits two siblings
+     gemm-operands        a matrix product's operands are not two matrices
+                          of its dtype, f32 or f64
+     gemm-epilogue-form   an epilogue would change the product's dtype"
+  *fusion-pass-stats*)
+
+;; Views: their values share the buffer of their source, in a layout that
+;; is in general not flat.
+(define fusion-view-ops '(transpose reshape broadcast-expand slice))
+
+;; The candidates entry of ssa-fusion-pass-stats for bindings bs.
+(define (fusion-candidates bs)
+  (let ((table (make-hash-table equal?)))
+    (for-each
+     (lambda (b)
+       (when (and (fused-binding? b) (not (fused-red-binding? b)))
+         (for-each
+          (lambda (o)
+            (let* ((key (cons (call-with-values
+                                  (lambda () (canonical-scalar-body (fused-out-body o)
+                                                                    (length (ssa-binding-inputs b))))
+                                (lambda (c perm) c))
+                              (fused-out-dtype o)))
+                   (old (hash-table-ref/default table key '(0 . 0))))
+              (hash-table-set! table key (cons (+ 1 (car old))
+                                               (+ (shape-size (fused-out-shape o)) (cdr old))))))
+          (fused-binding-outs b))))
+     bs)
+    (map (lambda (kv) (list (caar kv) (cdar kv) (cadr kv) (cddr kv)))
+         (hash-table->alist table))))
+
+;; The red-candidates entry of ssa-fusion-pass-stats for bindings bs.
+(define (fusion-red-candidates bs)
+  (let ((table (make-hash-table equal?)))
+    (for-each
+     (lambda (b)
+       (when (fused-red-binding? b)
+         (let* ((outs (fused-binding-outs b))
+                (o    (car outs))
+                (key  (list (call-with-values
+                                (lambda () (canonical-scalar-body (fused-out-body o)
+                                                                  (length (ssa-binding-inputs b))))
+                              (lambda (c perm) c))
+                            (let ((c (car (fused-out-red o))))
+                              (if (eq? c 'gemm) 'gemm (combine-spec-op c)))
+                            (cdr (assq 'path (ssa-binding-meta b)))
+                            (and (any (lambda (x) (not (fused-out-red x))) outs) #t)
+                            (fused-out-dtype o)))
+                (old  (hash-table-ref/default table key '(0 . 0))))
+           (hash-table-set! table key
+                            (cons (+ 1 (car old))
+                                  (+ (shape-size (cdr (assq 'src-shape (ssa-binding-meta b))))
+                                     (cdr old)))))))
+     bs)
+    (map (lambda (kv) (append (car kv) (list (cadr kv) (cddr kv))))
+         (hash-table->alist table))))
+
+;; Ops that never take part in a fusion: contractions, views and the
+;; convolution family read their operands in their own patterns, and a
+;; scan carries a value from one position to the next.
+(define fusion-barrier-ops
+  '(matmul batch-matmul reshape transpose broadcast-expand slice
+    im2col col2im conv2d-fwd conv2d-bwd-data conv2d-bwd-weights attention scan))
+
+;; The largest number of nodes in a fused body, and of its inputs.
+(define fusion-max-body-size 64)
+(define fusion-max-inputs 8)
+
+(define (fused-binding? b) (eq? (ssa-binding-op b) 'fused))
+
+;; The number of reduced dimensions of fused binding b: 0 for a seg-map.
+(define (fused-binding-nred b)
+  (let ((p (assq 'nred (ssa-binding-meta b)))) (if p (cdr p) 0)))
+
+(define (fused-red-binding? b) (and (fused-binding? b) (> (fused-binding-nred b) 0)))
+
+(define (reduce-binding? b)
+  (let ((op (ssa-binding-op b))) (and (pair? op) (eq? (car op) 'reduce))))
+
+(define (fused-binding-template b)
+  (cdr (assq 'template (ssa-binding-meta b))))
+
+(define (fused-binding-outs b)
+  (fusion-template-outs (fused-binding-template b)))
+
+(define (binding-out-names b)
+  (if (fused-binding? b) (map fused-out-name (fused-binding-outs b)) (list (ssa-binding-name b))))
+
+(define (binding-members b)
+  (if (fused-binding? b) (cdr (assq 'members (ssa-binding-meta b))) (list (ssa-binding-name b))))
+
+(define (make-fused-ssa-binding inputs space in-maps outs members #!optional (nred 0) (meta '()))
+  "A fused binding reading inputs (ssa-vtab) through in-maps, logical
+   index maps from the iteration space space, of which the last nred
+   dimensions are reduced.  outs lists its outputs as (name shape dtype
+   body) or (name shape dtype body map red), the binding's own result
+   first (see fused-out); each body reads the inputs as (in 0) ... in the
+   order of inputs.  members names the bindings it computes, in program
+   order; meta is added to the binding's meta."
+  (let* ((n   (length inputs))
+         (fos (map (lambda (o)
+                     (make-fused-out (car o) (cadr o) (caddr o) (cadddr o)
+                                     (scalar-expr->procedure (cadddr o) n)
+                                     (and (> (length o) 4) (list-ref o 4))
+                                     (and (> (length o) 5) (list-ref o 5))))
+                   outs))
+         (p   (car fos)))
+    (make-ssa-binding (fused-out-name p) 'fused inputs (fused-out-shape p) (fused-out-dtype p)
+                      `((template . ,(make-fusion-template space in-maps fos nred))
+                        (members . ,members)
+                        (body . ,(fused-out-body p))
+                        (combiner . ,(fused-out-combiner p))
+                        (nred . ,nred)
+                        ,@meta))))
+
+;; The output o of a fusion template in the list form of
+;; make-fused-ssa-binding.
+(define (fused-out->list o)
+  (list (fused-out-name o) (fused-out-shape o) (fused-out-dtype o) (fused-out-body o)
+        (fused-out-map o) (fused-out-red o)))
+
+(define (fusion-map-binding? b)
+  "True when b computes one value per point of its shape from its inputs:
+   an element-wise binding with a combiner, or a fused binding with a
+   single output."
+  (let ((op (ssa-binding-op b)))
+    (cond ((eq? op 'fused) (and (= 0 (fused-binding-nred b)) (null? (cdr (fused-binding-outs b)))))
+          ((pair? op) #f)
+          ((memq op fusion-barrier-ops) #f)
+          (else (ssa-binding-has-combiner? b)))))
+
+;; Shape and dtype table of the values of prog: binding results, extra
+;; outputs of fused bindings and constants.
+(define (fusion-value-table prog)
+  (let ((t (make-hash-table eq?)))
     (for-each (lambda (b)
-                (env-builder-extend! shape-of-eb
-                                     (ssa-binding-name b) (ssa-binding-shape b)))
-              bindings)
+                (if (fused-binding? b)
+                    (for-each (lambda (o)
+                                (hash-table-set! t (fused-out-name o)
+                                                 (cons (fused-out-shape o) (fused-out-dtype o))))
+                              (fused-binding-outs b))
+                    (hash-table-set! t (ssa-binding-name b)
+                                     (cons (ssa-binding-shape b) (ssa-binding-dtype b)))))
+              (ssa-program-bindings prog))
     (hash-table-walk (ssa-program-constants prog)
-      (lambda (k v) (env-builder-extend! shape-of-eb k (morph-shape v))))
+      (lambda (k v) (hash-table-set! t k (cons (morph-shape v) (morph-dtype v)))))
+    t))
 
-    ;; True when all inputs of b have the same shape as b's output.
-    (define (flat-producer? b)
-      (let ((b-shape (ssa-binding-shape b)))
-        (every (lambda (inp)
-                 (let ((id (cases ssa-value inp
-                             (binding-ref (bid) bid)
-                             (const-ref   (cid) cid))))
-                   (equal? (env-builder-lookup shape-of-eb id) b-shape)))
-               (ssa-binding-inputs b))))
+(define (fusion-edge-kind c shape)
+  (cond ((fusion-map-binding? c) (if (equal? shape (ssa-binding-shape c)) 'fusible 'infusible))
+        ;; a reduction reads its source at every point of its space
+        ((reduce-binding? c) 'fusible)
+        ((fused-red-binding? c)
+         (if (equal? shape (cdr (assq 'src-shape (ssa-binding-meta c)))) 'fusible 'infusible))
+        (else 'infusible)))
 
-    (let loop ((bs bindings) (result '()))
-      (cond
-        ((null? bs)
-         (make-ssa-program
-          (ssa-program-constants prog)
-          (ssa-program-morph-to-val prog)
-          (reverse result)
-          (ssa-program-outputs prog)
-          (ssa-program-n-params prog)
-          #f #f #f))
-        ((env-builder-lookup elim-eb (ssa-binding-name (car bs)))
-         (loop (cdr bs) result))
-        ((and (pair? (cdr bs))
-              (not (env-builder-lookup elim-eb (ssa-binding-name (cadr bs))))
-              (ssa-fusion-eligible? (car bs) (cadr bs) use-counts)
-              (flat-producer? (car bs)))
-         (let ((fused (fuse-two-ssa-bindings (car bs) (cadr bs))))
-           (env-builder-extend! elim-eb (ssa-binding-name (car bs)) #t)
-           ;; Update shape-of for the fused binding (inherits consumer's name+shape)
-           (env-builder-extend! shape-of-eb
-                                 (ssa-binding-name fused) (ssa-binding-shape fused))
-           (loop (cons fused (cddr bs)) result)))
-        (else
-         (loop (cdr bs) (cons (car bs) result)))))))
+;; Adds to uses the edges of binding c's reads.
+(define (add-fusion-edges! uses c vtab)
+  (let loop ((vs (ssa-binding-inputs c)) (k 0))
+    (when (pair? vs)
+      (when (ssa-binding-ref? (car vs))
+        (let ((id (ssa-value-id (car vs))))
+          (hash-table-set! uses id
+                           (append (hash-table-ref/default uses id '())
+                                   (list (list (ssa-binding-name c) k
+                                               (fusion-edge-kind
+                                                c (car (hash-table-ref vtab id)))))))))
+      (loop (cdr vs) (+ k 1)))))
+
+(define (fusion-uses prog vtab)
+  (let ((uses (make-hash-table eq?)))
+    (for-each (lambda (b) (add-fusion-edges! uses b vtab)) (ssa-program-bindings prog))
+    (for-each (lambda (ov)
+                (when (ssa-binding-ref? ov)
+                  (let ((id (ssa-value-id ov)))
+                    (hash-table-set! uses id
+                                     (append (hash-table-ref/default uses id '())
+                                             (list (list #f #f 'result)))))))
+              (ssa-program-outputs prog))
+    uses))
+
+(define (ssa-fusion-graph prog)
+  "The uses of the values of prog, as an alist from the name of a value
+   to its uses in program order, each (consumer position kind).  kind is
+   fusible, infusible or result; a result use has no consumer or position."
+  (hash-table->alist (fusion-uses prog (fusion-value-table prog))))
+
+(define (can-fuse? uses p c k)
+  "True when the graph allows fusing producer p into consumer c, of which
+   p is input k: p is a map binding whose single use is a fusible read by
+   c, a map binding whose body reads input k once.  A body reading it
+   twice (after its inputs were merged) would compute p twice."
+  (and (fusion-map-binding? p)
+       (fusion-map-binding? c)
+       (let ((u (hash-table-ref/default uses (ssa-binding-name p) '())))
+         (and (= (length u) 1)
+              (eq? (car (car u)) (ssa-binding-name c))
+              (eq? (caddr (car u)) 'fusible)))
+       (= 1 (scalar-body-input-reads (binding-scalar-body c (ssa-binding-combiner c)) k))))
+
+;; The number of occurrences of (in k) in body e.
+(define (scalar-body-input-reads e k)
+  (cond ((not (pair? e)) 0)
+        ((eq? (car e) 'in) (if (eqv? (cadr e) k) 1 0))
+        ((eq? (car e) 'opaque) (fold + 0 (map (lambda (x) (scalar-body-input-reads x k)) (cddr e))))
+        ((eq? (car e) 'cast) (scalar-body-input-reads (caddr e) k))
+        ((eq? (car e) 'let*)
+         (+ (fold + 0 (map (lambda (b) (scalar-body-input-reads (cadr b) k)) (cadr e)))
+            (scalar-body-input-reads (caddr e) k)))
+        (else (fold + 0 (map (lambda (x) (scalar-body-input-reads x k)) (cdr e))))))
+
+(define (scalar-body-size e)
+  (cond ((not (pair? e)) 1)
+        ((eq? (car e) 'in) 1)
+        ((eq? (car e) 'opaque) (+ 1 (fold + 0 (map scalar-body-size (cddr e)))))
+        ((eq? (car e) 'cast) (+ 1 (scalar-body-size (caddr e))))
+        ((eq? (car e) 'let*)
+         (+ 1 (fold + 0 (map (lambda (b) (scalar-body-size (cadr b))) (cadr e)))
+            (scalar-body-size (caddr e))))
+        (else (+ 1 (fold + 0 (map scalar-body-size (cdr e)))))))
+
+(define (fused-result-legal? f vtab)
+  "True when every input of fused binding f has its shape or broadcasts to
+   it (the input is then read through its broadcast map), and its inputs
+   and body are within the size bounds."
+  (let ((shape (ssa-binding-shape f)))
+    (and (<= (length (ssa-binding-inputs f)) fusion-max-inputs)
+         (every (lambda (v) (broadcastable? (car (hash-table-ref vtab (ssa-value-id v))) shape))
+                (ssa-binding-inputs f))
+         (<= (scalar-body-size (cdr (assq 'body (ssa-binding-meta f)))) fusion-max-body-size))))
+
+(define (fused-binding-query f vtab flat? #!optional (class #f))
+  "The segop template of fused binding f: its space, the dtype, logical
+   map and predicted layout of each input (flat? tells whether an input
+   value is expected to be stored flat), the dtype and body of each
+   output, and the class of the fusion that makes f (see segop
+   templates)."
+  (let ((tpl (fused-binding-template f)))
+    (make-segop-template
+     (fusion-template-space tpl)
+     (map (lambda (v m)
+            (make-template-input (cdr (hash-table-ref vtab (ssa-value-id v))) m (flat? v)))
+          (ssa-binding-inputs f) (fusion-template-in-maps tpl))
+     (map (lambda (o)
+            (let ((red (fused-out-red o)))
+              (make-template-output (fused-out-dtype o) (fused-out-body o)
+                                    (and red (car red)) (and red (cdr red)) (fused-out-map o))))
+          (fusion-template-outs tpl))
+     (fusion-template-nred tpl)
+     class)))
+
+(define (fusion-profitable? f vtab flat? class)
+  "True when making fused binding f, a fusion of the given class (see
+   segop templates), should be done under the current policy: always
+   under all; under the default policy when some segop backend would run
+   f natively (see segop-native?).  A fused segop that no backend runs
+   natively would run on the host executors, which are slower than the
+   separate bindings' (see above)."
+  (or (eq? (segop-fusion) 'all)
+      (and (segop-native? (fused-binding-query f vtab flat? class)) #t)))
+
+;; ins without repeated values, in order of first occurrence.
+(define (distinct-values ins)
+  (let loop ((ins ins) (acc '()))
+    (cond ((null? ins) (reverse acc))
+          ((any (lambda (v) (eq? (ssa-value-id v) (ssa-value-id (car ins)))) acc)
+           (loop (cdr ins) acc))
+          (else (loop (cdr ins) (cons (car ins) acc))))))
+
+(define (fuse-into p c k vtab #!optional (kept? #f))
+  "The fused binding computing producer p and consumer c, of which p is
+   input k.  Its inputs are c's with p's in place of input k, each read
+   once; its body is c's body with p's body, rounded to p's dtype, for
+   (in k).  When kept? is true, it also stores p's value as a second
+   output, whose body is the same object as p's body inside c's, so that
+   it is computed once."
+  (let* ((p-ins  (ssa-binding-inputs p))
+         (c-ins  (ssa-binding-inputs c))
+         (ins    (distinct-values (append (take c-ins k) p-ins (drop c-ins (+ k 1)))))
+         (pos    (lambda (v) (list-index (lambda (u) (eq? (ssa-value-id u) (ssa-value-id v))) ins)))
+         (renum  (lambda (vs) (lambda (j) `(in ,(pos (list-ref vs j))))))
+         (p-body* (scalar-expr-substitute-inputs (rounded-map-body p) (renum p-ins)))
+         (body   (scalar-expr-substitute-inputs
+                  (binding-scalar-body c (ssa-binding-combiner c))
+                  (lambda (j) (if (= j k) p-body* ((renum c-ins) j)))))
+         (shape  (ssa-binding-shape c))
+         (rank   (vector-length shape)))
+    (make-fused-ssa-binding
+     ins shape
+     (map (lambda (v) (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) rank))
+          ins)
+     (cons (list (ssa-binding-name c) shape (ssa-binding-dtype c) body)
+           (if kept?
+               (list (list (ssa-binding-name p) (ssa-binding-shape p) (ssa-binding-dtype p) p-body*))
+               '()))
+     (append (binding-members p) (binding-members c)))))
+
+;;; ------------------------------------------------------------
+;;; Multi-output and horizontal fusion
+;;; ------------------------------------------------------------
+;;;
+;;; A map P with several uses may still be fused into a map C that reads
+;;; it: the fused binding also stores P's value, as a second output, for
+;;; the other uses.  Two maps of the same shape that read a common input,
+;;; and neither of which depends on the other, may be fused into one
+;;; seg-map with an output for each (horizontal fusion), which reads the
+;;; common input once.  Outputs of fused bindings that are left without
+;;; uses are removed at the end of each round.
+
+;; The largest number of outputs of a fused binding.
+(define fusion-max-outputs 4)
+
+;; True when b computes one or more values at every point of its shape:
+;; a map binding, or a fused seg-map with any number of outputs.
+(define (fusion-group-binding? b)
+  (or (fusion-map-binding? b)
+      (and (fused-binding? b) (= 0 (fused-binding-nred b)))))
+
+;; The parts of map binding or fused seg-map b, as (inputs in-maps outs),
+;; outs in the list form of make-fused-ssa-binding.
+(define (map-parts b vtab)
+  (if (fused-binding? b)
+      (let ((tpl (fused-binding-template b)))
+        (list (ssa-binding-inputs b) (fusion-template-in-maps tpl)
+              (map fused-out->list (fusion-template-outs tpl))))
+      (let ((rank (vector-length (ssa-binding-shape b))))
+        (list (ssa-binding-inputs b)
+              (map (lambda (v) (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) rank))
+                   (ssa-binding-inputs b))
+              (list (list (ssa-binding-name b) (ssa-binding-shape b) (ssa-binding-dtype b)
+                          (binding-scalar-body b (ssa-binding-combiner b))))))))
+
+(define (fuse-siblings s1 s2 vtab)
+  "The fused seg-map computing map bindings or fused seg-maps s1 and s2,
+   of the same shape, with the outputs of s1 first.  An input that both
+   read through the same map is read once."
+  (let* ((p1    (map-parts s1 vtab))
+         (p2    (map-parts s2 vtab))
+         (reads (distinct-reads (append (map cons (car p1) (cadr p1)) (map cons (car p2) (cadr p2)))))
+         (renum (lambda (parts)
+                  (let ((memo (list '()))
+                        (subst (lambda (j)
+                                 `(in ,(read-position reads (list-ref (car parts) j)
+                                                      (list-ref (cadr parts) j))))))
+                    (map (lambda (o) (list (car o) (cadr o) (caddr o)
+                                           (renumber-body (cadddr o) subst memo)))
+                         (caddr parts))))))
+    (make-fused-ssa-binding (map car reads) (ssa-binding-shape s1) (map cdr reads)
+                            (append (renum p1) (renum p2))
+                            (append (binding-members s1) (binding-members s2)))))
+
+(define (drop-fused-outputs b dead)
+  "Fused binding b without its outputs named in dead, and without the
+   inputs that only those outputs read."
+  (let* ((tpl    (fused-binding-template b))
+         (outs   (filter (lambda (o) (not (memq (car o) dead)))
+                         (map fused-out->list (fusion-template-outs tpl))))
+         (ins    (ssa-binding-inputs b))
+         (maps   (fusion-template-in-maps tpl))
+         (used   (delete-duplicates
+                  (append-map (lambda (o)
+                                (let ((red (list-ref o 5)))
+                                  (append (scalar-expr-inputs (cadddr o))
+                                          (if (and red (cdr red)) (scalar-expr-inputs (cdr red)) '()))))
+                              outs)))
+         (keep   (filter (lambda (j) (memv j used)) (iota (length ins))))
+         (subst  (lambda (j) `(in ,(list-index (lambda (x) (= x j)) keep))))
+         (memo   (list '()))
+         (outs*  (map (lambda (o)
+                        (let ((red (list-ref o 5)))
+                          (list (car o) (cadr o) (caddr o) (renumber-body (cadddr o) subst memo)
+                                (list-ref o 4)
+                                (and red (cons (car red)
+                                               (and (cdr red) (scalar-expr-substitute-inputs (cdr red) subst)))))))
+                      outs))
+         (meta   (filter (lambda (kv) (memq (car kv) '(src-shape path))) (ssa-binding-meta b))))
+    (make-fused-ssa-binding (map (lambda (j) (list-ref ins j)) keep) (fusion-template-space tpl)
+                            (map (lambda (j) (list-ref maps j)) keep)
+                            outs* (binding-members b) (fusion-template-nred tpl) meta)))
+
+;;; ------------------------------------------------------------
+;;; Fusion with reductions
+;;; ------------------------------------------------------------
+;;;
+;;; A map P read by a reduction C is fused into it: the fused seg-reduce
+;;; computes P's body, rounded to P's dtype, at each point and combines it
+;;; as the unfused reduction would.  When P has other uses, the fused
+;;; binding also stores P's value as a map output and takes P's position,
+;;; because those uses may come before C.
+;;;
+;;; A map C that is the only use of a reduction R's result, and reads it at
+;;; C's own shape, becomes R's finalize: C's body, with R's stored value in
+;;; place of the read.  The fused binding takes R's position when C's other
+;;; inputs exist there, and otherwise C's position if R has no map outputs.
+;;;
+;;; A reduction whose order is left to its backend (the 1d sum, which may
+;;; use the BLAS dot product) is never fused.
+;;;
+;;; A matmul is a reduction over the space (M N K) with K reduced, whose
+;;; result has red (gemm . finalize) (see segop-lower.scm): maps that read
+;;; its product become its epilogue, as above, when the epilogue keeps the
+;;; product's dtype, since it runs in place on the stored product.  No map
+;;; is fused into its operands, which BLAS reads from memory.
+
+(define (gemm-binding? b) (eq? (ssa-binding-op b) 'matmul))
+
+;; The parts of matmul binding g, in the form of reduction-parts; or #f and
+;; the reason when its operands are not two matrices of its dtype, f32 or
+;; f64.
+(define (gemm-parts g vtab)
+  (let* ((ins (ssa-binding-inputs g))
+         (dt  (ssa-binding-dtype g))
+         (sds (map (lambda (v) (hash-table-ref vtab (ssa-value-id v))) ins)))
+    (if (and (= 2 (length ins))
+             (memq dt '(f32 f64))
+             (every (lambda (sd) (and (= 2 (vector-length (car sd))) (eq? (cdr sd) dt))) sds))
+        (let ((space (vector (vector-ref (car (car sds)) 0)
+                             (vector-ref (car (cadr sds)) 1)
+                             (vector-ref (car (car sds)) 1))))
+          (values (list ins space
+                        (list (make-index-map gemm-A-exprs #f 0.0 #f)
+                              (make-index-map gemm-B-exprs #f 0.0 #f))
+                        (list (list (ssa-binding-name g) (ssa-binding-shape g) dt gemm-body
+                                    (make-index-map gemm-out-exprs #f 0.0 #f) (cons 'gemm #f)))
+                        1 space 'gemm)
+                  #f))
+        (values #f 'gemm-operands))))
+
+;; The parts of reduction binding r (a reduce binding, a matmul or a fused
+;; seg-reduce) as a list (inputs space in-maps outs nred src-shape path), outs
+;; in the list form of make-fused-ssa-binding; or #f and the reason r
+;; cannot be fused.  A reduce binding's source must be expected flat
+;; (flat?), since its combine spec depends on its layout.
+(define (reduction-parts r vtab flat?)
+  (cond
+   ((fused-binding? r)
+      (let ((tpl (fused-binding-template r)) (meta (ssa-binding-meta r)))
+        (values (list (ssa-binding-inputs r) (fusion-template-space tpl) (fusion-template-in-maps tpl)
+                      (map fused-out->list (fusion-template-outs tpl)) (fusion-template-nred tpl)
+                      (cdr (assq 'src-shape meta)) (cdr (assq 'path meta)))
+                #f)))
+   ((gemm-binding? r) (gemm-parts r vtab))
+   (else
+      (let* ((meta  (ssa-binding-meta r))
+             (rop   (cadr (ssa-binding-op r)))
+             (src   (car (ssa-binding-inputs r)))
+             (sd    (hash-table-ref vtab (ssa-value-id src)))
+             (s     (car sd))
+             (sdt   (cdr sd))
+             (rank  (vector-length s))
+             (axes  (cdr (assq 'axes meta)))
+             (keep? (let ((p (assq 'keepdims? meta))) (and p (cdr p))))
+             (red   (filter (lambda (k) (memv k axes)) (iota rank)))
+             (par   (filter (lambda (k) (not (memv k axes))) (iota rank)))
+             (order (append par red))
+             (dim-of (lambda (k) `(dim ,(list-index (lambda (j) (= j k)) order))))
+             (in-map (make-index-map (list->vector (map dim-of (iota rank))) #f 0.0 #f))
+             (out-map (if keep?
+                          (make-index-map (list->vector (map (lambda (k) (if (memv k red) 0 (dim-of k)))
+                                                             (iota rank)))
+                                          #f 0.0 #f)
+                          (identity-index-map (length par))))
+             (path  (framed-path rop s (compute-strides s) 0 sdt red (binding-frame-rank meta)))
+             (spec  (reduction-combine-spec rop path sdt (ssa-binding-dtype r)))
+             (count (fold (lambda (k acc) (* acc (vector-ref s k))) 1 red)))
+        (cond ((eq? (combine-spec-order spec) 'unspecified) (values #f 'reduction-order))
+              ((not (flat? src)) (values #f 'view))
+              (else
+               (values (list (list src)
+                             (list->vector (map (lambda (k) (vector-ref s k)) order))
+                             (list in-map)
+                             (list (list (ssa-binding-name r) (ssa-binding-shape r) (ssa-binding-dtype r)
+                                         '(in 0) out-map
+                                         (cons spec (and (eq? rop 'mean) `(/ (reduced) ,count)))))
+                             (length red) s path)
+                       #f)))))))
+
+;; True when index maps a and b read the same element at every point.
+(define (same-index-map? a b)
+  (and (not (index-map-proc a)) (not (index-map-proc b))
+       (not (index-map-guard a)) (not (index-map-guard b))
+       (equal? (index-map-exprs a) (index-map-exprs b))))
+
+;; The (value . map) pairs of pairs without repeats, in order of first
+;; occurrence.  A value read through two different maps is kept twice.
+(define (distinct-reads pairs)
+  (let loop ((ps pairs) (acc '()))
+    (cond ((null? ps) (reverse acc))
+          ((any (lambda (q) (and (eq? (ssa-value-id (car q)) (ssa-value-id (caar ps)))
+                                 (same-index-map? (cdr q) (cdar ps))))
+                acc)
+           (loop (cdr ps) acc))
+          (else (loop (cdr ps) (cons (car ps) acc))))))
+
+(define (read-position reads v m)
+  (list-index (lambda (q) (and (eq? (ssa-value-id (car q)) (ssa-value-id v)) (same-index-map? (cdr q) m)))
+              reads))
+
+;; e with each (in j) replaced by (subst j).  memo keeps bodies that were
+;; the same object the same object after the change.
+(define (renumber-body e subst memo)
+  (let ((hit (assq e (car memo))))
+    (if hit
+        (cdr hit)
+        (let ((new (scalar-expr-substitute-inputs e subst)))
+          (set-car! memo (cons (cons e new) (car memo)))
+          new))))
+
+;; The body of map binding p, rounded to p's dtype as storing it would.
+(define (rounded-map-body p)
+  (let ((b (binding-scalar-body p (ssa-binding-combiner p))) (dt (ssa-binding-dtype p)))
+    (if (eq? dt 'f64) b `(cast ,dt ,b))))
+
+;; The number of reads of input k by the bodies of outs, a body shared by
+;; several outputs counted once, and by their finalize bodies.
+(define (parts-input-reads outs k)
+  (let loop ((os outs) (seen '()) (n 0))
+    (if (null? os)
+        n
+        (let* ((o (car os)) (body (list-ref o 3)) (red (list-ref o 5))
+               (fin-n (if (and red (cdr red)) (scalar-body-input-reads (cdr red) k) 0)))
+          (if (memq body seen)
+              (loop (cdr os) seen (+ n fin-n))
+              (loop (cdr os) (cons body seen) (+ n fin-n (scalar-body-input-reads body k))))))))
+
+(define (make-fused-reduction ins+maps space outs nred src-shape path members)
+  (make-fused-ssa-binding (map car ins+maps) space (map cdr ins+maps) outs members nred
+                          `((src-shape . ,src-shape) (path . ,path))))
+
+(define (fuse-map-into-reduction p parts k kept? members vtab)
+  "The fused seg-reduce computing map binding p and the reduction whose parts
+   are parts (see reduction-parts), of which p is input k.  When kept? is
+   true, p's value is also written, as a map output named after p."
+  (let* ((r-ins   (list-ref parts 0))
+         (in-maps (list-ref parts 2))
+         (outs    (list-ref parts 3))
+         (m-p     (list-ref in-maps k))
+         (p-ins   (ssa-binding-inputs p))
+         (p-rank  (vector-length (ssa-binding-shape p)))
+         (p-maps  (map (lambda (v)
+                         (compose-index-maps
+                          (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) p-rank)
+                          m-p))
+                       p-ins))
+         (reads   (distinct-reads (append (map cons (take r-ins k) (take in-maps k))
+                                          (map cons p-ins p-maps)
+                                          (map cons (drop r-ins (+ k 1)) (drop in-maps (+ k 1))))))
+         (p-body  (scalar-expr-substitute-inputs
+                   (rounded-map-body p)
+                   (lambda (i) `(in ,(read-position reads (list-ref p-ins i) (list-ref p-maps i))))))
+         (subst   (lambda (j)
+                    (if (= j k)
+                        p-body
+                        `(in ,(read-position reads (list-ref r-ins j) (list-ref in-maps j))))))
+         (memo    (list '()))
+         (outs*   (map (lambda (o)
+                         (let ((red (list-ref o 5)))
+                           (list (car o) (cadr o) (caddr o) (renumber-body (list-ref o 3) subst memo)
+                                 (list-ref o 4)
+                                 (and red (cons (car red)
+                                                (and (cdr red)
+                                                     (scalar-expr-substitute-inputs (cdr red) subst)))))))
+                       outs)))
+    (make-fused-reduction
+     reads (list-ref parts 1)
+     (if kept?
+         (append outs* (list (list (ssa-binding-name p) (ssa-binding-shape p) (ssa-binding-dtype p)
+                                   p-body m-p #f)))
+         outs*)
+     (list-ref parts 4) (list-ref parts 5) (list-ref parts 6) members)))
+
+(define (fuse-epilogue parts c k members vtab)
+  "The fused seg-reduce computing the reduction whose parts are parts and map
+   binding c, which reads the reduction's result as input k: c's body
+   becomes the result's finalize."
+  (let* ((r-ins   (list-ref parts 0))
+         (in-maps (list-ref parts 2))
+         (outs    (list-ref parts 3))
+         (res     (car outs))
+         (om      (list-ref res 4))
+         (red     (list-ref res 5))
+         (r-dtype (list-ref res 2))
+         (c-ins   (ssa-binding-inputs c))
+         (c-rank  (vector-length (ssa-binding-shape c)))
+         (c-maps  (map (lambda (v)
+                         (compose-index-maps
+                          (broadcast-index-map (car (hash-table-ref vtab (ssa-value-id v))) c-rank)
+                          om))
+                       c-ins))
+         (others  (filter (lambda (j) (not (= j k))) (iota (length c-ins))))
+         (reads   (distinct-reads (append (map cons r-ins in-maps)
+                                          (map (lambda (j) (cons (list-ref c-ins j) (list-ref c-maps j)))
+                                               others))))
+         (fin     (or (cdr red) '(reduced)))
+         (stored  (if (eq? r-dtype 'f64) fin `(cast ,r-dtype ,fin)))
+         (fin*    (scalar-expr-substitute-inputs
+                   (binding-scalar-body c (ssa-binding-combiner c))
+                   (lambda (j)
+                     (if (= j k)
+                         stored
+                         `(in ,(read-position reads (list-ref c-ins j) (list-ref c-maps j))))))))
+    (make-fused-reduction
+     reads (list-ref parts 1)
+     (cons (list (ssa-binding-name c) (ssa-binding-shape c) (ssa-binding-dtype c)
+                 (list-ref res 3) om (cons (car red) fin*))
+           (cdr outs))
+     (list-ref parts 4) (list-ref parts 5) (list-ref parts 6) members)))
+
+(define (fused-reduction-legal? f)
+  "True when fused seg-reduce f is within the bounds on the number of inputs
+   and the size of its bodies, finalize bodies included."
+  (and (<= (length (ssa-binding-inputs f)) fusion-max-inputs)
+       (every (lambda (o)
+                (and (<= (scalar-body-size (fused-out-body o)) fusion-max-body-size)
+                     (let ((red (fused-out-red o)))
+                       (or (not red) (not (cdr red))
+                           (<= (scalar-body-size (cdr red)) fusion-max-body-size)))))
+              (fused-binding-outs f))))
+
+(define (ssa-segop-fusion-pass prog)
+  "Fuse the map bindings of prog into their consumers, maps into the
+   reductions that read them, and reductions into the maps that read their
+   results (see above).  Returns a new program; prog is not changed."
+  (let* ((bv     (list->vector (ssa-program-bindings prog)))
+         (n      (vector-length bv))
+         (pos    (make-hash-table eq?))
+         (vtab (fusion-value-table prog))
+         (uses   (fusion-uses prog vtab))
+         (layouts (make-hash-table eq?))
+         (max-rounds (segop-fusion-max-rounds)))
+
+    ;; True when value v is expected to be stored row-major, at offset 0:
+    ;; a constant with that layout, the result of a binding that allocates
+    ;; (pool buffers are row-major), or a reshape of such a value, which
+    ;; keeps its buffer and its row-major order.  Other views are not
+    ;; expected to be flat.
+    (define (flat? v)
+      (cases ssa-value v
+        (const-ref (cid) (concrete-row-major? (hash-table-ref (ssa-program-constants prog) cid)))
+        (binding-ref (bid) (hash-table-ref/default layouts bid #t))))
+    (for-each (lambda (b)
+                (let ((op (ssa-binding-op b)))
+                  (cond ((eq? op 'reshape)
+                         (hash-table-set! layouts (ssa-binding-name b)
+                                          (flat? (car (ssa-binding-inputs b)))))
+                        ((memq op fusion-view-ops)
+                         (hash-table-set! layouts (ssa-binding-name b) #f)))))
+              (ssa-program-bindings prog))
+    ;; pos maps the name of every value a binding computes to the
+    ;; binding's position; pos-of-binding maps each binding's name.
+    (define pos-of-binding (make-hash-table eq?))
+    (do ((i 0 (+ i 1))) ((= i n))
+      (let ((b (vector-ref bv i)))
+        (hash-table-set! pos-of-binding (ssa-binding-name b) i)
+        (for-each (lambda (name) (hash-table-set! pos name i)) (binding-out-names b))))
+
+    (define (binding-of v)
+      (and (ssa-binding-ref? v)
+           (let ((i (hash-table-ref/default pos (ssa-value-id v) #f)))
+             (and i (vector-ref bv i)))))
+
+    ;; Replaces the bindings olds by f at position at, and updates the uses
+    ;; of their inputs.
+    (define (commit-at! olds f at)
+      (let ((names (map ssa-binding-name olds))
+            (keep  (map fused-out-name (fused-binding-outs f))))
+        (for-each (lambda (v)
+                    (when (ssa-binding-ref? v)
+                      (let ((id (ssa-value-id v)))
+                        (hash-table-set! uses id
+                                         (filter (lambda (u) (not (memq (car u) names)))
+                                                 (hash-table-ref/default uses id '()))))))
+                  (append-map ssa-binding-inputs olds))
+        (for-each (lambda (b)
+                    (for-each (lambda (name)
+                                (unless (memq name keep) (hash-table-set! uses name '()))
+                                (hash-table-set! pos name #f))
+                              (binding-out-names b))
+                    (vector-set! bv (hash-table-ref pos-of-binding (ssa-binding-name b)) #f))
+                  olds)
+        (vector-set! bv at f)
+        (for-each (lambda (name) (hash-table-set! pos name at)) keep)
+        (hash-table-set! pos-of-binding (ssa-binding-name f) at)
+        (add-fusion-edges! uses f vtab)))
+
+    ;; Replaces p and c by f at c's position.
+    (define (commit! p c f)
+      (commit-at! (list p c) f (hash-table-ref pos-of-binding (ssa-binding-name c))))
+
+    ;; The reasons for which the current round left pairs unfused, as an
+    ;; alist from reason to count.
+    (define missed '())
+    (define (miss! reason)
+      (let ((e (assq reason missed)))
+        (if e (set-cdr! e (+ (cdr e) 1)) (set! missed (cons (cons reason 1) missed)))))
+
+    ;; True when the only use of the value named name is a fusible read by
+    ;; the binding named c-name.
+    (define (single-fusible-use? name c-name)
+      (let ((u (hash-table-ref/default uses name '())))
+        (and (= (length u) 1)
+             (eq? (car (car u)) c-name)
+             (eq? (caddr (car u)) 'fusible))))
+
+    ;; Records why the fusion of p into c, of which p is input k, is not
+    ;; made, when p is a candidate that the rules or the policy refuse.
+    (define (note-missed! p c k)
+      (cond ((can-fuse? uses p c k)
+             (let ((f (fuse-into p c k vtab)))
+               (cond ((not (fused-result-legal? f vtab)) (miss! 'size-cap))
+                     ((fusion-profitable? f vtab flat? 'map))
+                     ((every (lambda (v) (equal? (car (hash-table-ref vtab (ssa-value-id v)))
+                                                 (ssa-binding-shape f)))
+                             (ssa-binding-inputs f))
+                      (miss! 'not-native))
+                     (else (miss! 'broadcast-input)))))
+            ((and (memq (ssa-binding-op p) '(reshape transpose))
+                  (fusion-map-binding? c)
+                  (single-fusible-use? (ssa-binding-name p) (ssa-binding-name c))
+                  (let ((q (binding-of (car (ssa-binding-inputs p)))))
+                    (and q
+                         (fusion-map-binding? q)
+                         (let ((u (hash-table-ref/default uses (ssa-binding-name q) '())))
+                           (and (= (length u) 1)
+                                (eq? (car (car u)) (ssa-binding-name p)))))))
+             (miss! 'view))))
+
+    ;; Counts of the fusions that keep a producer, of horizontal fusions
+    ;; and of the outputs removed.
+    (define kept-count 0)
+    (define horizontal-count 0)
+    ;; class -> number of fusions made, over all rounds
+    (define class-counts '())
+    (define (count-class! class)
+      (let ((p (assq class class-counts)))
+        (if p (set-cdr! p (+ 1 (cdr p))) (set! class-counts (cons (cons class 1) class-counts)))))
+    (define dead-count 0)
+
+    ;; The position of the binding that computes value v, or #f for a
+    ;; constant.
+    (define (value-position v)
+      (and (ssa-binding-ref? v) (hash-table-ref/default pos (ssa-value-id v) #f)))
+
+    ;; Fuses producer p, which has other uses, into map c, of which it is
+    ;; input k, keeping p's value as a second output; true if it did.  The
+    ;; fused binding takes p's position when c's other inputs exist there,
+    ;; and otherwise c's position when no other use of p comes before c.
+    (define (fuse-kept! p c k)
+      (let* ((p-name (ssa-binding-name p))
+             (c-name (ssa-binding-name c))
+             (u      (hash-table-ref/default uses p-name '())))
+        (and (fusion-map-binding? p)
+             (fusion-map-binding? c)
+             (eq? p-name (ssa-value-id (list-ref (ssa-binding-inputs c) k)))
+             (> (length u) 1)
+             (= 1 (length (filter (lambda (x) (eq? (car x) c-name)) u)))
+             (any (lambda (x) (and (eq? (car x) c-name) (eq? (caddr x) 'fusible))) u)
+             (= 1 (scalar-body-input-reads (binding-scalar-body c (ssa-binding-combiner c)) k))
+             (let* ((p-at (hash-table-ref pos-of-binding p-name))
+                    (c-at (hash-table-ref pos-of-binding c-name))
+                    (at   (cond ((every (lambda (v j)
+                                          (or (= j k)
+                                              (let ((q (value-position v))) (or (not q) (< q p-at)))))
+                                        (ssa-binding-inputs c) (iota (length (ssa-binding-inputs c))))
+                                 p-at)
+                                ((every (lambda (x)
+                                          (or (not (car x)) (eq? (car x) c-name)
+                                              (> (hash-table-ref pos-of-binding (car x)) c-at)))
+                                        u)
+                                 c-at)
+                                (else #f))))
+               (if (not at)
+                   (begin (miss! 'placement) #f)
+                   (let ((f (fuse-into p c k vtab #t)))
+                     (cond ((not (fused-result-legal? f vtab)) (miss! 'size-cap) #f)
+                           ((not (fusion-profitable? f vtab flat? 'kept)) (miss! 'not-native) #f)
+                           (else (commit-at! (list p c) f at)
+                                 (set! kept-count (+ kept-count 1))
+                                 (count-class! 'kept)
+                                 #t))))))))
+
+    ;; Fuses one producer into the binding at position i; true if it did.
+    (define (fuse-one! i)
+      (let ((c (vector-ref bv i)))
+        (let loop ((vs (ssa-binding-inputs c)) (k 0))
+          (and (pair? vs)
+               (or (let ((p (binding-of (car vs))))
+                     (and p
+                          (or (and (can-fuse? uses p c k)
+                                   (let ((f (fuse-into p c k vtab)))
+                                     (and (fused-result-legal? f vtab)
+                                          (fusion-profitable? f vtab flat? 'map)
+                                          (begin (commit! p c f) (count-class! 'map) #t))))
+                              (begin (note-missed! p c k) #f))))
+                   (loop (cdr vs) (+ k 1)))))))
+
+    ;; Fuses into the map at position i one producer that has other uses,
+    ;; keeping it as an output; true if it did.
+    (define (fuse-one-kept! i)
+      (let ((c (vector-ref bv i)))
+        (let loop ((vs (ssa-binding-inputs c)) (k 0))
+          (and (pair? vs)
+               (or (let ((p (binding-of (car vs)))) (and p (fuse-kept! p c k)))
+                   (loop (cdr vs) (+ k 1)))))))
+
+    ;; True when the binding at position j depends on a value computed by
+    ;; the binding at position i < j.
+    (define (depends? j i)
+      (let ((names (binding-out-names (vector-ref bv i))))
+        (let walk ((stack (list j)) (seen '()))
+          (cond ((null? stack) #f)
+                ((memv (car stack) seen) (walk (cdr stack) seen))
+                (else
+                 (let ((ins (ssa-binding-inputs (vector-ref bv (car stack)))))
+                   (or (any (lambda (v) (and (ssa-binding-ref? v) (memq (ssa-value-id v) names))) ins)
+                       (walk (append (filter (lambda (q) (and q (> q i)))
+                                             (map value-position ins))
+                                     (cdr stack))
+                             (cons (car stack) seen)))))))))
+
+    ;; Fuses the map binding or fused seg-map at position i with an earlier
+    ;; sibling: one of the same shape that reads a common input through the
+    ;; same map and on which it does not depend; true if it did.  The fused
+    ;; binding takes position i when no use of the sibling comes before i,
+    ;; and otherwise the sibling's position when the inputs at i all exist
+    ;; there.
+    (define (fuse-horizontal! i)
+      (let* ((s2    (vector-ref bv i))
+             (pairs (map cons (ssa-binding-inputs s2) (cadr (map-parts s2 vtab)))))
+        (let loop ((j (- i 1)))
+          (and (>= j 0)
+               (or (let ((s1 (vector-ref bv j)))
+                     (and s1
+                          (fusion-group-binding? s1)
+                          (equal? (ssa-binding-shape s1) (ssa-binding-shape s2))
+                          (<= (+ (length (binding-out-names s1)) (length (binding-out-names s2)))
+                              fusion-max-outputs)
+                          (let ((pairs1 (map cons (ssa-binding-inputs s1) (cadr (map-parts s1 vtab)))))
+                            (any (lambda (p)
+                                   (any (lambda (q) (and (eq? (ssa-value-id (car p)) (ssa-value-id (car q)))
+                                                         (same-index-map? (cdr p) (cdr q))))
+                                        pairs1))
+                                 pairs))
+                          (not (depends? i j))
+                          (let ((at (cond ((every (lambda (name)
+                                                    (every (lambda (x)
+                                                             (or (not (car x))
+                                                                 (> (hash-table-ref pos-of-binding (car x)) i)))
+                                                           (hash-table-ref/default uses name '())))
+                                                  (binding-out-names s1))
+                                           i)
+                                          ((every (lambda (v) (let ((q (value-position v))) (or (not q) (< q j))))
+                                                  (ssa-binding-inputs s2))
+                                           j)
+                                          (else #f))))
+                            (if (not at)
+                                (begin (miss! 'horizontal-placement) #f)
+                                (let ((f (fuse-siblings s1 s2 vtab)))
+                                  (cond ((> (length (ssa-binding-inputs f)) fusion-max-inputs)
+                                         (miss! 'size-cap) #f)
+                                        ((not (fusion-profitable? f vtab flat? 'horizontal)) (miss! 'not-native) #f)
+                                        (else (commit-at! (list s1 s2) f at)
+                                              (set! horizontal-count (+ horizontal-count 1))
+                                              (count-class! 'horizontal)
+                                              #t)))))))
+                   (loop (- j 1)))))))
+
+    ;; Removes the outputs of fused bindings, other than their first, that
+    ;; have no uses; returns how many it removed.
+    (define (remove-dead-outputs!)
+      (let loop ((i 0) (count 0))
+        (if (= i n)
+            count
+            (let ((b (vector-ref bv i)))
+              (if (and b (fused-binding? b))
+                  (let ((dead (filter (lambda (name) (null? (hash-table-ref/default uses name '())))
+                                      (cdr (binding-out-names b)))))
+                    (if (null? dead)
+                        (loop (+ i 1) count)
+                        (begin
+                          (commit-at! (list b) (drop-fused-outputs b dead) i)
+                          (loop (+ i 1) (+ count (length dead))))))
+                  (loop (+ i 1) count))))))
+
+    ;; Puts fused binding f in place of olds at position at, if it is legal
+    ;; and profitable; otherwise records why not.
+    (define (try-commit! olds f at class)
+      (let ((class (if (and (eq? class 'epilogue)
+                            (gemm-fused-out? (car (fusion-template-outs (fused-binding-template f)))))
+                       'gemm-epilogue
+                       class)))
+        (try-commit-class! olds f at class)))
+    (define (try-commit-class! olds f at class)
+      (cond ((not (fused-reduction-legal? f)) (miss! 'size-cap) #f)
+            ((not (fusion-profitable? f vtab flat? class)) (miss! 'not-native) #f)
+            (else (commit-at! olds f at) (count-class! class) #t)))
+
+    ;; Fuses a map producer into the reduction at position i; true if it
+    ;; did.  A producer with other uses is kept as a map output, which only
+    ;; a reduce binding can do.
+    (define (fuse-into-reduction! i)
+      (let ((c (vector-ref bv i)))
+        (let loop ((vs (ssa-binding-inputs c)) (k 0))
+          (and (pair? vs)
+               (or (let ((p (binding-of (car vs))))
+                     (and p
+                          (eq? (ssa-binding-name p) (ssa-value-id (car vs)))
+                          (fusion-map-binding? p)
+                          (let* ((p-name (ssa-binding-name p))
+                                 (u      (hash-table-ref/default uses p-name '()))
+                                 (single (single-fusible-use? p-name (ssa-binding-name c)))
+                                 (kept   (and (not single) (reduce-binding? c)
+                                              (any (lambda (x) (and (eq? (car x) (ssa-binding-name c))
+                                                                    (eq? (caddr x) 'fusible)))
+                                                   u))))
+                            (and (or single kept)
+                                 (call-with-values (lambda () (reduction-parts c vtab flat?))
+                                   (lambda (parts reason)
+                                     (cond
+                                      ((not parts) (miss! reason) #f)
+                                      ((not (and (= 1 (parts-input-reads (list-ref parts 3) k))
+                                                 (every (lambda (o)
+                                                          (let ((red (list-ref o 5)))
+                                                            (or (not red) (not (cdr red))
+                                                                (= 0 (scalar-body-input-reads (cdr red) k)))))
+                                                        (list-ref parts 3))))
+                                       #f)
+                                      (else
+                                       (let ((f (fuse-map-into-reduction
+                                                 p parts k kept
+                                                 (append (binding-members p) (binding-members c))
+                                                 vtab)))
+                                         (try-commit! (list p c) f
+                                                      (hash-table-ref pos-of-binding
+                                                                      (if kept p-name (ssa-binding-name c)))
+                                                      'redomap))))))))))
+                   (loop (cdr vs) (+ k 1)))))))
+
+    ;; Fuses map binding c at position i into the reduction whose result
+    ;; it reads (an epilogue); true if it did.
+    (define (fuse-epilogue! i)
+      (let ((c (vector-ref bv i)))
+        (let loop ((vs (ssa-binding-inputs c)) (k 0))
+          (and (pair? vs)
+               (or (let ((r (binding-of (car vs))))
+                     (and r
+                          (or (reduce-binding? r) (fused-red-binding? r) (gemm-binding? r))
+                          (eq? (ssa-binding-name r) (ssa-value-id (car vs)))
+                          (let* ((r-name (ssa-binding-name r))
+                                 (u      (hash-table-ref/default uses r-name '())))
+                            (and (any (lambda (x) (and (eq? (car x) (ssa-binding-name c))
+                                                       (eq? (caddr x) 'fusible)))
+                                      u)
+                                 (cond
+                                  ((not (single-fusible-use? r-name (ssa-binding-name c)))
+                                   (miss! 'multi-use-reduction) #f)
+                                  ;; a second read would compute the finalize twice
+                                  ((not (= 1 (scalar-body-input-reads
+                                              (binding-scalar-body c (ssa-binding-combiner c)) k)))
+                                   (miss! 'multi-use-reduction) #f)
+                                  ;; c also reads another output of r
+                                  ((any (lambda (v)
+                                          (and (ssa-binding-ref? v)
+                                               (not (eq? (ssa-value-id v) r-name))
+                                               (memq (ssa-value-id v) (binding-out-names r))))
+                                        (ssa-binding-inputs c))
+                                   #f)
+                                  (else
+                                   (call-with-values (lambda () (reduction-parts r vtab flat?))
+                                     (lambda (parts reason)
+                                       (cond
+                                        ((not parts) (miss! reason) #f)
+                                        ;; a GEMM epilogue is stored in the product's buffer
+                                        ((and (eq? (list-ref parts 6) 'gemm)
+                                              (not (eq? (ssa-binding-dtype c)
+                                                        (list-ref (car (list-ref parts 3)) 2))))
+                                         (miss! 'gemm-epilogue-form) #f)
+                                        (else
+                                           (let* ((r-at (hash-table-ref pos-of-binding r-name))
+                                                  (early? (every (lambda (v)
+                                                                   (or (not (ssa-binding-ref? v))
+                                                                       (eq? (ssa-value-id v) r-name)
+                                                                       (let ((j (hash-table-ref/default
+                                                                                 pos (ssa-value-id v) #f)))
+                                                                         (or (not j) (< j r-at)))))
+                                                                 (ssa-binding-inputs c)))
+                                                  (at (cond (early? r-at)
+                                                            ((null? (cdr (list-ref parts 3))) i)
+                                                            (else #f))))
+                                             (if (not at)
+                                                 (begin (miss! 'placement) #f)
+                                                 (try-commit!
+                                                  (list r c)
+                                                  (fuse-epilogue parts c k
+                                                                 (append (binding-members r) (binding-members c))
+                                                                 vtab)
+                                                  at
+                                                  'epilogue)))))))))))))
+                   (loop (cdr vs) (+ k 1)))))))
+
+    ;; Tries rule on each binding that satisfies pred, from last to first,
+    ;; until it fuses nothing more there; returns the number of fusions.
+    (define (run-phase pred rule)
+      (let loop ((i (- n 1)) (count 0))
+        (if (< i 0)
+            count
+            (let ((b (vector-ref bv i)))
+              (if (and b (pred b))
+                  (let fuse ((count count))
+                    (if (and (vector-ref bv i) (pred (vector-ref bv i)) (rule i))
+                        (fuse (+ count 1))
+                        (loop (- i 1) count)))
+                  (loop (- i 1) count))))))
+
+    ;; Maps are fused first, so that a chain of maps is one map before it
+    ;; meets its reduction.  Fusions that keep a producer as a second output,
+    ;; and horizontal fusions, come after the fusions with reductions, since
+    ;; a binding with several outputs no longer fuses into a reduction.
+    (define (run-round)
+      (set! missed '())
+      (let* ((maps (run-phase fusion-map-binding? fuse-one!))
+             (reds (run-phase (lambda (b) (or (reduce-binding? b) (fused-red-binding? b)))
+                              fuse-into-reduction!))
+             (epis (run-phase fusion-map-binding? fuse-epilogue!))
+             (kept (run-phase fusion-map-binding? fuse-one-kept!))
+             (horz (run-phase fusion-group-binding? fuse-horizontal!))
+             (dead (remove-dead-outputs!)))
+        (set! dead-count (+ dead-count dead))
+        (set! round-dead dead)
+        (+ maps reds epis kept horz)))
+
+    ;; The outputs the last round removed: a binding left with one output
+    ;; may fuse in the next round.
+    (define round-dead 0)
+
+    (let rounds ((r 1) (total 0))
+      (let* ((fused (run-round)) (total (+ total fused)))
+        (if (or (= 0 fused round-dead) (>= r max-rounds))
+            (set! *fusion-pass-stats*
+                  `((rounds . ,r) (fusions . ,total) (bound-reached? . ,(> fused 0))
+                    (kept . ,kept-count) (horizontal . ,horizontal-count) (dead-outputs . ,dead-count)
+                    (classes . ,(reverse class-counts))
+                    (candidates . ,(fusion-candidates (filter (lambda (b) b) (vector->list bv))))
+                    (red-candidates . ,(fusion-red-candidates (filter (lambda (b) b) (vector->list bv))))
+                    (missed . ,(reverse missed))))
+            (rounds (+ r 1) total))))
+
+    (make-ssa-program
+     (ssa-program-constants prog)
+     (ssa-program-morph-to-val prog)
+     (filter (lambda (b) b) (vector->list bv))
+     (ssa-program-outputs prog)
+     (ssa-program-n-params prog)
+     #f #f #f #t)))
+
+(define (realize-fused-binding ctx b inputs)
+  "Realize fused binding b on the concrete arrays inputs, through its segop
+   executor, the one a replay plan would select.  The outputs are
+   allocated through context ctx, or as fresh arrays when ctx is #f.
+   Returns one array per output."
+  (let* ((tpl   (fused-binding-template b))
+         (outs  (fusion-template-outs tpl))
+         (in-v  (list->vector inputs))
+         (sg    (lower-fused-binding tpl inputs (iota (length inputs)) (iota (length outs))))
+         (exec  (cdr (or (select-segop-executor sg)
+                         (error "realize-fused-binding: no backend accepts the segop"
+                                (ssa-binding-name b)))))
+         (deref (lambda (k) (vector-ref in-v k)))
+         (run!  (lambda (bufs)
+                  (if (null? (cdr bufs))
+                      (exec deref (car bufs))
+                      (exec deref (car bufs) (cdr bufs)))))
+         (specs (map (lambda (o) (cons (fused-out-shape o) (fused-out-dtype o))) outs)))
+    (if ctx
+        (realize-segop/ctx ctx inputs specs run!)
+        (let ((bufs (map (lambda (s) (allocate-typed-vector (cdr s) (shape-size (car s)))) specs)))
+          (run! bufs)
+          (map (lambda (s buf) (concrete-array buf (car s) (compute-strides (car s)) 0 (cdr s) -1 -1))
+               specs bufs)))))
 
 
 ;;; ============================================================
@@ -643,16 +1481,24 @@
 
             (morphism-expr (morph-id op operands index-fn shape dtype metadata batch-axis)
               (let* ((input-vals (map visit operands))
-                     ;; Normalize: morph-transpose stores key 'permutation; we use 'perm
-                     (norm-meta  (if (eq? op 'transpose)
-                                     (let ((pe (assq 'permutation metadata)))
-                                       (if pe
-                                           (cons (cons 'perm (cdr pe))
-                                                 (filter (lambda (x)
-                                                           (not (eq? (car x) 'permutation)))
-                                                         metadata))
-                                           metadata))
-                                     metadata))
+                     ;; Normalize: morph-transpose stores key 'permutation; we use 'perm.
+                     ;; morph-map stores its procedure under 'function; the map
+                     ;; bindings of ssa-vjp, and rebuild-morphism, use 'fn.
+                     (norm-meta  (case op
+                                   ((transpose)
+                                    (let ((pe (assq 'permutation metadata)))
+                                      (if pe
+                                          (cons (cons 'perm (cdr pe))
+                                                (filter (lambda (x)
+                                                          (not (eq? (car x) 'permutation)))
+                                                        metadata))
+                                          metadata)))
+                                   ((map)
+                                    (let ((fe (assq 'function metadata)))
+                                      (if (and fe (not (assq 'fn metadata)))
+                                          (cons (cons 'fn (cdr fe)) metadata)
+                                          metadata)))
+                                   (else metadata)))
                      (meta       (cons (cons 'index-fn index-fn) norm-meta))
                      (v          (emit-binding! op input-vals shape dtype meta)))
                 (env-builder-extend! visited-eb (morph-stable-id m) v)
@@ -660,10 +1506,13 @@
 
             (reduction-morphism (morph-id rop operand reduce-axes index-fn shape dtype batch-axis)
               (let* ((src-val (visit operand))
-                     (meta    (list (cons 'axes reduce-axes)
-                                    (cons 'index-fn index-fn)
-                                    (cons 'src-shape (morph-shape operand))
-                                    (cons 'keepdims? (reduction-index-fn-keepdims? index-fn))))
+                     (frame-rank (reduction-index-fn-frame-rank index-fn))
+                     (meta    (append
+                               (list (cons 'axes reduce-axes)
+                                     (cons 'index-fn index-fn)
+                                     (cons 'src-shape (morph-shape operand))
+                                     (cons 'keepdims? (reduction-index-fn-keepdims? index-fn)))
+                               (if (> frame-rank 0) (list (cons 'frame-rank frame-rank)) '())))
                      (v       (emit-binding! (list 'reduce rop) (list src-val) shape dtype meta)))
                 (env-builder-extend! visited-eb (morph-stable-id m) v)
                 v)))))
@@ -701,7 +1550,13 @@
   "Compute symbolic VJP of fwd-prog with respect to params.
    param-const-vals: list of (const-ref cid) ssa-values for trainable params.
    loss-binding-val: (binding-ref bid) ssa-value for the loss node.
-   Returns extended ssa-program."
+   Returns extended ssa-program.  fwd-prog must not contain fused
+   bindings, which have no derivative rule: a forward program realized
+   through a context is fused at its first trace, so differentiate it
+   before realizing it, or build it again with morphism-to-ssa."
+
+  (when (any fused-binding? (ssa-program-bindings fwd-prog))
+    (error "ssa-vjp: the forward program contains fused bindings"))
 
   (let* (;; Build shape/dtype lookup from forward bindings (single env-builder)
          (fwd-bindings  (ssa-program-bindings fwd-prog))
@@ -734,6 +1589,38 @@
                 (env-builder-extend! param-cid-eb (ssa-value-id v) #t))
               param-const-vals)
 
+    ;; The frame rank of each forward value: that of a reduction with a
+    ;; frame rank (see morph-reduce), carried through element-wise ops; 0
+    ;; elsewhere.  A sum that undoes the broadcasting of a value along a
+    ;; size-1 cell axis takes the value's frame rank, so that each cell's
+    ;; gradient is reduced as the cell's own would be.
+    (define frame-eb (make-env-builder))
+    (define (val-frame-rank v)
+      (cases ssa-value v
+        (binding-ref (bid) (or (env-builder-lookup frame-eb bid) 0))
+        (const-ref (cid) 0)))
+    (for-each (lambda (b)
+                (let* ((op (ssa-binding-op b))
+                       (fr (cond ((and (pair? op) (eq? (car op) 'reduce))
+                                  (binding-frame-rank (ssa-binding-meta b)))
+                                 ((memq op '(add sub mul div pow negate abs sqrt exp log sin cos
+                                             tan relu sigmoid tanh cast map))
+                                  (fold max 0 (map val-frame-rank (ssa-binding-inputs b))))
+                                 (else 0))))
+                  (when (> fr 0) (env-builder-extend! frame-eb (ssa-binding-name b) fr))))
+              fwd-bindings)
+
+    ;; Forward bindings whose value depends on a trainable parameter
+    (define param-dependent-eb (make-env-builder))
+    (define (param-dependent? v)
+      (cases ssa-value v
+        (binding-ref (bid) (and (env-builder-lookup param-dependent-eb bid) #t))
+        (const-ref (cid) (and (env-builder-lookup param-cid-eb cid) #t))))
+    (for-each (lambda (b)
+                (when (any param-dependent? (ssa-binding-inputs b))
+                  (env-builder-extend! param-dependent-eb (ssa-binding-name b) #t)))
+              fwd-bindings)
+
     ;; Lookup helpers
     (define (val-shape v)
       (let ((sd (env-builder-lookup binding-sd-eb (ssa-value-id v))))
@@ -742,9 +1629,35 @@
       (let ((sd (env-builder-lookup binding-sd-eb (ssa-value-id v))))
         (and sd (cdr sd))))
 
-    ;; emit! -- create a new backward SSA binding (O(1) push; reversed at end)
-    (define (emit! op inputs shape dtype meta)
+    ;; The dtype of the morphism rebuild-morphism makes for a binding with
+    ;; op and inputs, by the type rules of the morphism constructors:
+    ;; arithmetic promotes its operand dtypes, the transcendental ops and
+    ;; activations make integers f64, reductions follow
+    ;; infer-reduction-dtype, and structural ops keep their input's dtype.
+    ;; Ops not covered here (cast) keep the dtype the caller gives.
+    (define (emitted-dtype op inputs dtype)
+      (let ((in-dtypes (map val-dtype inputs)))
+        (cond
+         ((not (every values in-dtypes)) dtype)
+         ((memq op '(add sub mul div pow matmul batch-matmul conv2d-bwd-data conv2d-bwd-weights
+                     stack concat))
+          (fold promote-types (car in-dtypes) (cdr in-dtypes)))
+         ((and (pair? op) (eq? (car op) 'reduce))
+          (infer-reduction-dtype (cadr op) (car in-dtypes)))
+         ((memq op '(reshape transpose slice pad col2im map relu-deriv sigmoid-deriv tanh-deriv scan))
+          (car in-dtypes))
+         ((memq op '(gt lt ge le eq)) 'f64)
+         ((memq op '(negate abs floor ceiling sqrt exp log sin cos tan relu sigmoid tanh))
+          (infer-unary-dtype op (car in-dtypes)))
+         (else dtype))))
+
+    ;; emit! -- create a new backward SSA binding (O(1) push; reversed at end).
+    ;; The binding's dtype is the one the trace computes for it (see
+    ;; emitted-dtype), whatever dtype the caller passes, so that replay
+    ;; writes each pool buffer in the dtype the trace allocated.
+    (define (emit! op inputs shape dtype-hint meta)
       (let* ((adj-id (gensym 'adj-))
+             (dtype  (emitted-dtype op inputs dtype-hint))
              (b      (make-ssa-binding adj-id op inputs shape dtype meta)))
         (stack-push! bwd-bindings-stack b)
         (env-builder-extend! binding-sd-eb adj-id (cons shape dtype))
@@ -778,7 +1691,7 @@
               (accumulate-param-grad! cid new-val shape dtype))))))
 
     ;; emit-reduce-sum-to! -- reduce g-val to target-shape
-    (define (emit-reduce-sum-to! g-val g-shape target-shape dtype)
+    (define (emit-reduce-sum-to! g-val g-shape target-shape dtype #!optional (fr 0))
       (let* ((g-rank (vector-length g-shape))
              (t-vec  (if (vector? target-shape)
                          target-shape
@@ -809,9 +1722,13 @@
                              (_ (vector-set! new-shape k 1))
                              (r (emit! (list 'reduce 'sum) (list cur)
                                        new-shape dtype
-                                       (list (cons 'axes (list k))
-                                             (cons 'keepdims? #t)
-                                             (cons 'src-shape cur-shape)))))
+                                       (append
+                                        (list (cons 'axes (list k))
+                                              (cons 'keepdims? #t)
+                                              (cons 'src-shape cur-shape))
+                                        (if (and (> fr 0) (>= k fr) (= extra 0))
+                                            (list (cons 'frame-rank fr))
+                                            '())))))
                         (loop (+ k 1) r new-shape))
                       (loop (+ k 1) cur cur-shape))))))))
 
@@ -863,6 +1780,49 @@
         (env-builder-extend! binding-sd-eb cid (cons (vector 1) dtype))
         (const-ref cid)))
 
+    ;; emit-const! -- a constant array of the given shape and dtype, filled
+    ;; with value.
+    (define (emit-const! value shape dtype)
+      (let* ((n    (shape-size shape))
+             (data (allocate-typed-vector dtype n))
+             (_    (do ((i 0 (+ i 1))) ((= i n)) (typed-vector-set! data dtype i value)))
+             (m    (make-morphism data (vector->list shape) dtype))
+             (cid  (gensym 'cid-)))
+        (hash-table-set! (ssa-program-constants fwd-prog) cid m)
+        (env-builder-extend! binding-sd-eb cid (cons shape dtype))
+        (const-ref cid)))
+
+    ;; The operations of am:scan-gradient as bindings, for a scan along
+    ;; axis whose result has dtype dtype.
+    (define (ssa-scan-ops axis dtype)
+      (lambda (name . args)
+        (case name
+          ((scan)
+           (apply (lambda (v shape op excl? rev? init aux)
+                    (emit! 'scan (append (list v) (if init (list init) '()) aux) shape dtype
+                           (append `((scan-op . ,op) (axis . ,axis) (exclusive? . ,excl?)
+                                     (reverse? . ,rev?) (swapped? . #f))
+                                   (if (pair? aux) `((aux-count . ,(length aux)) (init? . ,(and init #t))) '()))))
+                  args))
+          ((slice)
+           (apply (lambda (v start end shape)
+                    (emit! 'slice (list v) shape dtype
+                           `((start . ,start) (end . ,end) (step . ,(map (lambda (k) 1) start)))))
+                  args))
+          ((concat) (emit! 'concat (car args) (cadr args) dtype `((axis . ,axis))))
+          ((reshape) (emit! 'reshape (list (car args)) (cadr args) dtype '()))
+          ((mul) (emit! 'mul (list (car args) (cadr args)) (caddr args) dtype
+                        `((combiner . ,(scalar-op-combiner 'mul)))))
+          ((sub) (emit! 'sub (list (car args) (cadr args)) (caddr args) dtype
+                        `((combiner . ,(scalar-op-combiner 'sub)))))
+          ((add-init) (emit! 'add (list (car args) (cadr args)) (val-shape (car args)) dtype
+                             `((combiner . ,(scalar-op-combiner 'add)))))
+          ((mask) (apply (lambda (rel a b shape)
+                           (emit! 'cast (list (emit! rel (list a b) shape 'f64 '())) shape dtype '()))
+                         args))
+          ((const) (emit-const! (car args) (cadr args) dtype))
+          (else (error "ssa-scan-ops: unknown operation" name)))))
+
     ;; Seed: dL/dL = ones-like(loss) stored as a constant
     (let* ((loss-bid    (find-fwd-binding fwd-bindings loss-bid-sym))
            (loss-shape  (ssa-binding-shape loss-bid))
@@ -900,9 +1860,9 @@
                        (y-val (list-ref inputs 1))
                        (x-shape (val-shape x-val))
                        (y-shape (val-shape y-val)))
-                  (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype)))
+                  (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype (val-frame-rank x-val))))
                     (accumulate-input-adjoint! x-val dx))
-                  (let ((dy (emit-reduce-sum-to! g-val g-shape y-shape dtype)))
+                  (let ((dy (emit-reduce-sum-to! g-val g-shape y-shape dtype (val-frame-rank y-val))))
                     (accumulate-input-adjoint! y-val dy))))
 
                ;; sub(x, y) -- dx = reduce-sum-to(g, shape-x); dy = reduce-sum-to(-g, shape-y)
@@ -911,11 +1871,11 @@
                        (y-val (list-ref inputs 1))
                        (x-shape (val-shape x-val))
                        (y-shape (val-shape y-val)))
-                  (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype)))
+                  (let ((dx (emit-reduce-sum-to! g-val g-shape x-shape dtype (val-frame-rank x-val))))
                     (accumulate-input-adjoint! x-val dx))
                   (let* ((neg-g (emit! 'negate (list g-val) g-shape dtype
-                                        `((combiner . ,(lambda (x) (- x))))))
-                         (dy    (emit-reduce-sum-to! neg-g g-shape y-shape dtype)))
+                                        `((combiner . ,(scalar-op-combiner 'negate)))))
+                         (dy    (emit-reduce-sum-to! neg-g g-shape y-shape dtype (val-frame-rank y-val))))
                     (accumulate-input-adjoint! y-val dy))))
 
                ;; mul(x, y) -- dx = reduce-sum-to(g*y, shape-x); dy = reduce-sum-to(g*x, shape-y)
@@ -926,11 +1886,11 @@
                        (y-shape (val-shape y-val)))
                   (let* ((gy    (emit! 'mul (list g-val y-val) g-shape dtype
                                         `((combiner . ,*))))
-                         (dx    (emit-reduce-sum-to! gy g-shape x-shape dtype)))
+                         (dx    (emit-reduce-sum-to! gy g-shape x-shape dtype (val-frame-rank x-val))))
                     (accumulate-input-adjoint! x-val dx))
                   (let* ((gx    (emit! 'mul (list g-val x-val) g-shape dtype
                                         `((combiner . ,*))))
-                         (dy    (emit-reduce-sum-to! gx g-shape y-shape dtype)))
+                         (dy    (emit-reduce-sum-to! gx g-shape y-shape dtype (val-frame-rank y-val))))
                     (accumulate-input-adjoint! y-val dy))))
 
                ;; div(x, y) -- dx = g/y; dy = -g*x/y^2
@@ -941,7 +1901,8 @@
                        (y-shape (val-shape y-val)))
                   (let* ((g-over-y (emit! 'div (list g-val y-val) g-shape dtype
                                            `((combiner . ,/))))
-                         (dx       (emit-reduce-sum-to! g-over-y g-shape x-shape dtype)))
+                         (dx       (emit-reduce-sum-to! g-over-y g-shape x-shape dtype
+                                                        (val-frame-rank x-val))))
                     (accumulate-input-adjoint! x-val dx))
                   (let* ((y2      (emit! 'mul (list y-val y-val) y-shape dtype
                                           `((combiner . ,*))))
@@ -950,8 +1911,9 @@
                          (neg-dy  (emit! 'mul (list g-val x-over-y2) g-shape dtype
                                           `((combiner . ,*))))
                          (neg-dy2 (emit! 'negate (list neg-dy) g-shape dtype
-                                          `((combiner . ,(lambda (x) (- x))))))
-                         (dy      (emit-reduce-sum-to! neg-dy2 g-shape y-shape dtype)))
+                                          `((combiner . ,(scalar-op-combiner 'negate)))))
+                         (dy      (emit-reduce-sum-to! neg-dy2 g-shape y-shape dtype
+                                                       (val-frame-rank y-val))))
                     (accumulate-input-adjoint! y-val dy))))
 
                ;; pow(x, n) -- dx = g * n * x^(n-1); dn skipped (n usually not a param)
@@ -963,7 +1925,7 @@
                   (let* ((one-val (emit-scalar-const! 1.0 dtype))
                          (nm1     (emit! 'sub (list n-val one-val)
                                          (val-shape n-val) dtype
-                                         `((combiner . ,(lambda (a b) (- a b))))))
+                                         `((combiner . ,(scalar-op-combiner 'sub)))))
                          (xpow    (emit! 'pow (list x-val nm1) g-shape dtype
                                           `((combiner . ,expt))))
                          (n-xpow  (emit! 'mul (list n-val xpow) g-shape dtype
@@ -978,7 +1940,7 @@
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
                        (neg-g   (emit! 'negate (list g-val) g-shape dtype
-                                        `((combiner . ,(lambda (x) (- x))))))
+                                        `((combiner . ,(scalar-op-combiner 'negate)))))
                        (dx      (emit-reduce-sum-to! neg-g g-shape x-shape dtype)))
                   (accumulate-input-adjoint! x-val dx)))
 
@@ -1049,7 +2011,7 @@
                        (sin-x   (emit! 'sin (list x-val) x-shape dtype
                                         `((combiner . ,sin))))
                        (neg-sin (emit! 'negate (list sin-x) x-shape dtype
-                                        `((combiner . ,(lambda (x) (- x))))))
+                                        `((combiner . ,(scalar-op-combiner 'negate)))))
                        (dx-raw  (emit! 'mul (list g-val neg-sin) g-shape dtype
                                         `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
@@ -1062,8 +2024,8 @@
                 (let* ((x-val   (list-ref inputs 0))
                        (x-shape (val-shape x-val))
                        (hx      (emit! 'relu-deriv (list x-val) x-shape dtype
-                                        `((fn . ,(lambda (xv) (if (> xv 0.0) 1.0 0.0)))
-                                          (combiner . ,(lambda (xv) (if (> xv 0.0) 1.0 0.0))))))
+                                        `((fn . ,(scalar-op-combiner 'relu-deriv))
+                                          (combiner . ,(scalar-op-combiner 'relu-deriv)))))
                        (dx-raw  (emit! 'mul (list g-val hx) g-shape dtype
                                         `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
@@ -1075,8 +2037,8 @@
                        (x-shape (val-shape x-val))
                        (fwd-out (binding-ref bid-sym))
                        (deriv   (emit! 'sigmoid-deriv (list fwd-out) g-shape dtype
-                                        `((fn . ,(lambda (sv) (* sv (- 1.0 sv))))
-                                          (combiner . ,(lambda (sv) (* sv (- 1.0 sv)))))))
+                                        `((fn . ,(scalar-op-combiner 'sigmoid-deriv))
+                                          (combiner . ,(scalar-op-combiner 'sigmoid-deriv)))))
                        (dx-raw  (emit! 'mul (list g-val deriv) g-shape dtype
                                         `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
@@ -1088,11 +2050,22 @@
                        (x-shape (val-shape x-val))
                        (fwd-out (binding-ref bid-sym))
                        (deriv   (emit! 'tanh-deriv (list fwd-out) g-shape dtype
-                                        `((fn . ,(lambda (tv) (- 1.0 (* tv tv))))
-                                          (combiner . ,(lambda (tv) (- 1.0 (* tv tv)))))))
+                                        `((fn . ,(scalar-op-combiner 'tanh-deriv))
+                                          (combiner . ,(scalar-op-combiner 'tanh-deriv)))))
                        (dx-raw  (emit! 'mul (list g-val deriv) g-shape dtype
                                         `((combiner . ,*))))
                        (dx      (emit-reduce-sum-to! dx-raw g-shape x-shape dtype)))
+                  (accumulate-input-adjoint! x-val dx)))
+
+               ;; cast(x) -- dx = g converted back to the dtype of x
+               ((eq? op 'cast)
+                (let* ((x-val   (list-ref inputs 0))
+                       (x-dtype (val-dtype x-val))
+                       (dx      (if (eq? (val-dtype g-val) x-dtype)
+                                    g-val
+                                    (emit! 'cast (list g-val) (val-shape x-val) x-dtype
+                                           `((dtype . ,x-dtype)
+                                             (combiner . ,(cast-combiner x-dtype)))))))
                   (accumulate-input-adjoint! x-val dx)))
 
                ;; matmul(A, B) -- dA = g @ B^T; dB = A^T @ g
@@ -1115,6 +2088,33 @@
                   (accumulate-input-adjoint! a-val da-val)
                   (accumulate-input-adjoint! b-val db-val)))
 
+               ;; batch-matmul(A, B) -- dA = g @ B^T; dB = A^T @ g, cell by
+               ;; cell; the gradient of an operand shared by every cell is
+               ;; summed over the frame.
+               ((eq? op 'batch-matmul)
+                (let* ((a-val    (list-ref inputs 0))
+                       (b-val    (list-ref inputs 1))
+                       (a-shape  (val-shape a-val))
+                       (b-shape  (val-shape b-val))
+                       (perm-a   (transpose-perm (vector-length a-shape)))
+                       (perm-b   (transpose-perm (vector-length b-shape)))
+                       (at-shape (permute-shape a-shape perm-a))
+                       (bt-shape (permute-shape b-shape perm-b))
+                       (bt-val   (emit! 'transpose (list b-val) bt-shape dtype
+                                        (list (cons 'perm perm-b))))
+                       (at-val   (emit! 'transpose (list a-val) at-shape dtype
+                                        (list (cons 'perm perm-a))))
+                       (da-shape (batch-matmul-shape g-shape bt-shape))
+                       (db-shape (batch-matmul-shape at-shape g-shape))
+                       (da-val   (emit! 'batch-matmul (list g-val bt-val) da-shape dtype
+                                        (batch-matmul-meta g-shape bt-shape)))
+                       (db-val   (emit! 'batch-matmul (list at-val g-val) db-shape dtype
+                                        (batch-matmul-meta at-shape g-shape))))
+                  (accumulate-input-adjoint!
+                   a-val (emit-reduce-sum-to! da-val da-shape a-shape dtype))
+                  (accumulate-input-adjoint!
+                   b-val (emit-reduce-sum-to! db-val db-shape b-shape dtype))))
+
                ;; transpose(x, perm) -- dx = transpose(g, inv-perm)
                ((eq? op 'transpose)
                 (let* ((x-val    (list-ref inputs 0))
@@ -1131,6 +2131,66 @@
                         (x-shape (val-shape x-val))
                         (dx      (emit! 'reshape (list g-val) x-shape dtype '())))
                    (accumulate-input-adjoint! x-val dx)))
+
+                ;; slice(x) with unit steps -- dx is g padded with zeros back to
+                ;; the shape of x.  A slice with larger steps has no rule.
+                ((eq? op 'slice)
+                 (let* ((x-val   (list-ref inputs 0))
+                        (x-shape (val-shape x-val))
+                        (start   (cdr (assq 'start meta)))
+                        (end     (cdr (assq 'end meta)))
+                        (step    (cdr (assq 'step meta))))
+                   (if (every (lambda (k) (= k 1)) step)
+                       (accumulate-input-adjoint!
+                        x-val
+                        (emit! 'pad (list g-val) x-shape dtype
+                               `((padding . ,(map (lambda (s e d) (list s (- d e)))
+                                                  start end (vector->list x-shape)))
+                                 (mode . constant) (value . 0.0))))
+                       (when (param-dependent? x-val)
+                         (error "ssa-vjp: a slice with steps above 1 has no gradient, and its input depends on a trainable parameter"
+                                step bid-sym)))))
+
+                ;; stack(x_0 ... x_n-1) along axis a -- dx_i is the slice of g at
+                ;; index i along a, without that axis; concat along a -- dx_i is
+                ;; the slice of g that holds x_i.
+                ((memq op '(stack concat))
+                 (let* ((ax     (cdr (assq 'axis meta)))
+                        (rank   (vector-length g-shape))
+                        (stack? (eq? op 'stack)))
+                   (let loop ((xs inputs) (i 0) (off 0))
+                     (unless (null? xs)
+                       (let* ((x-val   (car xs))
+                              (x-shape (val-shape x-val))
+                              (len     (if stack? 1 (vector-ref x-shape ax)))
+                              (cut-shape (list->vector (map (lambda (k) (if (= k ax) len (vector-ref g-shape k)))
+                                                            (iota rank))))
+                              (cut     (emit! 'slice (list g-val) cut-shape dtype
+                                              `((start . ,(map (lambda (k) (if (= k ax) off 0)) (iota rank)))
+                                                (end . ,(map (lambda (k) (if (= k ax) (+ off len) (vector-ref g-shape k)))
+                                                             (iota rank)))
+                                                (step . ,(make-list rank 1)))))
+                              (dx      (if stack? (emit! 'reshape (list cut) x-shape dtype '()) cut)))
+                         (accumulate-input-adjoint! x-val dx)
+                         (loop (cdr xs) (+ i 1) (+ off len)))))))
+
+                ;; pad(x) with a constant -- dx is the slice of g that holds x.
+                ;; Edge and reflect padding have no rule.
+                ((eq? op 'pad)
+                 (let* ((x-val   (list-ref inputs 0))
+                        (x-shape (val-shape x-val))
+                        (padding (cdr (assq 'padding meta))))
+                   (if (eq? (cdr (assq 'mode meta)) 'constant)
+                       (let ((start (map car padding)))
+                         (accumulate-input-adjoint!
+                          x-val
+                          (emit! 'slice (list g-val) x-shape dtype
+                                 `((start . ,start)
+                                   (end . ,(map + start (vector->list x-shape)))
+                                   (step . ,(map (lambda (p) 1) padding))))))
+                       (when (param-dependent? x-val)
+                         (error "ssa-vjp: edge and reflect padding have no gradient, and the padded input depends on a trainable parameter"
+                                (cdr (assq 'mode meta)) bid-sym)))))
 
                 ;; im2col(x) -- dx = col2im(g, shape(x), kernel, stride, padding)
                 ((eq? op 'im2col)
@@ -1201,10 +2261,76 @@
                ((equal? op '(reduce max))
                 (void))
 
-               ;; map(x, fn) -- no grad (non-differentiable; sign fn used in abs backward).
-               ;; The activation derivative ops are maps too, emitted only in the
-               ;; backward pass, and likewise have no gradient of their own.
-               ((memq op '(map relu-deriv sigmoid-deriv tanh-deriv))
+               ;; scan(x [, init]) along an axis.  For a sum, each element of x
+               ;; reaches every output from its own position on in the scan's
+               ;; direction (from the next position on for an exclusive scan),
+               ;; so dx is the scan of g in the opposite direction, inclusive or
+               ;; exclusive as the forward scan.  The sequential order of that
+               ;; scan adds g from the far end, as the backward pass of the
+               ;; step-by-step program does.  init reaches every output: dinit
+               ;; is the sum of g along the axis, taken from the inclusive scan
+               ;; of g in the opposite direction at its last position, which
+               ;; adds in the same order.  Products, maxima and minima have the
+               ;; gradients of scan-gradient (grad.scm); combine expressions
+               ;; have no gradient rule, and such a scan that depends on a
+               ;; trainable parameter is an error.
+               ((eq? op 'scan)
+                (let ((get (lambda (k) (cdr (assq k meta)))))
+                  (if (eq? (get 'scan-op) 'sum)
+                      (let* ((x-val   (list-ref inputs 0))
+                             (x-shape (val-shape x-val))
+                             (ax      (get 'axis))
+                             (dx      (emit! 'scan (list g-val) x-shape dtype
+                                             `((scan-op . sum) (axis . ,ax)
+                                               (exclusive? . ,(get 'exclusive?))
+                                               (reverse? . ,(not (get 'reverse?)))
+                                               (swapped? . #f)))))
+                        (accumulate-input-adjoint! x-val dx)
+                        (when (pair? (cdr inputs))
+                          (let* ((i-val (list-ref inputs 1))
+                                 (rank  (vector-length x-shape))
+                                 (pos   (if (get 'reverse?) (- (vector-ref x-shape ax) 1) 0))
+                                 (whole (if (get 'exclusive?)
+                                            (emit! 'scan (list g-val) x-shape dtype
+                                                   `((scan-op . sum) (axis . ,ax) (exclusive? . #f)
+                                                     (reverse? . ,(not (get 'reverse?)))
+                                                     (swapped? . #f)))
+                                            dx))
+                                 (one   (list->vector (map (lambda (k) (if (= k ax) 1 (vector-ref x-shape k)))
+                                                           (iota rank))))
+                                 (cut   (emit! 'slice (list whole) one dtype
+                                               `((start . ,(map (lambda (k) (if (= k ax) pos 0)) (iota rank)))
+                                                 (end . ,(map (lambda (k) (if (= k ax) (+ pos 1) (vector-ref x-shape k)))
+                                                              (iota rank)))
+                                                 (step . ,(make-list rank 1)))))
+                                 (dinit (emit! 'reshape (list cut) (val-shape i-val) dtype '())))
+                            (accumulate-input-adjoint! i-val dinit))))
+                      (if (memq (get 'scan-op) '(prod max min))
+                          (let* ((x-val   (list-ref inputs 0))
+                                 (x-shape (val-shape x-val))
+                                 (ax      (get 'axis))
+                                 (i-val   (and (pair? (cdr inputs)) (list-ref inputs 1)))
+                                 (d       (am:scan-gradient (ssa-scan-ops ax dtype) (get 'scan-op) x-shape dtype ax
+                                                            (get 'exclusive?) (get 'reverse?) (get 'swapped?)
+                                                            g-val x-val (binding-ref bid-sym) i-val)))
+                            (accumulate-input-adjoint! x-val (car d))
+                            (when i-val (accumulate-input-adjoint! i-val (cdr d))))
+                          (when (any param-dependent? inputs)
+                            (error "ssa-vjp: a scan with a combine expression has no gradient, and this one depends on a trainable parameter"
+                                   (get 'scan-op) bid-sym))))))
+
+               ;; map(x, fn) -- a user procedure has no derivative.  A map whose
+               ;; input does not depend on a trainable parameter passes no
+               ;; gradient on and needs none; otherwise the gradient cannot be
+               ;; computed.
+               ((eq? op 'map)
+                (when (param-dependent? (car inputs))
+                  (error "ssa-vjp: morph-map has no derivative, and its input depends on a trainable parameter"
+                         bid-sym)))
+
+               ;; The activation derivative ops are maps emitted only in the
+               ;; backward pass, and have no gradient of their own.
+               ((memq op '(relu-deriv sigmoid-deriv tanh-deriv))
                 (void))
 
                (else
@@ -1239,25 +2365,50 @@
            (zero-val    (const-ref zero-cid))
            (loss-out-val (emit! 'add (list loss-binding-val zero-val) loss-shape loss-dtype
                                       `((combiner . ,+))))
-           ;; Collect param grad outputs in order of param-const-vals
-           (grad-vals   (filter-map
+           ;; Collect param grad outputs in order of param-const-vals, one per
+           ;; parameter.  A gradient computed in another dtype than its
+           ;; parameter's (as when an f32 parameter meets f64 values) is cast
+           ;; to the parameter's dtype.  A parameter no gradient reaches (as
+           ;; through a max reduction, whose VJP is skipped) gets zeros,
+           ;; computed into a fresh buffer by an add of a zero constant.
+           (zero-grad   (lambda (pcv)
+                          (let* ((shape (val-shape pcv))
+                                 (dtype (val-dtype pcv))
+                                 (n     (shape-size shape))
+                                 (data  (allocate-typed-vector dtype n))
+                                 (zero  (if (memq dtype '(f32 f64)) 0.0 0))
+                                 (_     (do ((i 0 (+ i 1))) ((= i n))
+                                          (typed-vector-set! data dtype i zero)))
+                                 (cid   (gensym 'cid-)))
+                            (hash-table-set! (ssa-program-constants fwd-prog) cid
+                                             (make-morphism data (vector->list shape) dtype))
+                            (env-builder-extend! binding-sd-eb cid (cons shape dtype))
+                            (emit! 'add (list (const-ref cid) (const-ref cid)) shape dtype '()))))
+           (grad-vals   (map
                          (lambda (pcv)
-                           (let ((cid-sym (ssa-value-id pcv)))
-                             (env-builder-lookup param-grad-eb cid-sym)))
+                           (let* ((cid-sym (ssa-value-id pcv))
+                                  (g       (env-builder-lookup param-grad-eb cid-sym))
+                                  (p-dtype (val-dtype pcv)))
+                             (cond ((not g) (zero-grad pcv))
+                                   ((not (eq? (val-dtype g) p-dtype))
+                                    (emit! 'cast (list g) (val-shape pcv) p-dtype
+                                           `((dtype . ,p-dtype)
+                                             (combiner . ,(cast-combiner p-dtype)))))
+                                   (else g))))
                          param-const-vals))
            (all-outputs  (cons loss-out-val grad-vals))
            (all-bindings (append fwd-bindings (reverse (stack->list bwd-bindings-stack)))))
-      ;; Apply MoA psi-composition fusion to the full joint forward+backward program.
-      ;; Cross-AD-boundary fusion is automatic: backward element-wise bindings
-      ;; with use-count=1 are eligible under the same rules as forward ones.
-      (ssa-element-wise-fusion-pass
+      ;; Fuse the joint forward+backward program.  Fusion crosses the AD
+      ;; boundary: backward element-wise bindings are fused under the same
+      ;; rules as forward ones.
+      ((if (segop-fusion) ssa-segop-fusion-pass (lambda (p) p))
        (make-ssa-program
         (ssa-program-constants fwd-prog)
         (ssa-program-morph-to-val fwd-prog)
         all-bindings
         all-outputs
         (length param-const-vals)
-        #f #f #f)))))
+        #f #f #f #t)))))
 
 
 ;;; Helper: find a forward binding by its bid-symbol
@@ -1271,6 +2422,26 @@
 
 ;;; Helper: build the transpose permutation for a rank-r tensor
 ;;; For rank 2: (1 0).  For rank 3: (0 2 1) (transpose last two axes).
+;;; The frame of a batched product of operands of shapes sa and sb: the
+;;; leading dimensions of the operand of rank 3 or more (of A when both are).
+(define (batch-matmul-frame sa sb)
+  (let ((ra (vector-length sa)) (rb (vector-length sb)))
+    (if (> ra 2) (subvector sa 0 (- ra 2)) (subvector sb 0 (- rb 2)))))
+
+;;; The shape of the batched product of operands of shapes sa and sb.
+(define (batch-matmul-shape sa sb)
+  (let ((ra (vector-length sa)) (rb (vector-length sb)))
+    (list->vector (append (vector->list (batch-matmul-frame sa sb))
+                          (list (vector-ref sa (- ra 2)) (vector-ref sb (- rb 1)))))))
+
+;;; The metadata morph-batch-matmul gives the product of operands of shapes
+;;; sa and sb.
+(define (batch-matmul-meta sa sb)
+  (let ((ra (vector-length sa)) (rb (vector-length sb)))
+    `((k-dim . ,(vector-ref sa (- ra 1)))
+      (frame . ,(batch-matmul-frame sa sb))
+      (frame-form . ,(cond ((= rb 2) 'a) ((= ra 2) 'b) (else 'both))))))
+
 (define (transpose-perm rank)
   (if (= rank 2)
       '(1 0)
@@ -1290,41 +2461,67 @@
 ;;; inputs, construct a lazy morphism to pass to realize.
 ;;; ============================================================
 
+;;; The frame rank of a reduction binding's meta (see morph-reduce): 0
+;;; unless the meta has a frame-rank entry.
+(define (binding-frame-rank meta)
+  (let ((p (assq 'frame-rank meta))) (if p (cdr p) 0)))
+
 (define (rebuild-morphism b inputs)
   "Reconstruct a lazy morphism from an SSA binding and concrete inputs."
   (let ((op   (ssa-binding-op b))
         (meta (ssa-binding-meta b))
         (shp  (ssa-binding-shape b)))
     (cond
-      ;; Fused binding: op is consumer's op, inputs are the fused (producer's) inputs.
-      ;; Dispatch on the stored combiner instead of rebuilding from op name.
-      ((and (assq 'fused? meta) (assq 'combiner meta))
-       (let* ((comb   (cdr (assq 'combiner meta)))
-              (shapes (map morph-shape inputs))
-              (ifn    (make-compute-index-fn
-                        (map (lambda (_) (lambda (idx) idx)) inputs)
-                        comb
-                        shapes)))
-         (morphism-expr (gensym 'morph-) op inputs ifn shp (ssa-binding-dtype b) '() -1)))
       ((equal? op '(reduce mean))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
-         (morph-reduce 'mean (car inputs) axes keepdims?)))
+         (morph-reduce 'mean (car inputs) axes keepdims? (binding-frame-rank meta))))
       ((equal? op '(reduce sum))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
-         (morph-reduce 'sum (car inputs) axes keepdims?)))
+         (morph-reduce 'sum (car inputs) axes keepdims? (binding-frame-rank meta))))
       ((equal? op '(reduce max))
        (let ((axes     (cdr (assq 'axes meta)))
              (keepdims? (cdr (assq 'keepdims? meta))))
-         (morph-reduce 'max (car inputs) axes keepdims?)))
+         (morph-reduce 'max (car inputs) axes keepdims? (binding-frame-rank meta))))
+      ((equal? op '(reduce min))
+       (let ((axes     (cdr (assq 'axes meta)))
+             (keepdims? (cdr (assq 'keepdims? meta))))
+         (morph-reduce 'min (car inputs) axes keepdims? (binding-frame-rank meta))))
+      ((equal? op '(reduce prod))
+       (let ((axes     (cdr (assq 'axes meta)))
+             (keepdims? (cdr (assq 'keepdims? meta))))
+         (morph-reduce 'prod (car inputs) axes keepdims? (binding-frame-rank meta))))
       ((eq? op 'matmul)
        (morph-matmul (car inputs) (cadr inputs)))
+      ((eq? op 'batch-matmul)
+       (morph-batch-matmul (car inputs) (cadr inputs)))
+      ((eq? op 'scan)
+       (let* ((get (lambda (k) (cdr (assq k meta))))
+              (k   (let ((p (assq 'aux-count meta))) (if p (cdr p) 0))))
+         (morph-scan (get 'scan-op) (car inputs) (get 'axis)
+                     exclusive?: (get 'exclusive?) reverse?: (get 'reverse?)
+                     swapped?: (get 'swapped?)
+                     neutral: (let ((p (assq 'neutral meta))) (and p (cdr p)))
+                     init: (and (= (length inputs) (+ 2 k)) (cadr inputs))
+                     aux: (list-tail inputs (- (length inputs) k)))))
+      ((memq op '(gt lt ge le eq))
+       (create-comparison-morphism op (car inputs) (cadr inputs)))
       ((eq? op 'transpose)
        (let ((perm (cdr (assq 'perm meta))))
          (morph-transpose (car inputs) perm)))
       ((eq? op 'reshape)
        (morph-reshape (car inputs) shp))
+      ((eq? op 'slice)
+       (morph-slice (car inputs) (cdr (assq 'start meta)) (cdr (assq 'end meta))
+                    (cdr (assq 'step meta))))
+      ((eq? op 'stack)
+       (morph-stack inputs (cdr (assq 'axis meta))))
+      ((eq? op 'concat)
+       (morph-concat inputs (cdr (assq 'axis meta))))
+      ((eq? op 'pad)
+       (morph-pad (car inputs) (cdr (assq 'padding meta)) (cdr (assq 'mode meta))
+                  (cdr (assq 'value meta))))
       ((eq? op 'add)    (morph+ (car inputs) (cadr inputs)))
       ((eq? op 'sub)    (morph- (car inputs) (cadr inputs)))
       ((eq? op 'mul)    (morph* (car inputs) (cadr inputs)))
@@ -1340,8 +2537,9 @@
       ((eq? op 'relu)    (morph-relu    (car inputs)))
       ((eq? op 'sigmoid) (morph-sigmoid (car inputs)))
       ((eq? op 'tanh)    (morph-tanh-am (car inputs)))
+      ((eq? op 'cast)    (morph-cast (car inputs) (ssa-binding-dtype b)))
        ;; map, and the activation derivative ops, which ssa-vjp emits as maps
-       ;; under their own op names so they can be compiled to ri-activation-unary.
+       ;; under their own op names so that replay can use activation kernels for them.
        ((memq op '(map relu-deriv sigmoid-deriv tanh-deriv))
         (let ((fn (cdr (assq 'fn meta))))
           (morph-map fn (car inputs))))
@@ -1455,11 +2653,14 @@
     ;; Execute bindings in topological order
     (for-each
      (lambda (b)
-       (let* ((inputs (map (lambda (v)
-                             (hash-table-ref values (ssa-value-id v)))
-                           (ssa-binding-inputs b)))
-              (result (realize (rebuild-morphism b inputs))))
-         (hash-table-set! values (ssa-binding-name b) result)))
+       (let ((inputs (map (lambda (v)
+                            (hash-table-ref values (ssa-value-id v)))
+                          (ssa-binding-inputs b))))
+         (if (fused-binding? b)
+             (for-each (lambda (o r) (hash-table-set! values (fused-out-name o) r))
+                       (fused-binding-outs b) (realize-fused-binding #f b inputs))
+             (hash-table-set! values (ssa-binding-name b)
+                              (realize (rebuild-morphism b inputs))))))
      (ssa-program-bindings prog))
     ;; Collect outputs
     (map (lambda (ov)
@@ -1587,8 +2788,16 @@
 (define (copy-concrete-array m)
   (cases array-morphism m
     (concrete-array (data shape strides offset dtype alloc-id batch-axis)
+      (copy-concrete-array-into m (allocate-typed-vector dtype (shape-size shape))))
+    (else (error "copy-concrete-array: not a concrete-array" m))))
+
+;; Copy the elements of concrete array m, in row-major order, into the
+;; typed vector new-data, which holds at least as many elements as m, and
+;; return a row-major array over new-data (alloc-id -1).
+(define (copy-concrete-array-into m new-data)
+  (cases array-morphism m
+    (concrete-array (data shape strides offset dtype alloc-id batch-axis)
       (let* ((size     (shape-size shape))
-             (new-data (allocate-typed-vector dtype size))
              (new-strs (compute-strides shape))
              (rank     (vector-length shape)))
          (cond
@@ -1601,7 +2810,7 @@
           (else
            (%copy-concrete-array-slow data shape strides offset dtype new-data size)))
         (concrete-array new-data shape new-strs 0 dtype -1 batch-axis)))
-    (else (error "copy-concrete-array: not a concrete-array" m))))
+    (else (error "copy-concrete-array-into: not a concrete-array" m))))
 
 ;;; ============================================================
 ;;; Replay Plan: compile-time classification helpers
@@ -1610,40 +2819,10 @@
 ;;; inside compile-one-instruction and never during replay.
 ;;; ============================================================
 
-(define (trace-arr-row-major? m)
-  (cases array-morphism m
-    (concrete-array (_ shape strides offset _ _ _)
-      (and (= offset 0) (equal? strides (compute-strides shape))))
-    (else #f)))
-
 (define (trace-arr-shape m)
   (cases array-morphism m
     (concrete-array (_ shape _ _ _ _ _) shape)
     (else (error "trace-arr-shape: not concrete" m))))
-
-(define (flat-unary-eligible? out-shape in-traces)
-  (and (= (length in-traces) 1)
-       (trace-arr-row-major? (car in-traces))
-       (equal? (trace-arr-shape (car in-traces)) out-shape)))
-
-(define (flat-binary-eligible? out-shape in-traces)
-  (and (= (length in-traces) 2)
-       (trace-arr-row-major? (car  in-traces))
-       (trace-arr-row-major? (cadr in-traces))
-       (equal? (trace-arr-shape (car  in-traces)) out-shape)
-       (equal? (trace-arr-shape (cadr in-traces)) out-shape)))
-
-(define (flat-bias-broadcast-eligible? out-shape in-traces)
-  (and (= (length in-traces) 2)
-       (> (vector-length out-shape) 0)  ; bias-broadcast requires rank >= 1
-       (trace-arr-row-major? (car  in-traces))
-       (trace-arr-row-major? (cadr in-traces))
-       (equal? (trace-arr-shape (car in-traces)) out-shape)
-       (let* ((bias-shape (trace-arr-shape (cadr in-traces)))
-              (rank       (vector-length out-shape))
-              (N          (vector-ref out-shape (- rank 1))))
-         (and (= (vector-length bias-shape) 1)
-              (= (vector-ref bias-shape 0) N)))))
 
 
 ;; The (row-step col-step) pair of an operand of a broadcast binary op
@@ -1670,22 +2849,6 @@
       (list 0 1))
      (else #f))))
 
-;; The #(rsA csA rsB csB) steps of a binary op eligible for
-;; ri-flat-broadcast, or #f.
-(define (flat-broadcast-steps out-shape out-dtype in-traces)
-  (and (= (length in-traces) 2)
-       (> (vector-length out-shape) 0)
-       (memq out-dtype '(f32 f64))
-       (every (lambda (tr)
-                (and (trace-arr-row-major? tr)
-                     (cases array-morphism tr
-                       (concrete-array (_ _ _ _ dt _ _) (eq? dt out-dtype))
-                       (else #f))))
-              in-traces)
-       (let ((a (broadcast-steps out-shape (trace-arr-shape (car in-traces))))
-             (b (broadcast-steps out-shape (trace-arr-shape (cadr in-traces)))))
-         (and a b (list->vector (append a b))))))
-
 ;; Loops over the [M, N] output, storing (F A[..] B[..]) at each
 ;; element.  F is a flonum operator or a procedure; the element reads are
 ;; nested directly in the call so that the compiler can unbox them.
@@ -1698,15 +2861,6 @@
            (set! out (fx+ base j)
                  (f (ref dataA (fx+ a0 (fx* j csA)))
                     (ref dataB (fx+ b0 (fx* j csB)))))))))))
-
-;; The op name of a binding's combiner when it is the plain procedure
-;; of add, sub, mul or div (as for bindings that are not fused), else #f.
-(define (plain-binary-op combiner)
-  (cond ((eq? combiner +) 'add)
-        ((eq? combiner -) 'sub)
-        ((eq? combiner *) 'mul)
-        ((eq? combiner /) 'div)
-        (else #f)))
 
 ;; The operand mode of lookup-broadcast-kernel for the steps at
 ;; position K (0 for A, 2 for B) of a broadcast on N columns: 0 full,
@@ -1750,6 +2904,8 @@
       ((f64) (dispatch f64vector-ref f64vector-set!))
       (else (error "execute-flat-broadcast-compute: unsupported dtype" dtype)))))
 
+(include "segop-lower.scm")
+
 
 ;;; ============================================================
 ;;; Replay Plan: compile-replay-ref
@@ -1769,13 +2925,16 @@
 ;;; Replay Plan: compile-one-instruction
 ;;; ============================================================
 
-(define (compile-one-instruction b in-refs pool-idx trace-info-env constants)
+(define (compile-one-instruction b in-refs pool-idx trace-info-env constants
+                                 #!optional (extra-outs '()))
   "Compile one SSA binding into a replay-instruction.
    b:               ssa-binding
    in-refs:         list of replay-ref? (already compiled from inputs)
    pool-idx:        integer (physical buffer slot) or -1 (zero-copy)
    trace-info-env:  morph-env bid-sym -> (concrete-array . is-pool?)
-   constants:       hash-table cid-sym -> concrete-array"
+   constants:       hash-table cid-sym -> concrete-array
+   extra-outs:      for a fused binding with several outputs, the outputs
+                    after the first (see ri-segop)"
   (let* ((op        (ssa-binding-op b))
          (meta      (ssa-binding-meta b))
          (shape     (ssa-binding-shape b))
@@ -1796,30 +2955,27 @@
                                     (error "compile-one-instruction: no trace-info for input"
                                            bid))))))
 
-    ;; Extract index-fn from meta when present (morphism-to-ssa bindings),
-    ;; or rebuild the morphism with trace-time inputs to obtain it
-    ;; (VJP-emitted bindings whose meta never carries 'index-fn).
-    ;; rebuild-morphism can return morphism-expr (most ops) or reduction-morphism.
+    ;; The index function of b: from its meta when morphism-to-ssa stored
+    ;; one, else from the morphism rebuilt over the trace-time inputs (the
+    ;; bindings ssa-vjp emits carry none).
     (define (get-index-fn)
       (let ((ip (assq 'index-fn meta)))
         (if ip
             (cdr ip)
-            ;; Fused binding: (fused? . #t) + (combiner . proc); build compute-index-fn directly.
-            (let ((fp (assq 'fused? meta)))
-              (if fp
-                  (let ((cp (assq 'combiner meta)))
-                    (make-compute-index-fn
-                     (map (lambda (_) (lambda (idx) idx)) (ssa-binding-inputs b))
-                     (cdr cp)
-                     (map (lambda (_) shape) (ssa-binding-inputs b))))
-                  (let ((trace-inputs (map trace-arr-of (ssa-binding-inputs b))))
-                    (cases array-morphism (rebuild-morphism b trace-inputs)
-                      (morphism-expr (_ _ _ ifn _ _ _ _) ifn)
-                      (reduction-morphism (_ _ _ _ ifn _ _ _) ifn)
-                      (else (error "compile-one-instruction: rebuild-morphism returned unexpected type"
-                                   op meta)))))))))
+            (let ((trace-inputs (map trace-arr-of (ssa-binding-inputs b))))
+              (cases array-morphism (rebuild-morphism b trace-inputs)
+                (morphism-expr (_ _ _ ifn _ _ _ _) ifn)
+                (reduction-morphism (_ _ _ _ ifn _ _ _) ifn)
+                (else (error "compile-one-instruction: rebuild-morphism returned unexpected type"
+                             op meta)))))))
 
     (cond
+      ;; Fused binding: its template lowered against the trace-time inputs.
+      ((fused-binding? b)
+       (compile-fused-segop (fused-binding-template b)
+                            (map trace-arr-of (ssa-binding-inputs b))
+                            in-refs pool-idx extra-outs shape strides dtype))
+
       ;; Zero-copy view: any op where the trace did not allocate (counter not incremented).
       ;; Only transpose and reshape produce zero-copy views in practice.
       ((not is-pool?)
@@ -1830,311 +2986,64 @@
               (view-fn    (lambda (src) (create-view src index-fn shape batch-axis))))
          (ri-view view-fn (car in-refs))))
 
-      ;; matmul: use trace-time input arrays to determine BLAS variant once.
-      ;; morph-matmul uses (identity-fn) as a placeholder, so matmul can never
-      ;; use the ri-index path -- it always needs the BLAS/Scheme kernel dispatch.
-      ;; execute-blas-gemm/into! handles the row-major case; execute-blas-gemm-strided/into!
-      ;; handles transposed/non-contiguous inputs via a stride-aware Scheme triple loop.
+      ;; matmul: a seg-reduce over (M N K), routed to the BLAS backend through
+      ;; a gemm-plan prepared from the trace-time operand layouts (see
+      ;; lower-matmul-binding in segop-lower.scm).
+      ;; batch-matmul: a seg-reduce over the frame and (M N K), with one
+      ;; gemm-plan for every cell (see lower-batch-matmul-binding).
+      ((eq? op 'batch-matmul)
+       (or (compile-batch-matmul-segop (trace-arr-of (car  (ssa-binding-inputs b)))
+                                       (trace-arr-of (cadr (ssa-binding-inputs b)))
+                                       (car in-refs) (cadr in-refs) pool-idx shape strides dtype)
+           (error "compile-one-instruction: batch-matmul not BLAS-compatible"
+                  (ssa-binding-name b))))
+
+      ;; Scans: a seg-scan over the other axes and the scanned one (see
+      ;; lower-scan-binding).
+      ((eq? op 'scan)
+       (compile-scan-segop meta (map trace-arr-of (ssa-binding-inputs b)) in-refs
+                           pool-idx shape strides dtype))
+
       ((eq? op 'matmul)
-       (let* ((A-tr      (trace-arr-of (car  (ssa-binding-inputs b))))
-              (B-tr      (trace-arr-of (cadr (ssa-binding-inputs b))))
-              (blas-info (blas-compatible-operation? (morph-matmul A-tr B-tr))))
-         ;; The operand checks of the BLAS dispatch are done here, once,
-         ;; on the trace-time inputs, which have the shapes, strides and
-         ;; dtypes of the replay-time inputs.
-         (if blas-info
-             (case (car blas-info)
-               ((gemm-strided) (ri-gemm-strided pool-idx shape strides dtype
-                                                (car in-refs) (cadr in-refs)
-                                                (prepare-blas-gemm-strided/into A-tr B-tr)))
-               (else           (ri-gemm pool-idx shape strides dtype
-                                        (car in-refs) (cadr in-refs)
-                                        (prepare-blas-gemm/into A-tr B-tr))))
-             ;; Not compatible (shapes mismatch etc.) -- shouldn't reach here in practice.
-             (error "compile-one-instruction: matmul not BLAS-compatible" (ssa-binding-name b)))))
+       (or (compile-matmul-segop (trace-arr-of (car  (ssa-binding-inputs b)))
+                                 (trace-arr-of (cadr (ssa-binding-inputs b)))
+                                 (car in-refs) (cadr in-refs) pool-idx shape strides dtype)
+           (error "compile-one-instruction: matmul not BLAS-compatible" (ssa-binding-name b))))
 
       ;; Reductions: op is (list 'reduce rop).
       ;; VJP-emitted reduce has 'axes and 'keepdims? in meta but no 'index-fn;
       ;; get-index-fn handles both via rebuild-morphism.
       ((and (pair? op) (eq? (car op) 'reduce))
-       (let* ((rop       (cadr op))
-              (axes      (cdr (assq 'axes meta)))
-              (keepdims? (cdr (assq 'keepdims? meta)))
-              (rfn       (get-index-fn))
-              (reducer   (reduction-index-fn-reducer rfn))
-              (src-arr   (trace-arr-of (car (ssa-binding-inputs b))))
-              (src-dtype (cases array-morphism src-arr
-                           (concrete-array (_ _ _ _ d _ _) d)
-                           (else dtype))))
-         (ri-reduce pool-idx shape strides dtype src-dtype rop axes reducer keepdims?
-                    (car in-refs))))
+       (compile-reduction-segop (cadr op)
+                                (cdr (assq 'axes meta))
+                                (cdr (assq 'keepdims? meta))
+                                (trace-arr-of (car (ssa-binding-inputs b)))
+                                (car in-refs) pool-idx shape strides dtype
+                                (binding-frame-rank meta)))
 
-      ;; Fast im2col: extract kernel/stride/padding from morph meta; bake into ri-im2col.
-      ;; The morph meta carries kernel-size/stride/padding/spatial-output from im2col-morph.
-      ;; Source shape comes from the trace-time concrete-array for the input binding.
-      ((eq? op 'im2col)
-       (let* ((meta-ks  (cdr (assq 'kernel-size meta)))
-              (meta-st  (cdr (assq 'stride meta)))
-              (meta-pd  (cdr (assq 'padding meta)))
-              (meta-so  (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
-              (KH       (car  meta-ks)) (KW (cadr meta-ks))
-              (SH       (car  meta-st)) (SW (cadr meta-st))
-              (PH       (car  meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (src-arr  (trace-arr-of (car (ssa-binding-inputs b))))
-              (src-shape (cases array-morphism src-arr
-                           (concrete-array (_ s _ _ _ _ _) s)
-                           (else (error "compile-one-instruction im2col: source not concrete"
-                                        (ssa-binding-name b)))))
-              (rank     (vector-length src-shape))
-              (batched? (= rank 4))
-              (col-layout (cond (nhwc?    'nhwc-classic)
-                                (batched? 'nchw-classic)
-                                (else     'nchw-standard)))
-              (N        (if batched? (vector-ref src-shape 0) 1))
-              ;; For NHWC input [N,H,W,C]: C is at index 3, H at 1, W at 2
-              (C        (cond (nhwc?    (vector-ref src-shape 3))
-                              (batched? (vector-ref src-shape 1))
-                              (else     (vector-ref src-shape 0))))
-              (H        (cond (nhwc?    (vector-ref src-shape 1))
-                              (batched? (vector-ref src-shape 2))
-                              (else     (vector-ref src-shape 1))))
-              (W        (cond (nhwc?    (vector-ref src-shape 2))
-                              (batched? (vector-ref src-shape 3))
-                              (else     (vector-ref src-shape 2))))
-              (OH       (if meta-so (car  meta-so)
-                           (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
-              (OW       (if meta-so (cadr meta-so)
-                           (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW)))))
-         (ri-im2col pool-idx shape strides dtype
-                    (car in-refs) N C H W KH KW SH SW PH PW OH OW col-layout)))
+      ;; The convolution family: segops read through guarded maps, run by
+      ;; the convolution executors (see Convolutions in segop-lower.scm).
+      ((memq op '(im2col col2im conv2d-fwd conv2d-bwd-data conv2d-bwd-weights))
+       (compile-conv-segop op meta (map trace-arr-of (ssa-binding-inputs b)) in-refs
+                           pool-idx shape strides dtype))
 
-      ;; Fast col2im: VJP-emitted backward of im2col.
-      ;; Meta carries output-shape (= grad target shape), kernel-size, stride, padding.
-      ;; The output shape (= col2im output = im2col input gradient shape) is ssa-binding-shape.
-      ((eq? op 'col2im)
-       (let* ((meta-ks  (cdr (assq 'kernel-size meta)))
-              (meta-st  (cdr (assq 'stride meta)))
-              (meta-pd  (cdr (assq 'padding meta)))
-              (KH       (car  meta-ks)) (KW (cadr meta-ks))
-              (SH       (car  meta-st)) (SW (cadr meta-st))
-              (PH       (car  meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (rank     (vector-length shape))
-              (batched? (= rank 4))
-              (col-layout (cond (nhwc?    'nhwc-classic)
-                                (batched? 'nchw-classic)
-                                (else     'nchw-standard)))
-              (N        (if batched? (vector-ref shape 0) 1))
-              ;; For NHWC output [N,H,W,C]: C is at index 3, H at 1, W at 2
-              (C        (cond (nhwc?    (vector-ref shape 3))
-                              (batched? (vector-ref shape 1))
-                              (else     (vector-ref shape 0))))
-              (H        (cond (nhwc?    (vector-ref shape 1))
-                              (batched? (vector-ref shape 2))
-                              (else     (vector-ref shape 1))))
-              (W        (cond (nhwc?    (vector-ref shape 2))
-                              (batched? (vector-ref shape 3))
-                              (else     (vector-ref shape 2)))))
-         (ri-col2im pool-idx shape strides dtype
-                    (car in-refs) N C H W KH KW SH SW PH PW col-layout)))
-
-      ;; conv2d-fwd: fused im2col+GEMM+bias, no col buffer.
-      ;; inputs: [x-val, wt-val, b-val]; shape = [N*OH_OW, out_ch]
-      ((eq? op 'conv2d-fwd)
-       (let* ((meta-ks (cdr (assq 'kernel-size meta)))
-              (meta-st (cdr (assq 'stride meta)))
-              (meta-pd (cdr (assq 'padding meta)))
-              (meta-so (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
-              (KH (car meta-ks)) (KW (cadr meta-ks))
-              (SH (car meta-st)) (SW (cadr meta-st))
-              (PH (car meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (src-arr  (trace-arr-of (list-ref (ssa-binding-inputs b) 0)))
-              (src-shape (cases array-morphism src-arr
-                           (concrete-array (_ s _ _ _ _ _) s)
-                           (else (error "conv2d-fwd: src not concrete"
-                                        (ssa-binding-name b)))))
-              (rank     (vector-length src-shape))
-              (N   (if (= rank 4) (vector-ref src-shape 0) 1))
-              (C   (cond (nhwc?    (vector-ref src-shape 3))
-                         ((= rank 4) (vector-ref src-shape 1))
-                         (else       (vector-ref src-shape 0))))
-              (H   (cond (nhwc?    (vector-ref src-shape 1))
-                         ((= rank 4) (vector-ref src-shape 2))
-                         (else       (vector-ref src-shape 1))))
-              (W   (cond (nhwc?    (vector-ref src-shape 2))
-                         ((= rank 4) (vector-ref src-shape 3))
-                         (else       (vector-ref src-shape 2))))
-              (OH  (if meta-so (car  meta-so) (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
-              (OW  (if meta-so (cadr meta-so) (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW))))
-              (out-ch     (vector-ref shape 1))
-              (col-layout (if nhwc? 'nhwc-classic 'nchw-classic))
-              (col-buf    (allocate-typed-vector dtype (* N OH OW C KH KW))))
-         (ri-conv-fwd pool-idx shape strides dtype
-                      (car in-refs) (cadr in-refs) (caddr in-refs)
-                      col-buf
-                      N C H W KH KW SH SW PH PW OH OW out-ch col-layout)))
-
-      ;; conv2d-bwd-data: dX = scatter(g x WT), no col buffer.
-      ;; inputs: [g-val, wt-val]; shape = x-shape
-      ((eq? op 'conv2d-bwd-data)
-       (let* ((meta-ks (cdr (assq 'kernel-size meta)))
-              (meta-st (cdr (assq 'stride meta)))
-              (meta-pd (cdr (assq 'padding meta)))
-              (meta-so (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
-              (KH (car meta-ks)) (KW (cadr meta-ks))
-              (SH (car meta-st)) (SW (cadr meta-st))
-              (PH (car meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (rank     (vector-length shape))
-              (N   (if (= rank 4) (vector-ref shape 0) 1))
-              (C   (cond (nhwc?    (vector-ref shape 3))
-                         ((= rank 4) (vector-ref shape 1))
-                         (else       (vector-ref shape 0))))
-              (H   (cond (nhwc?    (vector-ref shape 1))
-                         ((= rank 4) (vector-ref shape 2))
-                         (else       (vector-ref shape 1))))
-              (W   (cond (nhwc?    (vector-ref shape 2))
-                         ((= rank 4) (vector-ref shape 3))
-                         (else       (vector-ref shape 2))))
-              (OH  (if meta-so (car  meta-so) (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
-              (OW  (if meta-so (cadr meta-so) (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW))))
-              (g-arr   (trace-arr-of (list-ref (ssa-binding-inputs b) 0)))
-              (g-shape (cases array-morphism g-arr
-                          (concrete-array (_ s _ _ _ _ _) s)
-                          (else (error "conv2d-bwd-data: g not concrete"))))
-              (out-ch     (vector-ref g-shape 1))
-              (col-layout (if nhwc? 'nhwc-classic 'nchw-classic))
-              (col-buf    (allocate-typed-vector dtype (* N OH OW C KH KW))))
-         (ri-conv-bwd-data pool-idx shape strides dtype
-                           (car in-refs) (cadr in-refs)
-                           col-buf
-                           N C H W KH KW SH SW PH PW OH OW out-ch col-layout)))
-
-      ;; conv2d-bwd-weights: dWT = outer product, no col buffer.
-      ;; inputs: [g-val, x-val]; shape = wt-shape [fan_in, out_ch]
-      ((eq? op 'conv2d-bwd-weights)
-       (let* ((meta-ks (cdr (assq 'kernel-size meta)))
-              (meta-st (cdr (assq 'stride meta)))
-              (meta-pd (cdr (assq 'padding meta)))
-              (meta-so (let ((p (assq 'spatial-output meta))) (and p (cdr p))))
-              (KH (car meta-ks)) (KW (cadr meta-ks))
-              (SH (car meta-st)) (SW (cadr meta-st))
-              (PH (car meta-pd)) (PW (cadr meta-pd))
-              (nhwc?    (let ((p (assq 'layout meta))) (and p (eq? (cdr p) 'nhwc))))
-              (src-arr  (trace-arr-of (list-ref (ssa-binding-inputs b) 1)))
-              (src-shape (cases array-morphism src-arr
-                            (concrete-array (_ s _ _ _ _ _) s)
-                            (else (error "conv2d-bwd-weights: src not concrete"))))
-              (rank     (vector-length src-shape))
-              (N   (if (= rank 4) (vector-ref src-shape 0) 1))
-              (C   (cond (nhwc?    (vector-ref src-shape 3))
-                         ((= rank 4) (vector-ref src-shape 1))
-                         (else       (vector-ref src-shape 0))))
-              (H   (cond (nhwc?    (vector-ref src-shape 1))
-                         ((= rank 4) (vector-ref src-shape 2))
-                         (else       (vector-ref src-shape 1))))
-              (W   (cond (nhwc?    (vector-ref src-shape 2))
-                         ((= rank 4) (vector-ref src-shape 3))
-                         (else       (vector-ref src-shape 2))))
-              (OH  (if meta-so (car  meta-so) (+ 1 (quotient (+ H (* 2 PH) (- KH)) SH))))
-              (OW  (if meta-so (cadr meta-so) (+ 1 (quotient (+ W (* 2 PW) (- KW)) SW))))
-              (g-arr   (trace-arr-of (list-ref (ssa-binding-inputs b) 0)))
-              (g-shape (cases array-morphism g-arr
-                          (concrete-array (_ s _ _ _ _ _) s)
-                          (else (error "conv2d-bwd-weights: g not concrete"))))
-              (out-ch     (vector-ref g-shape 1))
-              (col-layout (if nhwc? 'nhwc-classic 'nchw-classic))
-              (col-buf    (allocate-typed-vector dtype (* N OH OW C KH KW))))
-         (ri-conv-bwd-weights pool-idx shape strides dtype
-                              (car in-refs) (cadr in-refs)
-                              col-buf
-                              N C H W KH KW SH SW PH PW OH OW out-ch col-layout)))
-
-      ;; Element-wise and all other pool-backed ops.
-      ;; VJP-emitted bindings have empty meta; get-index-fn rebuilds via trace inputs.
-      ;; classify once at compile time into flat fast-paths or generic ri-index fallback.
+      ;; Element-wise ops, materialized affine views and all other
+      ;; pool-backed ops.  VJP-emitted bindings have empty meta; get-index-fn
+      ;; rebuilds via trace inputs.  Each binding is lowered to a segop
+      ;; once, at compile time; an index function with no segop form runs on
+      ;; the host through execute-index-fn.
       (else
        (let* ((index-fn  (get-index-fn))
               (in-traces (map trace-arr-of (ssa-binding-inputs b))))
-         (cond
-           ;; Non-compute index-fns (affine, window, etc.): generic path
-           ((not (compute-index-fn? index-fn))
-            (ri-index pool-idx shape strides dtype index-fn in-refs))
-
-           ;; Activation op, unary, row-major, same shape.  Fused bindings are
-           ;; excluded: they keep the consumer's op name but carry a composed
-           ;; combiner, so the op's own kernel would compute the wrong function.
-           ((and (activation-op-registered? op)
-                 (not (assq 'fused? meta))
-                 (flat-unary-eligible? shape in-traces))
-            (ri-activation-unary pool-idx shape strides dtype op
-                                 (compute-index-fn-combiner index-fn)
-                                 (car in-refs)))
-
-           ;; Fast path 1: unary, row-major, same shape
-           ((flat-unary-eligible? shape in-traces)
-            (ri-flat-unary pool-idx shape strides dtype
-                           (compute-index-fn-combiner index-fn)
-                           (car in-refs)))
-
-           ;; Registered binary op, both operands row-major with the
-           ;; output's shape.  Fused bindings are excluded, as for
-           ;; activations.
-           ((and (binary-op-registered? op)
-                 (not (assq 'fused? meta))
-                 (flat-binary-eligible? shape in-traces))
-            (ri-activation-binary pool-idx shape strides dtype op
-                                  (compute-index-fn-combiner index-fn)
-                                  (car in-refs) (cadr in-refs)))
-
-           ;; Fast path 2: binary, both row-major, same shape
-           ((flat-binary-eligible? shape in-traces)
-            (ri-flat-binary pool-idx shape strides dtype
-                            (compute-index-fn-combiner index-fn)
-                            (car in-refs) (cadr in-refs)))
-
-           ;; Fast path 3: bias broadcast [B*N] + [N]
-           ((flat-bias-broadcast-eligible? shape in-traces)
-            (let* ((rank (vector-length shape))
-                   (N    (vector-ref shape (- rank 1))))
-              (ri-flat-bias-broadcast pool-idx shape strides dtype
-                                      (compute-index-fn-combiner index-fn)
-                                      N
-                                      (car in-refs) (cadr in-refs))))
-
-           ;; Fast path 5: three operands, row-major with the output's shape
-           ((and (= (length in-traces) 3)
-                 (memq dtype '(f32 f64))
-                 (every (lambda (tr)
-                          (and (trace-arr-row-major? tr)
-                               (equal? (trace-arr-shape tr) shape)
-                               (cases array-morphism tr
-                                 (concrete-array (_ _ _ _ dt _ _) (eq? dt dtype))
-                                 (else #f))))
-                        in-traces))
-            (ri-flat-ternary pool-idx shape strides dtype
-                             (compute-index-fn-combiner index-fn)
-                             (car in-refs) (cadr in-refs) (caddr in-refs)))
-
-           ;; Fast path 4: binary with a row, column or scalar broadcast
-           ((flat-broadcast-steps shape dtype in-traces)
-            => (lambda (steps)
-                 (let* ((rank (vector-length shape))
-                        (N    (vector-ref shape (- rank 1))))
-                   (ri-flat-broadcast pool-idx shape strides dtype
-                                      (compute-index-fn-combiner index-fn)
-                                      (if (and (memq op '(add sub mul div pow))
-                                               (not (assq 'fused? meta)))
-                                          op
-                                          'generic)
-                                      (quotient (shape-size shape) N) N steps
-                                      (car in-refs) (cadr in-refs)))))
-
-           ;; Generic fallback: compute-index-fn with non-trivial layout
-           (else
-            (ri-index pool-idx shape strides dtype index-fn in-refs))))))))
+         (or (cond
+              ((compute-index-fn? index-fn)
+               (compile-elementwise-segop b (compute-index-fn-combiner index-fn)
+                                          in-traces in-refs pool-idx shape strides dtype))
+              ((and (affine-index-fn? index-fn) (= (length in-traces) 1))
+               (compile-affine-segop index-fn (car in-traces) (car in-refs)
+                                     pool-idx shape strides dtype))
+              (else #f))
+             (compile-host-segop index-fn in-traces in-refs pool-idx shape strides dtype)))))))
 
 
 ;;; ============================================================
@@ -2151,152 +3060,83 @@
          (constants   (ssa-program-constants prog))
          (trace-info  (ssa-program-trace-info prog))
          (plan-vec    (make-vector n #f))
-         ;; Map binding name -> 0-based position in bindings list
+         ;; Map binding name -> 0-based position in bindings list.  The
+         ;; outputs after the first of fused bindings take the positions
+         ;; after the bindings'.
          (name->pos-eb (let ((eb (make-env-builder)))
                          (let loop ((bs bindings) (i 0))
                            (unless (null? bs)
                              (env-builder-extend! eb (ssa-binding-name (car bs)) i)
                              (loop (cdr bs) (+ i 1))))
-                         eb)))
-    ;; Detect GEMM bindings whose only consumer is an adjacent element-wise
-    ;; binding that compiles to a flat fast-path instruction.
-    ;; When found, pre-compile ri-gemm-epilogue for the GEMM position and
-    ;; arrange for ri-alias at the epilogue position.
-    (define use-counts (ssa-compute-use-counts bindings))
-    ;; Pool slot holding the value of binding input v at replay time, or #f
-    ;; for constants and values without a slot.  A view shares the
-    ;; allocation id, and so the slot, of the array it views.
-    (define (input-pool-idx v)
-      (cases ssa-value v
-        (binding-ref (bid)
-          (let ((info (morph-env-lookup trace-info bid)))
-            (and info
-                 (let ((aid (concrete-alloc-id (car info))))
-                   (and (>= aid 0) (context-alloc->pool-idx ctx aid))))))
-        (else #f)))
-    ;; Trace-time array of binding input v: the recorded result of the
-    ;; binding it refers to, or the constant itself.
-    (define (trace-input-arr v)
-      (cases ssa-value v
-        (binding-ref (bid)
-          (car (or (morph-env-lookup trace-info bid)
-                   (error "compile-replay-plan: no trace-info for input" bid))))
-        (const-ref (cid) (hash-table-ref constants cid))))
-    (define gemm-epilogue-eb (make-env-builder))  ;; g.name -> ri-gemm-epilogue
-    (define epilogue-gemm-eb (make-env-builder))  ;; e.name -> g's position index
-    (let lp ((bs bindings) (i 0))
-      (when (and (pair? bs) (pair? (cdr bs)))
-        (let ((g (car bs)) (e (cadr bs)))
-          (when (and (eq? (ssa-binding-op g) 'matmul)
-                     (= 1 (hash-table-ref/default use-counts (ssa-binding-name g) 0))
-                     (let ((in0 (and (pair? (ssa-binding-inputs e))
-                                     (car (ssa-binding-inputs e)))))
-                       (cases ssa-value in0
-                         (binding-ref (bid) (eq? bid (ssa-binding-name g)))
-                         (else #f)))
-                     (ssa-binding-elementwise? e))
-            ;; Try to compile e as a flat instruction
-            (let* ((e-in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
-                                    (ssa-binding-inputs e)))
-                   (e-info     (or (morph-env-lookup trace-info (ssa-binding-name e))
-                        (error "compile-replay-plan: no trace-info for epilogue binding"
-                               (ssa-binding-name e))))
-                   (e-pool-idx (if (cdr e-info)
-                                   (context-alloc->pool-idx ctx (concrete-alloc-id (car e-info)))
-                                   -1))
-                   (e-instr    (compile-one-instruction e e-in-refs e-pool-idx
-                                                        trace-info constants))
-                   ;; g's pool-idx and refs for the GEMM part
-                   (g-info     (or (morph-env-lookup trace-info (ssa-binding-name g))
-                       (error "compile-replay-plan: no trace-info for gemm binding"
-                              (ssa-binding-name g))))
-                   (g-pool-idx (if (cdr g-info)
-                                   (context-alloc->pool-idx ctx (concrete-alloc-id (car g-info)))
-                                   -1))
-                   (g-in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
-                                    (ssa-binding-inputs g)))
-                   (g-shape    (ssa-binding-shape g))
-                   (g-strides  (compute-strides g-shape))
-                   (g-dtype    (ssa-binding-dtype g))
-                   ;; The fused GEMM runs through execute-blas-gemm-strided/into!;
-                   ;; its operand checks are done once here, on the trace-time inputs.
-                   (g-plan     (let ((ins (ssa-binding-inputs g)))
-                                 (prepare-blas-gemm-strided/into
-                                  (trace-input-arr (car ins))
-                                  (trace-input-arr (cadr ins))))))
-              ;; The fused instruction writes the product straight into e's
-              ;; slot while it still reads g's inputs.  The trace allocated
-              ;; e's slot only after g had run, so it may be the slot of one
-              ;; of g's inputs; the pair is then left unfused.
-              (unless (memv e-pool-idx (filter-map input-pool-idx (ssa-binding-inputs g)))
-              (cases replay-instruction e-instr
-                (ri-flat-unary (_ _ _ _ e-comb _)
-                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
-                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
-                                      (car g-in-refs) (cadr g-in-refs)
-                                      'unary e-comb 0 (rr-val 0) g-plan))
-                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
-                ;; An activation directly after its GEMM stays a combiner
-                ;; epilogue applied in place to the GEMM output.
-                (ri-activation-unary (_ _ _ _ _ e-comb _)
-                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
-                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
-                                      (car g-in-refs) (cadr g-in-refs)
-                                      'unary e-comb 0 (rr-val 0) g-plan))
-                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
-                (ri-flat-bias-broadcast (_ _ _ _ e-comb N _ e-in-B)
-                  (env-builder-extend! gemm-epilogue-eb (ssa-binding-name g)
-                    (ri-gemm-epilogue e-pool-idx g-shape g-strides g-dtype
-                                      (car g-in-refs) (cadr g-in-refs)
-                                      'bias-broadcast e-comb N e-in-B g-plan))
-                  (env-builder-extend! epilogue-gemm-eb (ssa-binding-name e) i))
-                (else #f))))))
-        (lp (cdr bs) (+ i 1))))
-
-    (let loop ((bs bindings) (i 0))
+                         (let loop ((bs bindings) (j n))
+                           (unless (null? bs)
+                             (loop (cdr bs)
+                                   (if (fused-binding? (car bs))
+                                       (fold (lambda (o j)
+                                               (env-builder-extend! eb (fused-out-name o) j)
+                                               (+ j 1))
+                                             j (cdr (fused-binding-outs (car bs))))
+                                       j))))
+                         eb))
+         (plan-ctx    (make-segop-plan-context)))
+    (parameterize ((segop-plan-context plan-ctx))
+     (let loop ((bs bindings) (i 0))
       (unless (null? bs)
         (let* ((b     (car bs))
                (bname (ssa-binding-name b))
                (instr
-                (cond
-                  ;; GEMM with epilogue: use pre-compiled ri-gemm-epilogue
-                  ((env-builder-lookup gemm-epilogue-eb bname) => (lambda (ri) ri))
-                  ;; Epilogue position: the GEMM already applied it in-place
-                  ((env-builder-lookup epilogue-gemm-eb bname) =>
-                   (lambda (g-pos)
-                     (let* ((info     (or (morph-env-lookup trace-info bname)
-                                          (error "compile-replay-plan: no trace-info for alias"
-                                                 bname)))
-                            (pool-idx (if (cdr info)
-                                          (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
-                                          -1))
-                            (shape    (ssa-binding-shape b))
-                            (strides  (compute-strides shape))
-                            (dtype    (ssa-binding-dtype b)))
-                       (ri-alias pool-idx shape strides dtype (rr-val g-pos)))))
-                  ;; Normal path
-                  (else
-                   (let* ((in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
-                                         (ssa-binding-inputs b)))
-                          (info     (or (morph-env-lookup trace-info bname)
-                                        (error "compile-replay-plan: no trace-info for binding"
-                                               bname)))
-                          (is-pool? (cdr info))
-                          (pool-idx (if is-pool?
-                                        (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
-                                        -1)))
-                     (compile-one-instruction b in-refs pool-idx trace-info constants))))))
+                (let* ((in-refs  (map (lambda (v) (compile-replay-ref v name->pos-eb))
+                                      (ssa-binding-inputs b)))
+                       (info     (or (morph-env-lookup trace-info bname)
+                                     (error "compile-replay-plan: no trace-info for binding"
+                                            bname)))
+                       (is-pool? (cdr info))
+                       (pool-idx (if is-pool?
+                                     (context-alloc->pool-idx ctx (concrete-alloc-id (car info)))
+                                     -1))
+                       (extra-outs
+                        (if (fused-binding? b)
+                            (map (lambda (o)
+                                   (let* ((name  (fused-out-name o))
+                                          (oinfo (or (morph-env-lookup trace-info name)
+                                                     (error "compile-replay-plan: no trace-info for output"
+                                                            name)))
+                                          (shape (fused-out-shape o)))
+                                     (vector (env-builder-lookup name->pos-eb name)
+                                             (context-alloc->pool-idx
+                                              ctx (concrete-alloc-id (car oinfo)))
+                                             shape (compute-strides shape) (fused-out-dtype o))))
+                                 (cdr (fused-binding-outs b)))
+                            '())))
+                  (compile-one-instruction b in-refs pool-idx trace-info constants
+                                           extra-outs))))
           (vector-set! plan-vec i instr)
-          (loop (cdr bs) (+ i 1)))))
+          (loop (cdr bs) (+ i 1))))))
+    ;; Every instruction is compiled; the plan finalizers complete what the
+    ;; backends left for the whole plan (see segop-plan-add-finalizer!).
+    (ssa-program-plan-notes-set! prog (segop-plan-finalize! plan-ctx))
 
     ;; Pre-compute output specs to eliminate name->idx hash-table rebuild per replay step.
-    ;; Each spec is either an integer (0-based position in vals for binding-refs)
-    ;; or a concrete-array (the constant value itself for const-refs).
+    ;; Each spec is one of
+    ;;   an integer       the 0-based position in vals of a binding-ref output;
+    ;;   (pos . buffer)   the same for an output that the trace produced as a
+    ;;                    strided view, with a buffer of the plan that each
+    ;;                    replay copies it into in row-major order;
+    ;;   a concrete-array the constant value itself, for const-refs.
     (let ((output-specs
            (map (lambda (ov)
                   (cases ssa-value ov
-                    (binding-ref (bid) (or (env-builder-lookup name->pos-eb bid)
-                                           (error "compile-replay-plan: output binding not found" bid)))
+                    (binding-ref (bid)
+                      (let ((pos  (or (env-builder-lookup name->pos-eb bid)
+                                      (error "compile-replay-plan: output binding not found" bid)))
+                            (info (morph-env-lookup trace-info bid)))
+                        (if (and info (concrete-array? (car info))
+                                 (not (concrete-row-major? (car info))))
+                            (cases array-morphism (car info)
+                              (concrete-array (_ shape _ _ dtype _ _)
+                                (cons pos (allocate-typed-vector dtype (shape-size shape))))
+                              (else pos))
+                            pos)))
                     (const-ref   (cid) (hash-table-ref constants cid))))
                 (ssa-program-outputs prog))))
       (ssa-program-output-specs-set! prog output-specs))
@@ -2360,7 +3200,14 @@
    Returns:   vector of concrete-array, one per binding position."
   (let* ((n         (vector-length plan))
          (pool-bufs (buffer-pool-buffers pool))
-         (vals      (make-vector n #f))
+         ;; one value per instruction, then the outputs after the first of
+         ;; the segops with several outputs
+         (n-vals    (do ((i 0 (+ i 1))
+                         (m n (cases replay-instruction (vector-ref plan i)
+                                (ri-segop (_ _ _ _ _ _ _ extra-outs) (+ m (length extra-outs)))
+                                (else m))))
+                        ((= i n) m)))
+         (vals      (make-vector n-vals #f))
          ;; alloc-ctr mirrors the trace-time context counter so that pool-backed
          ;; bindings get the same alloc-id here as they did during the trace run.
          ;; Zero-copy (ri-view) bindings don't increment this, matching the trace.
@@ -2391,303 +3238,28 @@
               (cases replay-instruction instr
 
 
-                (ri-gemm (pool-idx shape strides dtype A-ref B-ref plan)
-                  (time-instr 'ri-gemm
-                    (let ((buf (vector-ref pool-bufs pool-idx)))
-                      (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
-                      (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-gemm-strided (pool-idx shape strides dtype A-ref B-ref plan)
-                  (time-instr 'ri-gemm-strided
-                    (let ((buf (vector-ref pool-bufs pool-idx)))
-                      (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
-                      (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-index (pool-idx shape strides dtype index-fn in-refs)
-                  (time-instr 'ri-index
-                    (let ((buf (vector-ref pool-bufs pool-idx)))
-                      (execute-index-fn index-fn buf shape (map deref in-refs) dtype)
-                      (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-reduce (pool-idx shape strides dtype src-dtype rop axes reducer keepdims? in-ref)
-                  (time-instr 'ri-reduce
-                    (let* ((src (deref in-ref))
-                           (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism src
-                        (concrete-array (src-data src-shape src-strides src-offset _ _ _)
-                          (execute-reduction-morphism
-                           rop buf shape
-                           src-data src-shape src-strides src-offset
-                           axes reducer keepdims? dtype src-dtype)
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else
-                         (error "execute-replay-plan ri-reduce: source not concrete" src))))))
-
                 (ri-view (view-fn in-ref)
                   (time-instr 'ri-view
                     (view-fn (deref in-ref))))
 
-                (ri-flat-unary (pool-idx shape strides dtype combiner in-A)
-                  (time-instr 'ri-flat-unary
-                    (let* ((src  (deref in-A))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism src
-                        (concrete-array (data _ _ _ src-dtype _ _)
-                          (execute-flat-unary-compute combiner data src-dtype buf size dtype)
+                (ri-segop (pool-idx shape strides dtype sg executor tag extra-outs)
+                  (time-instr tag
+                    (if (null? extra-outs)
+                        (begin
+                          (executor deref (vector-ref pool-bufs pool-idx))
                           (make-pool-arr pool-idx shape strides dtype))
-                        (else (error "ri-flat-unary: source not concrete" src))))))
-
-                (ri-activation-unary (pool-idx shape strides dtype op combiner in-A)
-                  (time-instr 'ri-activation-unary
-                    (let* ((src  (deref in-A))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism src
-                        (concrete-array (data _ _ _ src-dtype _ _)
-                          (execute-activation-unary-compute op combiner data src-dtype
-                                                            buf size dtype)
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else (error "ri-activation-unary: source not concrete" src))))))
-
-                (ri-flat-binary (pool-idx shape strides dtype combiner in-A in-B)
-                  (time-instr 'ri-flat-binary
-                    (let* ((A    (deref in-A))
-                           (B    (deref in-B))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism A
-                        (concrete-array (data1 _ _ _ src-dtype1 _ _)
-                          (cases array-morphism B
-                            (concrete-array (data2 _ _ _ src-dtype2 _ _)
-                              (execute-flat-binary-compute combiner data1 src-dtype1 data2 src-dtype2 buf size dtype)
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-flat-binary: B not concrete" B))))
-                        (else (error "ri-flat-binary: A not concrete" A))))))
-
-                (ri-activation-binary (pool-idx shape strides dtype op combiner in-A in-B)
-                  (time-instr 'ri-activation-binary
-                    (let* ((A    (deref in-A))
-                           (B    (deref in-B))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism A
-                        (concrete-array (data1 _ _ _ src-dtype1 _ _)
-                          (cases array-morphism B
-                            (concrete-array (data2 _ _ _ src-dtype2 _ _)
-                              (execute-activation-binary-compute op combiner data1 src-dtype1
-                                                                 data2 src-dtype2 buf size dtype)
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-activation-binary: B not concrete" B))))
-                        (else (error "ri-activation-binary: A not concrete" A))))))
-
-                (ri-flat-bias-broadcast (pool-idx shape strides dtype combiner N in-A in-B)
-                  (time-instr 'ri-flat-bias-broadcast
-                    (let* ((A    (deref in-A))
-                           (B    (deref in-B))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (size (shape-size shape)))
-                      (cases array-morphism A
-                        (concrete-array (data1 _ _ _ _ _ _)
-                          (cases array-morphism B
-                            (concrete-array (data2 _ _ _ _ _ _)
-                              (let ((kernel (and (memq dtype '(f32 f64))
-                                                 (plain-binary-op combiner)
-                                                 (lookup-broadcast-kernel
-                                                  (active-activation-backend)
-                                                  (plain-binary-op combiner) dtype))))
-                                (if (and kernel (> N 0) (> size 0))
-                                    (kernel (quotient size N) N data1 0 data2 2 buf)
-                                    (execute-flat-bias-broadcast-compute combiner data1 data2
-                                                                         buf size N dtype)))
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-flat-bias-broadcast: B not concrete" B))))
-                        (else (error "ri-flat-bias-broadcast: A not concrete" A))))))
-
-                (ri-flat-ternary (pool-idx shape strides dtype combiner in-A in-B in-C)
-                  (time-instr 'ri-flat-ternary
-                    (let ((buf  (vector-ref pool-bufs pool-idx))
-                          (size (shape-size shape))
-                          (data-of (lambda (ref)
-                                     (cases array-morphism (deref ref)
-                                       (concrete-array (d _ _ _ _ _ _) d)
-                                       (else (error "ri-flat-ternary: operand not concrete"))))))
-                      (let ((a (data-of in-A)) (b (data-of in-B)) (c (data-of in-C)))
-                        (case dtype
-                          ((f32) (do ((i 0 (fx+ i 1))) ((fx= i size))
-                                   (f32vector-set! buf i (exact->inexact
-                                                          (combiner (f32vector-ref a i)
-                                                                    (f32vector-ref b i)
-                                                                    (f32vector-ref c i))))))
-                          (else (do ((i 0 (fx+ i 1))) ((fx= i size))
-                                  (f64vector-set! buf i (exact->inexact
-                                                         (combiner (f64vector-ref a i)
-                                                                   (f64vector-ref b i)
-                                                                   (f64vector-ref c i))))))))
-                      (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-flat-broadcast (pool-idx shape strides dtype combiner op-kind M N steps in-A in-B)
-                  (time-instr 'ri-flat-broadcast
-                    (let ((A   (deref in-A))
-                          (B   (deref in-B))
-                          (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism A
-                        (concrete-array (data1 _ _ _ _ _ _)
-                          (cases array-morphism B
-                            (concrete-array (data2 _ _ _ _ _ _)
-                              (let ((kernel (and (memq op-kind '(add sub mul div))
-                                                 (lookup-broadcast-kernel
-                                                  (active-activation-backend) op-kind dtype))))
-                                (if kernel
-                                    (kernel M N data1 (broadcast-mode steps 0 N)
-                                            data2 (broadcast-mode steps 2 N) buf)
-                                    (execute-flat-broadcast-compute combiner op-kind data1 data2
-                                                                    buf M N steps dtype)))
-                              (make-pool-arr pool-idx shape strides dtype))
-                            (else (error "ri-flat-broadcast: B not concrete" B))))
-                        (else (error "ri-flat-broadcast: A not concrete" A))))))
-
-                (ri-gemm-epilogue (pool-idx shape strides dtype A-ref B-ref
-                                   epilogue-kind epilogue-comb epilogue-N bias-ref plan)
-                  (time-instr 'ri-gemm-epilogue
-                    (let* ((buf (vector-ref pool-bufs pool-idx))
-                           (sz  (shape-size shape)))
-                      (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
-                      (case epilogue-kind
-                        ((unary)
-                         (execute-flat-unary-compute-inplace! epilogue-comb buf sz dtype))
-                        ((bias-broadcast)
-                         (cases array-morphism (deref bias-ref)
-                           (concrete-array (bias-data _ _ _ _ _ _)
-                             (execute-flat-bias-broadcast-inplace!
-                              epilogue-comb buf bias-data sz epilogue-N dtype))
-                           (else (error "ri-gemm-epilogue: bias not concrete"))))
-                        (else (error "ri-gemm-epilogue: unknown epilogue-kind" epilogue-kind)))
-                      (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-alias (pool-idx shape strides dtype in-ref)
-                  ;; The epilogue was applied in-place by the preceding ri-gemm-epilogue.
-                  ;; Advance alloc-ctr to stay in sync with trace-time pool allocation,
-                  ;; then return the GEMM result (already epilogue-applied) with the
-                  ;; correct alloc-id for this binding position.
-                  (let* ((src (deref in-ref))
-                         (aid alloc-ctr))
-                    (set! alloc-ctr (+ alloc-ctr 1))
-                    (cases array-morphism src
-                      (concrete-array (src-data _ _ _ _ _ _)
-                        (concrete-array src-data shape strides 0 dtype aid -1))
-                      (else (error "ri-alias: source not concrete" src)))))
-
-                (ri-im2col (pool-idx shape strides dtype src-ref
-                             N C H W KH KW SH SW PH PW OH OW col-layout)
-                  (time-instr 'ri-im2col
-                    (let* ((src (deref src-ref))
-                           (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism src
-                        (concrete-array (_ _ _ _ _ _ _)
-                          (let ((src-data (concrete-data/row-major src)))
-                          (case col-layout
-                            ((nchw-standard)
-                             (execute-im2col-unbatched buf src-data C H W KH KW SH SW PH PW OH OW dtype))
-                            ((nchw-classic)
-                             (execute-im2col-batched buf src-data N C H W KH KW SH SW PH PW OH OW dtype))
-                            ((nhwc-classic)
-                             (execute-im2col-nhwc-classic buf src-data N C H W KH KW SH SW PH PW OH OW dtype))
-                            (else (error "ri-im2col: unknown col-layout" col-layout))))
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else (error "ri-im2col: source not concrete" src))))))
-
-                (ri-col2im (pool-idx shape strides dtype col-ref
-                             N C H W KH KW SH SW PH PW col-layout)
-                  (time-instr 'ri-col2im
-                    (let* ((col (deref col-ref))
-                           (buf (vector-ref pool-bufs pool-idx)))
-                      (cases array-morphism col
-                        (concrete-array (_ col-shape _ _ _ _ _)
-                          (let ((col-data (concrete-data/row-major col)))
-                          (case col-layout
-                            ((nchw-standard)
-                             (execute-col2im-unbatched buf shape col-data col-shape KH KW SH SW PH PW dtype))
-                            ((nchw-classic)
-                             (execute-col2im-batched buf shape col-data col-shape KH KW SH SW PH PW dtype))
-                            ((nhwc-classic)
-                             (execute-col2im-nhwc-classic buf shape col-data col-shape KH KW SH SW PH PW dtype))
-                            (else (error "ri-col2im: unknown col-layout" col-layout))))
-                          (make-pool-arr pool-idx shape strides dtype))
-                        (else (error "ri-col2im: col not concrete" col))))))
-
-                (ri-conv-fwd (pool-idx shape strides dtype src-ref wt-ref b-ref col-buf
-                              N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
-                  (time-instr 'ri-conv-fwd
-                    (let* ((src  (deref src-ref)) (wt (deref wt-ref)) (b (deref b-ref))
-                           (buf  (vector-ref pool-bufs pool-idx))
-                           (src-d (concrete-data/row-major src))
-                           (wt-d  (concrete-data/row-major wt))
-                           (b-d   (concrete-data/row-major b)))
-                                  (if (and (blas-enabled?) (blas-available?))
-                                      (case col-layout
-                                        ((nchw-classic)
-                                         (execute-conv-fwd-blas buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                        ((nhwc-classic)
-                                         (execute-conv-fwd-nhwc-blas buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                        (else (error "ri-conv-fwd: unknown layout" col-layout)))
-                                      (case col-layout
-                                        ((nchw-classic)
-                                         (execute-conv-fwd-nchw buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                        ((nhwc-classic)
-                                         (execute-conv-fwd-nhwc buf src-d wt-d b-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                        (else (error "ri-conv-fwd: unknown layout" col-layout))))
-                                  (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-conv-bwd-data (pool-idx shape strides dtype g-ref wt-ref col-buf
-                                   N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
-                  (time-instr 'ri-conv-bwd-data
-                    (let* ((g  (deref g-ref)) (wt (deref wt-ref))
-                           (buf (vector-ref pool-bufs pool-idx))
-                           (g-shape (cases array-morphism g
-                                      (concrete-array (_ s _ _ _ _ _) s)
-                                      (else (error "ri-conv-bwd-data: g not concrete"))))
-                           (g-d  (concrete-data/row-major g))
-                           (wt-d (concrete-data/row-major wt)))
-                              (if (and (blas-enabled?) (blas-available?))
-                                  (case col-layout
-                                    ((nchw-classic)
-                                     (execute-conv-bwd-data-blas buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                    ((nhwc-classic)
-                                     (execute-conv-bwd-data-nhwc-blas buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                    (else (error "ri-conv-bwd-data: unknown layout" col-layout)))
-                                  (case col-layout
-                                    ((nchw-classic)
-                                     (execute-conv-bwd-data-nchw buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                    ((nhwc-classic)
-                                     (execute-conv-bwd-data-nhwc buf shape g-d g-shape wt-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                    (else (error "ri-conv-bwd-data: unknown layout" col-layout))))
-                              (make-pool-arr pool-idx shape strides dtype))))
-
-                (ri-conv-bwd-weights (pool-idx shape strides dtype g-ref src-ref col-buf
-                                      N C H W KH KW SH SW PH PW OH OW out-ch col-layout)
-                  (time-instr 'ri-conv-bwd-weights
-                    (let* ((g   (deref g-ref)) (src (deref src-ref))
-                           (buf (vector-ref pool-bufs pool-idx))
-                           (g-shape (cases array-morphism g
-                                      (concrete-array (_ s _ _ _ _ _) s)
-                                      (else (error "ri-conv-bwd-weights: g not concrete"))))
-                           (g-d   (concrete-data/row-major g))
-                           (src-d (concrete-data/row-major src)))
-                              (if (and (blas-enabled?) (blas-available?))
-                                  (case col-layout
-                                    ((nchw-classic)
-                                     (execute-conv-bwd-weights-blas buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                    ((nhwc-classic)
-                                     (execute-conv-bwd-weights-nhwc-blas buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype col-buf))
-                                    (else (error "ri-conv-bwd-weights: unknown layout" col-layout)))
-                                  (case col-layout
-                                    ((nchw-classic)
-                                     (execute-conv-bwd-weights-nchw buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                    ((nhwc-classic)
-                                     (execute-conv-bwd-weights-nhwc buf shape g-d g-shape src-d N C H W KH KW SH SW PH PW OH OW out-ch dtype))
-                                    (else (error "ri-conv-bwd-weights: unknown layout" col-layout))))
-                              (make-pool-arr pool-idx shape strides dtype))))
+                        ;; the outputs take alloc-ids in order, as in the trace
+                        (begin
+                          (executor deref (vector-ref pool-bufs pool-idx)
+                                    (map (lambda (e) (vector-ref pool-bufs (vector-ref e 1)))
+                                         extra-outs))
+                          (let ((first (make-pool-arr pool-idx shape strides dtype)))
+                            (for-each (lambda (e)
+                                        (vector-set! vals (vector-ref e 0)
+                                                     (make-pool-arr (vector-ref e 1) (vector-ref e 2)
+                                                                    (vector-ref e 3) (vector-ref e 4))))
+                                      extra-outs)
+                            first)))))
                 ))
              )
         (vector-set! vals i result)))
@@ -2711,11 +3283,26 @@
 
    First replay call (context in replay mode, no plan yet):
      Lazily compiles the replay-plan from trace-info + finalized pool, then
-     executes it via execute-replay-plan.
+     executes it via execute-replay-plan.  The trace-info, and with it the
+     arrays of the trace run, is released once the plan exists.
 
    Subsequent replay calls:
      Executes the pre-compiled replay-plan directly.  No morphism rebuilding,
-     no BLAS-compat re-evaluation, no context-vector allocation per binding."
+     no BLAS-compat re-evaluation, no context-vector allocation per binding.
+
+   The outputs of a replay call live in pool buffers, or, for an output
+   that is a strided view, in a buffer of the plan that receives its
+   row-major copy; the next replay call of the program overwrites them, so
+   a caller that keeps an output across calls copies it first.
+
+   A program to which the fusion policy has not been applied yet (a
+   forward program from morphism-to-ssa) is fused at its first trace,
+   under the policy and the backends in effect then; its bindings are
+   replaced by the fused ones."
+  (when (and (eq? (context-mode ctx) 'trace) (not (ssa-program-fused? prog)))
+    (when (segop-fusion)
+      (ssa-program-bindings-set! prog (ssa-program-bindings (ssa-segop-fusion-pass prog))))
+    (ssa-program-fused?-set! prog #t))
   (let* ((mode        (context-mode ctx))
          (trace-mode? (eq? mode 'trace))
          (constants   (ssa-program-constants prog))
@@ -2723,13 +3310,15 @@
 
     (cond
       ;; ---- BINDING-LOOP PATH ----
-      ;; Used for the trace run AND for any replay call where trace-info is
-      ;; missing (e.g., when the caller's joint-program state table missed a
-      ;; lookup due to GC-invalidated eq?-hash keys and created a fresh
-      ;; program).  In both cases we run every binding via realize/ctx, collect
-      ;; trace-info, and return the outputs.  Output pinning via
-      ;; context-pin-output! is only performed in true trace mode.
-      ((or trace-mode? (not (ssa-program-trace-info prog)))
+      ;; Used for the trace run AND for any replay call of a program that
+      ;; has neither a replay plan nor trace-info (e.g., when the caller's
+      ;; joint-program state table missed a lookup due to GC-invalidated
+      ;; eq?-hash keys and created a fresh program).  In both cases we run
+      ;; every binding via realize/ctx, collect trace-info, and return the
+      ;; outputs.  Output pinning via context-pin-output! is only performed
+      ;; in true trace mode.
+      ((or trace-mode?
+           (not (or (ssa-program-replay-plan prog) (ssa-program-trace-info prog))))
        (let* ((values       (make-hash-table))
               (trace-info-eb (make-env-builder))
               (output-bids-eb (make-env-builder)))
@@ -2741,9 +3330,22 @@
          ;; Pre-populate constants (values is kept as hash-table: hot O(1) lookup path)
          (hash-table-walk constants
            (lambda (k v) (hash-table-set! values k v)))
-         ;; Execute each binding; record trace-info
+         ;; Execute each binding; record trace-info.  A fused binding runs
+         ;; its segop executor and allocates one buffer per output, each a
+         ;; value of its own.
          (for-each
           (lambda (b)
+           (if (fused-binding? b)
+            (let ((inputs (map (lambda (v) (hash-table-ref values (ssa-value-id v)))
+                               (ssa-binding-inputs b))))
+              (for-each
+               (lambda (o result)
+                 (let ((name (fused-out-name o)))
+                   (when (and trace-mode? (env-builder-lookup output-bids-eb name))
+                     (context-pin-output! ctx (concrete-alloc-id result)))
+                   (hash-table-set! values name result)
+                   (env-builder-extend! trace-info-eb name (cons result #t))))
+               (fused-binding-outs b) (realize-fused-binding ctx b inputs)))
             (let* ((inputs     (map (lambda (v) (hash-table-ref values (ssa-value-id v)))
                                     (ssa-binding-inputs b)))
                    (is-output? (env-builder-lookup output-bids-eb (ssa-binding-name b)))
@@ -2769,7 +3371,7 @@
                         result)))
               (hash-table-set! values (ssa-binding-name b) stored)
               ;; Record per-binding (concrete-array . is-pool?) for replay-plan compilation
-              (env-builder-extend! trace-info-eb (ssa-binding-name b) (cons result is-pool?))))
+              (env-builder-extend! trace-info-eb (ssa-binding-name b) (cons result is-pool?)))))
           bindings)
          ;; Save morph-env snapshot for lazy replay-plan compilation
          (ssa-program-trace-info-set! prog (env-builder-env trace-info-eb))
@@ -2779,70 +3381,90 @@
 
       ;; ---- REPLAY RUN ----
       (else
-       ;; Lazily compile replay-plan on first replay call (pool is now available)
+       ;; Lazily compile replay-plan on first replay call (pool is now
+       ;; available).  The trace arrays are not needed once the plan exists.
        (unless (ssa-program-replay-plan prog)
-         (ssa-program-replay-plan-set! prog (compile-replay-plan prog ctx)))
+         (ssa-program-replay-plan-set! prog (compile-replay-plan prog ctx))
+         (ssa-program-trace-info-set! prog #f))
        ;; Execute the pre-compiled plan directly
        (let* ((plan  (ssa-program-replay-plan prog))
               (pool  (morphism-context-pool ctx))
               (vals  (execute-replay-plan plan pool constants))
               ;; output-specs pre-computed by compile-replay-plan: list of
-              ;; (integer | concrete-array) -- no hash-table rebuild per step.
+              ;; (integer | (pos . buffer) | concrete-array) -- no hash-table
+              ;; rebuild per step.
               (specs (ssa-program-output-specs prog)))
            (time-instr 'ri-output-mapping
              (map (lambda (spec)
-                    (if (integer? spec)
-                        (let ((v (vector-ref vals spec)))
-                          (if (concrete-row-major? v) v (copy-concrete-array v)))
-                        spec))   ; const-ref: direct concrete-array from constants
+                    (cond
+                     ((integer? spec)
+                      (let ((v (vector-ref vals spec)))
+                        (if (concrete-row-major? v) v (copy-concrete-array v))))
+                     ((pair? spec)
+                      (let ((v (vector-ref vals (car spec))))
+                        (if (concrete-row-major? v) v (copy-concrete-array-into v (cdr spec)))))
+                     (else spec)))   ; const-ref: direct concrete-array from constants
                   specs)))))
 
     ))
 
+  ;; How many fused bindings of a plan run as a native fused kernel and how
+  ;; many on the host executors, as ((native . n) (host . m)).
+  (define (fused-placement plan bindings)
+    (let loop ((bs bindings) (i 0) (native 0) (host 0))
+      (cond ((null? bs) `((native . ,native) (host . ,host)))
+            ((fused-binding? (car bs))
+             (if (cases replay-instruction (vector-ref plan i)
+                   (ri-segop (_ _ _ _ _ _ tag _)
+                     (memq tag '(segop/fused-kernel segop/colsum-kernel segop/gemm-epilogue
+                                 segop/codegen-map segop/codegen-red segop/codegen-epilogue)))
+                   (else #f))
+                 (loop (cdr bs) (+ i 1) (+ native 1) host)
+                 (loop (cdr bs) (+ i 1) native (+ host 1))))
+            (else (loop (cdr bs) (+ i 1) native host)))))
+
   (define (replay-plan-stats prog)
     "Return alist with:
        (counts . alist-of-tag.count)
-       (ri-index-shapes . list-of-(i . shape-vector))
-       (ri-reduce-specs . list-of-(i axes keepdims? shape))"
+       (ri-index-shapes . list-of-(i . shape-vector)), the positions of the
+          segops executed by the generic strided loops, gathers, host index
+          functions and the interpreter
+       (ri-reduce-specs . list-of-(i axes keepdims? shape)), the reductions
+       (conv-scratch-bytes . n), the size of the image-column buffers the
+          plan's convolutions share
+     followed by the entries the plan finalizers returned (see
+     segop-plan-add-finalizer!)"
     (let ((plan (ssa-program-replay-plan prog)))
       (if (not plan)
           '()
           (let ((counts       (make-hash-table))
                 (index-shapes (make-stack))
-                (reduce-specs (make-stack)))
+                (reduce-specs (make-stack))
+                (scratch      (new-conv-scratch)))
             (do ((i 0 (+ i 1))) ((= i (vector-length plan)))
               (let* ((instr (vector-ref plan i))
                      (tag (cases replay-instruction instr
-                            (ri-gemm             (_ _ _ _ _ _ _)         'ri-gemm)
-                            (ri-gemm-strided     (_ _ _ _ _ _ _)         'ri-gemm-strided)
-                            (ri-index            (_ shape _ _ _ _)
-                                                 (begin
-                                                   (stack-push! index-shapes (cons i shape))
-                                                   'ri-index))
-                            (ri-reduce           (_ shape _ _ _ _ axes _ keepdims? _)
-                                                 (begin
-                                                   (stack-push! reduce-specs (list i axes keepdims? shape))
-                                                   'ri-reduce))
                             (ri-view             (_ _)                   'ri-view)
-                            (ri-flat-unary       (_ _ _ _ _ _)           'ri-flat-unary)
-                            (ri-activation-unary (_ _ _ _ _ _ _)         'ri-activation-unary)
-                            (ri-flat-binary      (_ _ _ _ _ _ _)         'ri-flat-binary)
-                            (ri-activation-binary (_ _ _ _ _ _ _ _)      'ri-activation-binary)
-                            (ri-flat-bias-broadcast (_ _ _ _ _ _ _ _)   'ri-flat-bias-broadcast)
-                            (ri-flat-broadcast   (_ _ _ _ _ _ _ _ _ _ _) 'ri-flat-broadcast)
-                            (ri-flat-ternary     (_ _ _ _ _ _ _ _)       'ri-flat-ternary)
-                            (ri-gemm-epilogue    (_ _ _ _ _ _ _ _ _ _ _) 'ri-gemm-epilogue)
-                            (ri-alias            (_ _ _ _ _)             'ri-alias)
-                            (ri-im2col           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-im2col)
-                            (ri-col2im           (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _)     'ri-col2im)
-                            (ri-conv-fwd         (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) 'ri-conv-fwd)
-                            (ri-conv-bwd-data    (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  'ri-conv-bwd-data)
-                            (ri-conv-bwd-weights (_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)  'ri-conv-bwd-weights))))
+                            (ri-segop            (_ shape _ dtype sg _ tag _)
+                              (when (memq tag '(segop/strided-map segop/gather
+                                                segop/host-index-fn segop/interpreted))
+                                (stack-push! index-shapes (cons i shape)))
+                              (let ((r (and (eq? (segop-kind sg) 'seg-reduce) (standard-reduction sg))))
+                                (when r
+                                  (stack-push! reduce-specs (list i (cadr r) (caddr r) shape))))
+                              (let ((g (conv-segop-geom sg)))
+                                (when (and g (> (conv-scratch-size g) 0))
+                                  (conv-scratch-request! scratch dtype (conv-scratch-size g))))
+                              tag))))
                 (hash-table-set! counts tag
                                  (+ (hash-table-ref/default counts tag 0) 1))))
             `((counts . ,(hash-table->alist counts))
               (ri-index-shapes . ,(reverse (stack->list index-shapes)))
-              (ri-reduce-specs . ,(reverse (stack->list reduce-specs)))))))
+              (ri-reduce-specs . ,(reverse (stack->list reduce-specs)))
+              (fused . ,(fused-placement plan (ssa-program-bindings prog)))
+              (conv-scratch-bytes . ,(conv-scratch-bytes scratch))
+              ,@(or (ssa-program-plan-notes prog) '())))))
+
     )
 
 ) ; end module array-morphisms-ssa
