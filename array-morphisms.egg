@@ -4,6 +4,8 @@
  ; Your egg's license:
  (license "LGPL-3")
 
+ (version "3.0")
+
  ; Egg category
  (category data)
 
